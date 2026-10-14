@@ -111,6 +111,8 @@ printf 'fn main() { println!("hi"); }\n' >"$WS/src/main.rs"
 printf '{"a": 1}\n' >"$WS/config.json"
 printf '#!/bin/sh\necho hi\n' >"$WS/run.sh"
 printf 'name,qty\nwidget,3\n' >"$WS/data.csv"
+# An image for the viewer, made here so the check needs no fixture file.
+convert -size 320x240 gradient:'#ffffff-#2f6fd0' "$WS/shot.png"
 
 # A PDF for the viewer, written by hand so the check needs no exporter.
 python3 - "$WS/page.pdf" <<'PY_EOF'
@@ -437,7 +439,38 @@ shot 24-pdf-dragged
   || fail "dragging a zoomed-in PDF page did not move it"
 pass "dragging a zoomed-in page moves it"
 
-# 14. Still alive at the end — no crash from any of the above.
+# 14. The image viewer: a bare wheel does not zoom it, Command or Control
+#     plus the wheel does — the same gesture as the editor, the preview, the
+#     diagram and the PDF viewer. The image opens at a fit, so a bare wheel
+#     has nothing to scroll and has to leave the frame alone. It is opened by
+#     clicking the Explorer: keyboard shortcuts do not reach a focused viewer
+#     (see scripts/e2e/README.md), and the PDF viewer was just closed over.
+xdotool mousemove $((win_x + 83)) $((win_y + 285))
+sleep 0.3
+xdotool click 1
+sleep 1.5
+shot 25-image-open
+[[ "$(pixels_differ 24-pdf-dragged 25-image-open)" -gt 1000 ]] \
+  || fail "clicking the Explorer did not open the image"
+xdotool mousemove $((win_x + 640)) $((win_y + 420))
+sleep 0.3
+xdotool click 4
+sleep 0.8
+shot 26-image-wheel
+[[ "$(pixels_differ 25-image-open 26-image-wheel)" -lt 500 ]] \
+  || fail "a bare wheel zoomed the image viewer"
+pass "a bare wheel does not zoom the image viewer"
+xdotool keydown ctrl
+xdotool click 4
+xdotool click 4
+xdotool keyup ctrl
+sleep 0.8
+shot 27-image-zoomed
+[[ "$(pixels_differ 26-image-wheel 27-image-zoomed)" -gt 1000 ]] \
+  || fail "Ctrl+wheel did not zoom the image viewer"
+pass "Ctrl+wheel zooms the image viewer"
+
+# 15. Still alive at the end — no crash from any of the above.
 kill -0 "$APP_PID" 2>/dev/null || fail "process died during the run"
 pass "process alive at exit"
 

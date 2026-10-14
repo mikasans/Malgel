@@ -75,6 +75,24 @@ fn thumb_size(page: &PdfPage, width: f32) -> (f32, f32) {
     (width, width * page.height / page.width)
 }
 
+/// The index of the page at the top of a viewport scrolled `offset` pixels
+/// into the content, given each row's height. Rows hold one or two pages, so a
+/// spread reports its first page the way a reader names the page it is on.
+fn page_at_offset(rows: &[Vec<usize>], row_heights: &[f32], offset: f32) -> usize {
+    let mut top = 0.;
+    for (row, &height) in rows.iter().zip(row_heights) {
+        if offset < top + height {
+            return row.first().copied().unwrap_or(0);
+        }
+        top += height;
+    }
+    // Past the last row (a short document in a tall window) the last page is
+    // the one on screen.
+    rows.last()
+        .and_then(|row| row.first().copied())
+        .unwrap_or(0)
+}
+
 /// How the zoom factor is chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FitMode {
@@ -316,6 +334,37 @@ impl PdfView {
     /// The page indexes each row shows, in order.
     fn rows(&self) -> Vec<Vec<usize>> {
         page_rows(self.page_count(), self.per_row())
+    }
+
+    /// The page the viewport is showing, read from the scroll position rather
+    /// than written while the page list renders. Everything that names the
+    /// current page — the toolbar, the zoom target and the thumbnail strip —
+    /// therefore reads one value that was set before any of them were built,
+    /// instead of whichever had run first.
+    fn visible_page(&self) -> usize {
+        let Some(doc) = &self.doc else {
+            return 0;
+        };
+        let rows = self.rows();
+        if rows.is_empty() {
+            return 0;
+        }
+        let zoom = self.zoom;
+        let heights: Vec<f32> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|&ix| doc.pages[ix].height)
+                    .fold(0.0f32, f32::max)
+                    * zoom
+                    + PAGE_GAP
+            })
+            .collect();
+        // A scrolling list translates its content by the scroll offset, so the
+        // offset is negative once the reader scrolls down; the top of the
+        // viewport in content space is the negation.
+        let offset = (-self.scroll.base_handle().offset().y.as_f32()).max(0.);
+        page_at_offset(&rows, &heights, offset)
     }
 
     /// The path of the open document, if opened from disk.
@@ -860,11 +909,6 @@ impl PdfView {
             "pdf-pages",
             sizes,
             move |this, range: Range<usize>, _window, _cx| {
-                if let Some(first) = rows.get(range.start).and_then(|row| row.first())
-                    && let Some(doc) = &this.doc
-                {
-                    this.current_page = (*first).min(doc.pages.len().saturating_sub(1));
-                }
                 range
                     .filter_map(|row_ix| {
                         let row = rows.get(row_ix)?.clone();
@@ -970,6 +1014,9 @@ impl Render for PdfView {
         // toolbar, so the percentage shown matches the pages below it.
         let viewport = self.scroll.bounds().size;
         self.zoom = self.resolved_zoom(viewport);
+        // Name the current page before the toolbar, the pages and the
+        // thumbnail strip are built, so all three agree within a frame.
+        self.current_page = self.visible_page();
 
         v_flex()
             .id("pdf-view")
@@ -1015,6 +1062,29 @@ impl Render for PdfView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page named as current must follow the scroll position: at the top
+    /// it is the first page, then the first page whose row reaches the top of
+    /// the viewport, and the last page when scrolled past the end.
+    #[test]
+    fn the_current_page_follows_the_scroll_offset() {
+        let rows = vec![vec![0], vec![1], vec![2]];
+        let heights = vec![100., 100., 100.];
+        assert_eq!(page_at_offset(&rows, &heights, 0.), 0);
+        assert_eq!(page_at_offset(&rows, &heights, 99.9), 0);
+        assert_eq!(page_at_offset(&rows, &heights, 100.), 1);
+        assert_eq!(page_at_offset(&rows, &heights, 250.), 2);
+        assert_eq!(page_at_offset(&rows, &heights, 1_000_000.), 2);
+    }
+
+    /// A two-page spread names the page it starts with, the way a reader does.
+    #[test]
+    fn a_spread_row_reports_its_first_page() {
+        let rows = vec![vec![0, 1], vec![2, 3]];
+        let heights = vec![100., 100.];
+        assert_eq!(page_at_offset(&rows, &heights, 0.), 0);
+        assert_eq!(page_at_offset(&rows, &heights, 100.), 2);
+    }
 
     #[test]
     fn parses_and_measures_minimal_pdf() {

@@ -391,26 +391,22 @@ impl DiagramViewer {
     // ---------------------------------------------------------------------
     // Input
 
+    /// Command or Control plus the wheel zooms, as in the image viewer, the
+    /// PDF viewer and VS Code. On its own the wheel moves the diagram, so the
+    /// gesture means the same thing on every surface Malgel draws.
     fn on_scroll(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
-        match event.delta {
-            // A mouse wheel zooms, as in image viewers, a step per notch
-            // (which systems count as one to three lines).
-            ScrollDelta::Lines(lines) => self.zoom_by(
-                zoom::WHEEL_STEP.powf(lines.y.clamp(-1., 1.)),
-                Some(event.position),
-                cx,
-            ),
-            // Holding Command or Control turns trackpad scrolling into zoom.
-            ScrollDelta::Pixels(delta) if event.modifiers.secondary() => {
-                let factor = (f32::from(delta.y) / 200.).exp();
-                self.zoom_by(factor, Some(event.position), cx)
-            }
-            // Otherwise trackpads move the diagram around.
-            ScrollDelta::Pixels(_) => {
-                let delta = event.delta.pixel_delta(window.line_height());
-                self.pan(f32::from(delta.x), f32::from(delta.y), cx);
-            }
+        if !event.modifiers.secondary() {
+            let delta = event.delta.pixel_delta(window.line_height());
+            self.pan(f32::from(delta.x), f32::from(delta.y), cx);
+            return;
         }
+        let factor = match event.delta {
+            // A mouse wheel steps one notch at a time (systems count a notch
+            // as one to three lines).
+            ScrollDelta::Lines(lines) => zoom::WHEEL_STEP.powf(lines.y.clamp(-1., 1.)),
+            ScrollDelta::Pixels(delta) => (f32::from(delta.y) / 200.).exp(),
+        };
+        self.zoom_by(factor, Some(event.position), cx);
     }
 
     fn on_pinch(&mut self, event: &PinchEvent, cx: &mut Context<Self>) {

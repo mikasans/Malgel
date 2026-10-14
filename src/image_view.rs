@@ -197,22 +197,22 @@ impl ImageView {
         }
     }
 
-    /// One notch of a mouse wheel zooms, as in the diagram viewer and most
-    /// image viewers. A trackpad zooms only while Ctrl (⌘ on macOS) is held —
-    /// otherwise it is left to the scroll area, so the image still scrolls
-    /// the way a trackpad's two-finger gesture is expected to.
+    /// Command or Control plus the wheel zooms, as in the PDF viewer and in
+    /// VS Code. On its own the wheel is left to the scroll area behind this
+    /// element, so a zoomed-in image scrolls rather than resizing — the same
+    /// gesture as everywhere else in the app.
     fn on_scroll(
         &mut self,
         event: &ScrollWheelEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !event.modifiers.secondary() {
+            return;
+        }
         let factor = match event.delta {
             ScrollDelta::Lines(lines) => zoom::WHEEL_STEP.powf(lines.y.clamp(-1., 1.)),
-            ScrollDelta::Pixels(delta) if event.modifiers.secondary() => {
-                (f32::from(delta.y) / 200.).exp()
-            }
-            ScrollDelta::Pixels(_) => return,
+            ScrollDelta::Pixels(delta) => (f32::from(delta.y) / 200.).exp(),
         };
         self.set_zoom(self.zoom * factor, cx);
         // The scroll area behind this element would otherwise scroll the

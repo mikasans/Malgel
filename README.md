@@ -35,9 +35,10 @@ A fast, native Markdown editor and previewer written in pure Rust with
   JavaScript. Diagrams take their colors from the current theme, render in
   the background in a few milliseconds, and a mistake shows the parser's
   message under the source instead of a blank. Click a diagram to open it in
-  a window of its own: scroll or pinch to zoom, drag to move around,
-  double-click to zoom in, and 0 to fit it to the window. Zoomed in, the part
-  in view is drawn again at that size, so even small labels stay crisp.
+  a window of its own: Ctrl+scroll or pinch to zoom, scroll or drag to move
+  around, double-click to zoom in, and 0 to fit it to the window. Zoomed in,
+  the part in view is drawn again at that size, so even small labels stay
+  crisp.
 - **Links that go somewhere.** Click a link in the preview to follow it. Links
   to headings (`#getting-started`) scroll to them; links to other Markdown
   files open them in Malgel, at the heading they name, in a new tab or in
@@ -61,9 +62,9 @@ A fast, native Markdown editor and previewer written in pure Rust with
   Markdown as the plain-text alternative.
 - **Go to heading.** An outline palette (Ctrl+Shift+O) jumps to any heading.
 - **Images.** PNG, JPEG, GIF, WebP and SVG open in a viewer of their own,
-  with fit-width, fit-page and percentage zoom, the wheel, pinch and the
-  keyboard, and a drag on the picture to move around once it is bigger than
-  the pane.
+  with fit-width, fit-page and percentage zoom, Ctrl+scroll, pinch and the
+  keyboard, a scroll or a drag on the picture to move around once it is
+  bigger than the pane.
 - **PDF viewing.** PDFs open in a viewer of their own: continuous scrolling,
   fit-width / fit-page / custom zoom, one page or two side by side, and a page
   thumbnail strip you can browse and click to jump by (the button at the left
