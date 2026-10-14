@@ -60,11 +60,16 @@ A fast, native Markdown editor and previewer written in pure Rust with
   images embedded) for mail, word processors and web editors, with the
   Markdown as the plain-text alternative.
 - **Go to heading.** An outline palette (Ctrl+Shift+O) jumps to any heading.
+- **Images.** PNG, JPEG, GIF, WebP and SVG open in a viewer of their own,
+  with fit-width, fit-page and percentage zoom, the wheel, pinch and the
+  keyboard, and a drag on the picture to move around once it is bigger than
+  the pane.
 - **PDF viewing.** PDFs open in a viewer of their own: continuous scrolling,
   fit-width / fit-page / custom zoom, one page or two side by side, and a page
   thumbnail strip you can browse and click to jump by (the button at the left
-  of its toolbar). Pages are drawn as vector sheets on demand and cached, so a
-  long document opens and scrolls smoothly.
+  of its toolbar); dragging a page moves around once it is zoomed in. Pages
+  are drawn as vector sheets on demand and cached, so a long document opens
+  and scrolls smoothly.
 - **Documents done right.** Atomic saves, UTF-8 with byte-order-mark
   handling, CRLF files stay CRLF (switch a document between LF and CRLF from
   the status bar), unsaved-changes prompts on new, open, close and quit,

@@ -9,8 +9,9 @@ use std::{path::Path, path::PathBuf, sync::Arc};
 
 use gpui_kit::{
     Anchor, App, Context, FocusHandle, Focusable, Image, ImageFormat, InteractiveElement as _,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement as _, PinchEvent, Pixels, Render,
-    ScrollDelta, ScrollWheelEvent, Size, Styled as _, Window,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
+    PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Size,
+    StatefulInteractiveElement as _, Styled as _, Window,
     assets::IconName,
     base::Disableable as _,
     component::{
@@ -57,6 +58,10 @@ pub struct ImageView {
     custom_zoom: f32,
     /// The scroll area's size, measured while it paints.
     viewport: Size<Pixels>,
+    /// The image's scroll position, so a drag can move it.
+    scroll: ScrollHandle,
+    /// Where a drag started, and the scroll offset it started from.
+    drag: Option<(Point<Pixels>, Point<Pixels>)>,
     focus_handle: FocusHandle,
 }
 
@@ -135,6 +140,8 @@ impl ImageView {
             zoom: zoom::DEFAULT,
             custom_zoom: zoom::DEFAULT,
             viewport: gpui_kit::size(px(0.), px(0.)),
+            scroll: ScrollHandle::new(),
+            drag: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -228,8 +235,29 @@ impl ImageView {
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         // Only the left button gets here; the wiring asks for it.
         if event.click_count == 2 {
+            self.drag = None;
             self.on_double_click(cx);
+            return;
         }
+        self.drag = Some((event.position, self.scroll.offset()));
+    }
+
+    /// Dragging moves the image, the way it moves a diagram in its own
+    /// window: once the picture is bigger than the pane, the wheel alone
+    /// leaves the rest of it out of reach.
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, _cx: &mut Context<Self>) {
+        let Some((start, offset)) = self.drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.drag = None;
+            return;
+        }
+        self.scroll.set_offset(offset + (event.position - start));
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _cx: &mut Context<Self>) {
+        self.drag = None;
     }
 
     fn on_pinch(&mut self, event: &PinchEvent, cx: &mut Context<Self>) {
@@ -400,6 +428,7 @@ impl ImageView {
                         cx.listener(|this, event: &PinchEvent, _, cx| this.on_pinch(event, cx)),
                     ),
             )
+            .track_scroll(&self.scroll)
             .on_prepaint(move |bounds, _, cx| {
                 // Notifying mid-frame can be lost; update once it's done.
                 cx.defer(move |cx| {
@@ -448,6 +477,8 @@ impl Render for ImageView {
                     .flex_1()
                     .min_h_0()
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .child(self.render_content(cx)),
             )
     }

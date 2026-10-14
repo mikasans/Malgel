@@ -140,7 +140,13 @@ for ix in range(PAGES):
         ).encode(),
     )
 for ix in range(PAGES):
-    stream = f"0.62 0.78 0.94 rg\n0 0 {W:g} {H:g} re\nf\n".encode()
+    # Stripes rather than a flat fill: a drag scrolls the page, and stripes
+    # are what makes that visible in a screenshot.
+    stream = "".join(
+        f"{(row % 3) * 0.3 + 0.1:.2f} {(row % 5) * 0.18 + 0.1:.2f} 0.7 rg\n"
+        f"0 {H * row / 40:g} {W:g} {H / 40:g} re\nf\n"
+        for row in range(40)
+    ).encode()
     add(4 + PAGES + ix, b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"endstream")
 
 xref_at = len(out)
@@ -414,7 +420,24 @@ shot 22-pdf-thumbnails-off
   || fail "hiding the thumbnails did not put the page back"
 pass "PDF page thumbnails toggle from the toolbar"
 
-# 13. Still alive at the end — no crash from any of the above.
+# 13. Zoom the page in and drag it: once it is bigger than the pane, a drag
+#     has to move it, the way the diagram window already moves.
+xdotool mousemove 640 500
+xdotool keydown ctrl
+for _ in 1 2 3 4; do xdotool click 4; done
+xdotool keyup ctrl
+sleep 0.8
+shot 23-pdf-zoomed
+xdotool mousedown 1
+for y in 450 400 350 300 250; do xdotool mousemove 640 "$y"; sleep 0.12; done
+xdotool mouseup 1
+sleep 0.8
+shot 24-pdf-dragged
+[[ "$(pixels_differ 23-pdf-zoomed 24-pdf-dragged)" -gt 50000 ]] \
+  || fail "dragging a zoomed-in PDF page did not move it"
+pass "dragging a zoomed-in page moves it"
+
+# 14. Still alive at the end — no crash from any of the above.
 kill -0 "$APP_PID" 2>/dev/null || fail "process died during the run"
 pass "process alive at exit"
 

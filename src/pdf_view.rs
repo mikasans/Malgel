@@ -18,9 +18,9 @@ use std::{
 
 use gpui_kit::{
     Anchor, App, Context, ElementId, FocusHandle, Focusable, Image, ImageFormat,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _,
-    PinchEvent, Pixels, Render, ScrollDelta, ScrollStrategy, ScrollWheelEvent, Size, Styled as _,
-    Window,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement as _, PinchEvent, Pixels, Point, Render, ScrollDelta,
+    ScrollStrategy, ScrollWheelEvent, Size, Styled as _, Window,
     assets::IconName,
     base::Disableable as _,
     component::{
@@ -260,6 +260,8 @@ pub struct PdfView {
     current_page: usize,
     /// Whether the page thumbnails are shown beside the pages.
     thumbnails: bool,
+    /// Where a drag started, and the scroll offset it started from.
+    drag: Option<(Point<Pixels>, Point<Pixels>)>,
     scroll: VirtualListScrollHandle,
     /// The thumbnails' own scroll position, so the strip and the pages move
     /// independently.
@@ -286,6 +288,7 @@ impl PdfView {
             spread: false,
             current_page: 0,
             thumbnails: false,
+            drag: None,
             scroll: VirtualListScrollHandle::new(),
             thumb_scroll: VirtualListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
@@ -392,6 +395,26 @@ impl PdfView {
         self.set_zoom(self.zoom * (1. + event.delta), cx);
     }
 
+    /// Dragging moves the pages, the way it moves an image in its viewer and
+    /// a diagram in its own window: zoomed in, the wheel alone leaves the
+    /// rest of the sheet out of reach.
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, _cx: &mut Context<Self>) {
+        let Some((start, offset)) = self.drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.drag = None;
+            return;
+        }
+        self.scroll
+            .base_handle()
+            .set_offset(offset + (event.position - start));
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _cx: &mut Context<Self>) {
+        self.drag = None;
+    }
+
     /// Double-clicking swaps between the fitted view and a closer look, the
     /// way a double-click does in the diagram viewer and in the image viewer:
     /// from a fit it doubles what the fit resolved to, and from a zoom the
@@ -399,8 +422,10 @@ impl PdfView {
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         // Only the left button gets here; the wiring asks for it.
         if event.click_count != 2 {
+            self.drag = Some((event.position, self.scroll.base_handle().offset()));
             return;
         }
+        self.drag = None;
         if self.fit == FitMode::Custom {
             self.fit_page(cx);
         } else {
@@ -979,6 +1004,8 @@ impl Render for PdfView {
                             .flex_1()
                             .min_w_0()
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                            .on_mouse_move(cx.listener(Self::on_mouse_move))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                             .child(self.render_content(cx)),
                     ),
             )
@@ -1041,10 +1068,7 @@ mod tests {
         assert!(short < width);
 
         // A page with no width does not divide by zero.
-        let empty = PdfPage {
-            width: 0.0,
-            ..page
-        };
+        let empty = PdfPage { width: 0.0, ..page };
         assert_eq!(thumb_size(&empty, THUMB_WIDTH), (THUMB_WIDTH, THUMB_WIDTH));
     }
 
