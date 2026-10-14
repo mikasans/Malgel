@@ -97,7 +97,9 @@ A fast, native Markdown editor and previewer written in pure Rust with
 - **Themes.** Light, dark or follow the system, with bundled themes (Ayu,
   Catppuccin, Everforest, Flexoki, Gruvbox, macOS Classic, Solarized,
   Tokyo Night) selectable separately for light and dark.
-- **Zoom.** Ctrl+= / Ctrl+- scale the entire interface, not just the text.
+- **Zoom.** Ctrl+= / Ctrl+- scale the entire interface, not just the text, and
+  Ctrl+scroll over a document does the same; in the viewers Ctrl+scroll zooms
+  the page or picture instead.
 - **Live statistics.** Words (CJK-aware), characters, reading time, caret
   position and selection size in the status bar, beside the line ending, the
   indent size and the language.

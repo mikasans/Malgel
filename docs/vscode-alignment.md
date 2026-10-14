@@ -84,6 +84,13 @@ is not considered).
   other formatting commands. Plain Alt with an arrow is free: the library
   binds Ctrl+Alt+↑/↓ (and Shift+Alt+↑/↓) to adding a cursor above and below.
 
+- **The wheel means one thing everywhere.** Command or Control plus the wheel
+  zooms — the editor, the preview, the image viewer, the diagram window and
+  the PDF viewer. On its own the wheel scrolls, or moves a diagram. The
+  editor and the preview need a window-level listener for this: the editor's
+  own wheel handling scrolls and takes the event before the pane underneath
+  sees it, and GPUI gives an element no capture-phase hook for the wheel.
+
 - **Go to Line** (Ctrl+G) and **Toggle Word Wrap** (Alt+Z).
 
 - **Current-line highlight.** The editor draws a band over the line the caret

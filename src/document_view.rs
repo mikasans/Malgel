@@ -10,14 +10,16 @@ use std::{
 };
 
 use gpui_kit::{
-    App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, Focusable as _, HighlightStyle, Image, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ListOffset, MouseMoveEvent, ParentElement as _, Pixels, Render, ScrollWheelEvent,
-    SharedString, Styled as _, Subscription, Task, Window,
+    Action, App, AppContext as _, Bounds, ClipboardEntry, ClipboardItem, Context, DispatchPhase,
+    Entity, EventEmitter, FocusHandle, Focusable as _, HighlightStyle, Image,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseMoveEvent,
+    ParentElement as _, Pixels, Render, ScrollWheelEvent, SharedString, Styled as _, Subscription,
+    Task, Window,
     base::{
         TextView, TextViewState,
         input::{Diagnostic, DiagnosticSeverity},
     },
+    canvas,
     component::{
         ActiveTheme as _, ElementExt as _, RopeExt as _,
         clipboard::Clipboard,
@@ -1261,31 +1263,41 @@ impl DocumentView {
         }
     }
 
-    /// Command or Control plus the wheel zooms, the way it does in the image
-    /// and PDF viewers; on its own the wheel keeps scrolling. Both panes come
-    /// through here, so one gesture behaves the same in the editor and in the
-    /// preview. Returns whether the event was consumed.
-    fn zoom_on_wheel(
-        &mut self,
-        event: &ScrollWheelEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !event.modifiers.secondary() {
-            return false;
-        }
-        let step = f32::from(event.delta.pixel_delta(window.line_height()).y);
-        if step != 0. {
-            let action: Box<dyn gpui_kit::Action> = if step > 0. {
-                Box::new(ZoomIn)
-            } else {
-                Box::new(ZoomOut)
-            };
-            window.dispatch_action(action, cx);
-        }
-        // Otherwise the pane underneath scrolls as the zoom resizes it.
-        cx.stop_propagation();
-        true
+    /// Watch `bounds` (one of the text panes) for Command or Control plus the
+    /// wheel and zoom, the way the viewers do. On its own the wheel keeps
+    /// scrolling.
+    ///
+    /// The listener goes on the window rather than the pane because the
+    /// editor's own wheel handling scrolls the document and consumes the
+    /// event before anything underneath sees it, and GPUI gives an element no
+    /// capture-phase hook for the wheel. A window listener does run in the
+    /// capture phase, ahead of every element, and stopping the event there
+    /// keeps the editor from scrolling as it zooms.
+    fn zoom_on_wheel(bounds: Bounds<Pixels>, window: &mut Window) {
+        window.on_mouse_event(
+            move |event: &ScrollWheelEvent,
+                  phase: DispatchPhase,
+                  window: &mut Window,
+                  cx: &mut App| {
+                if !phase.capture() || !event.modifiers.secondary() {
+                    return;
+                }
+                if !bounds.contains(&event.position) {
+                    return;
+                }
+                let step = f32::from(event.delta.pixel_delta(window.line_height()).y);
+                if step != 0. {
+                    let action: Box<dyn Action> = if step > 0. {
+                        Box::new(ZoomIn)
+                    } else {
+                        Box::new(ZoomOut)
+                    };
+                    window.dispatch_action(action, cx);
+                }
+                // Otherwise the pane underneath scrolls as the zoom resizes it.
+                cx.stop_propagation();
+            },
+        );
     }
 
     fn syncs_scrolling(&self, cx: &App) -> bool {
@@ -1450,6 +1462,7 @@ impl DocumentView {
         div()
             .id("editor-pane")
             .key_context(crate::actions::EDITOR_CONTEXT)
+            .relative()
             .size_full()
             .bg(cx.theme().background)
             .font_family(cx.theme().mono_font_family.clone())
@@ -1502,9 +1515,6 @@ impl DocumentView {
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
-                if this.zoom_on_wheel(event, window, cx) {
-                    return;
-                }
                 this.set_scroll_driver(ScrollDriver::Editor);
                 this.editor.update(cx, |editor, cx| {
                     let line_height = editor.line_height().unwrap_or(window.line_height());
@@ -1546,6 +1556,14 @@ impl DocumentView {
                     });
                 });
             })
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    |bounds, _, window, _| Self::zoom_on_wheel(bounds, window),
+                )
+                .absolute()
+                .inset_0(),
+            )
     }
 
     fn render_preview(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1568,9 +1586,6 @@ impl DocumentView {
                 this.set_scroll_driver(ScrollDriver::Preview)
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
-                if this.zoom_on_wheel(event, window, cx) {
-                    return;
-                }
                 this.set_scroll_driver(ScrollDriver::Preview);
                 let list = this.preview.read(cx).list_state().clone();
                 if list.viewport_bounds().contains(&event.position) {
@@ -1626,6 +1641,14 @@ impl DocumentView {
                     });
                 });
             })
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    |bounds, _, window, _| Self::zoom_on_wheel(bounds, window),
+                )
+                .absolute()
+                .inset_0(),
+            )
     }
 
     /// A pane fills the view unless the editor and preview share it, in

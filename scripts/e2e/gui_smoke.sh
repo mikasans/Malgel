@@ -210,6 +210,11 @@ wait_for() { # wait_for <seconds> <command...>
   done
   return 1
 }
+# The interface font size Malgel has saved; the zoom writes it there.
+font_size() {
+  sed -n 's/.*"font_size": *\([0-9.]*\).*/\1/p' \
+    "$HOME/.config/malgel/settings.json" 2>/dev/null
+}
 
 echo "== malgel GUI smoke =="
 echo "binary:   $BIN"
@@ -470,7 +475,34 @@ shot 27-image-zoomed
   || fail "Ctrl+wheel did not zoom the image viewer"
 pass "Ctrl+wheel zooms the image viewer"
 
-# 15. Still alive at the end — no crash from any of the above.
+# 15. Command or Control plus the wheel zooms the editor itself, the way it
+#     zooms a viewer. The editor's own wheel handling used to scroll and take
+#     the event before the pane underneath saw it, so this gesture only ever
+#     scrolled. The zoom is the interface font size, so the assertion reads it
+#     back from the saved settings. Opened by clicking the Explorer: keyboard
+#     shortcuts do not reach a focused viewer.
+xdotool mousemove $((win_x + 83)) $((win_y + 106))
+sleep 0.3
+xdotool click 1
+sleep 1.5
+shot 28-editor-open
+[[ "$(pixels_differ 27-image-zoomed 28-editor-open)" -gt 1000 ]] \
+  || fail "clicking the Explorer did not open a text file"
+before="$(font_size)"
+[[ -n "$before" ]] || before=16
+xdotool mousemove $((win_x + 640)) $((win_y + 420))
+sleep 0.3
+xdotool keydown ctrl
+xdotool click 4
+xdotool click 4
+xdotool keyup ctrl
+sleep 0.8
+after="$(font_size)"
+[[ "$after" != "$before" ]] \
+  || fail "Ctrl+wheel over the editor did not zoom (font size stayed at ${before:-unset})"
+pass "Ctrl+wheel zooms the editor"
+
+# 16. Still alive at the end — no crash from any of the above.
 kill -0 "$APP_PID" 2>/dev/null || fail "process died during the run"
 pass "process alive at exit"
 
