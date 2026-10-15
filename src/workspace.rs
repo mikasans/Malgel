@@ -239,6 +239,32 @@ enum OpenMode {
     PlainText,
 }
 
+/// A button of the dialog shown before opening a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenChoice {
+    Close(&'static str),
+    PlainText,
+    Anyway,
+}
+
+/// The dialog's buttons for a file `check` flagged: a binary file that is not
+/// text gets only an OK, as there is nothing to open it as.
+fn open_choices(check: document::OpenCheck, media: bool) -> &'static [OpenChoice] {
+    use OpenChoice::*;
+    match check {
+        document::OpenCheck::Binary => &[Close("OK")],
+        document::OpenCheck::BinaryText => &[Close("Cancel"), Anyway],
+        _ if media => &[Close("Cancel"), Anyway],
+        _ => &[Close("Cancel"), PlainText, Anyway],
+    }
+}
+
+/// A PDF or picture read and decoded in the background.
+enum MediaLoad {
+    Pdf(crate::pdf_view::PdfDocument),
+    Image(Arc<gpui_kit::Image>, f32, f32),
+}
+
 #[derive(Clone, Debug)]
 enum Target {
     /// The top of the document.
@@ -533,6 +559,7 @@ impl Workspace {
                             window,
                             cx,
                         )
+                        .with_encoding(loaded.encoding)
                     }))
                 }),
                 None => None,
@@ -880,7 +907,11 @@ impl Workspace {
             if path.is_dir() {
                 // A directory argument (CLI or a second launch) becomes the
                 // sidebar root, the way VS Code opens a folder.
-                AppSettings::update(cx, |settings| settings.push_recent(&path));
+                // Opening a folder shows the Explorer, as VS Code does.
+                AppSettings::update(cx, |settings| {
+                    settings.push_recent(&path);
+                    settings.file_sidebar = true;
+                });
                 self.file_tree
                     .update(cx, |tree, cx| tree.set_root(Some(path), cx));
                 continue;
@@ -914,9 +945,10 @@ impl Workspace {
         }
     }
 
-    /// Ask how to open a file too large (or too binary) to load as is, the
-    /// way VS Code warns before opening one: open it anyway, open it as plain
-    /// text (the editor alone), or leave it.
+    /// Ask how to open a file too large (or binary) to load as is, the way
+    /// VS Code warns before opening one: open it anyway or leave it; a huge
+    /// text file can also open as plain text. A binary file that is not text
+    /// at all only says so: opening it could only fail.
     fn ask_before_opening(
         &mut self,
         path: PathBuf,
@@ -938,8 +970,12 @@ impl Workspace {
                     "; as plain text it opens without preview or highlighting"
                 }
             ),
-            _ => "It looks like a binary file, not text.".to_string(),
+            document::OpenCheck::BinaryText => {
+                "It holds binary data, though it reads as text.".to_string()
+            }
+            _ => "It is a binary file, which Malgel can’t show as text.".to_string(),
         };
+        let choices = open_choices(check, media);
         if window.has_active_dialog(cx) {
             self.notify_error(
                 format!("“{name}” was not opened. {description}"),
@@ -965,33 +1001,32 @@ impl Workspace {
                     });
                 }
             };
-            let footer = DialogFooter::new().justify_end().child(
-                Button::new("open-cancel")
-                    .label("Cancel")
-                    .outline()
-                    .on_click(|_, window, cx| window.close_dialog(cx)),
-            );
-            let footer = if media || check == document::OpenCheck::Binary {
-                footer
-            } else {
-                footer.child(
-                    Button::new("open-plain")
+            let mut footer = DialogFooter::new().justify_end();
+            for choice in choices {
+                footer = footer.child(match choice {
+                    OpenChoice::Close(label) => Button::new("open-cancel")
+                        .label(*label)
+                        .outline()
+                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                    OpenChoice::PlainText => Button::new("open-plain")
                         .label("Open as Plain Text")
                         .outline()
                         .on_click(open(OpenMode::PlainText)),
-                )
+                    OpenChoice::Anyway => Button::new("open-anyway")
+                        .label("Open Anyway")
+                        .primary()
+                        .on_click(open(OpenMode::Full)),
+                });
+            }
+            let title = if check == document::OpenCheck::Binary {
+                format!("Can’t open “{name}”")
+            } else {
+                format!("Open “{name}”?")
             };
             alert
-                .title(format!("Open “{name}”?"))
+                .title(title)
                 .description(description.clone())
-                .footer(
-                    footer.child(
-                        Button::new("open-anyway")
-                            .label("Open Anyway")
-                            .primary()
-                            .on_click(open(OpenMode::Full)),
-                    ),
-                )
+                .footer(footer)
         });
     }
 
@@ -1052,6 +1087,7 @@ impl Workspace {
                                     window,
                                     cx,
                                 )
+                                .with_encoding(loaded.encoding)
                             });
                             this.place_document(doc, placement, window, cx);
                         }
@@ -1132,49 +1168,48 @@ impl Workspace {
             }
         }
 
-        if document::is_pdf_path(&path) {
-            // The async spawn_in continuation never resumes under the current
-            // gpui-pre build when spawned from the startup path, so render
-            // inline: PDFs are small and this keeps open/restore working.
-            let result = std::fs::read(&path)
-                .map_err(|e| e.to_string())
-                .and_then(crate::pdf_view::PdfDocument::from_bytes);
-            match result {
-                Ok(document) => {
-                    AppSettings::update(cx, |settings| settings.push_recent(&path));
-                    let doc =
-                        cx.new(|cx| DocumentView::new_pdf(path.clone(), document, window, cx));
-                    self.place_document(doc, placement, window, cx);
+        // A PDF is parsed and a picture decoded off the UI thread, so a large
+        // one never freezes the window while it loads.
+        if document::is_pdf_path(&path) || document::is_image_path(&path) {
+            let pdf = document::is_pdf_path(&path);
+            let read_path = path.clone();
+            let task = cx.background_executor().spawn(async move {
+                let bytes = std::fs::read(&read_path)
+                    .map_err(|err| format!("Couldn\u{2019}t read it. {err}"))?;
+                if pdf {
+                    crate::pdf_view::PdfDocument::from_bytes(bytes).map(MediaLoad::Pdf)
+                } else {
+                    crate::image_view::load_image(&read_path, bytes)
+                        .map(|(image, width, height)| MediaLoad::Image(image, width, height))
                 }
-                Err(err) => {
-                    AppSettings::update(cx, |settings| {
-                        settings.recent_files.retain(|recent| recent != &path)
-                    });
-                    self.notify_error(
-                        format!(
-                            "Couldn’t open “{}”. {err}",
-                            document::display_name(Some(&path))
-                        ),
-                        window,
-                        cx,
-                    );
-                }
-            }
-            return;
-        }
-
-        if document::is_image_path(&path) {
-            match std::fs::read(&path) {
-                Ok(bytes) => match crate::image_view::load_image(&path, bytes) {
-                    Ok((image, width, height)) => {
+            });
+            cx.spawn_in(window, async move |this, cx| {
+                let result = task.await;
+                _ = this.update_in(cx, |this, window, cx| match result {
+                    Ok(media) => {
                         AppSettings::update(cx, |settings| settings.push_recent(&path));
-                        let doc = cx.new(|cx| {
-                            DocumentView::new_image(path.clone(), image, width, height, window, cx)
+                        let doc = cx.new(|cx| match media {
+                            MediaLoad::Pdf(document) => {
+                                DocumentView::new_pdf(path.clone(), document, window, cx)
+                            }
+                            MediaLoad::Image(image, width, height) => DocumentView::new_image(
+                                path.clone(),
+                                image,
+                                width,
+                                height,
+                                window,
+                                cx,
+                            ),
                         });
-                        self.place_document(doc, placement, window, cx);
+                        this.place_document(doc, placement, window, cx);
                     }
                     Err(err) => {
-                        self.notify_error(
+                        if pdf {
+                            AppSettings::update(cx, |settings| {
+                                settings.recent_files.retain(|recent| recent != &path)
+                            });
+                        }
+                        this.notify_error(
                             format!(
                                 "Couldn\u{2019}t open \u{201c}{}\u{201d}. {err}",
                                 document::display_name(Some(&path))
@@ -1183,18 +1218,9 @@ impl Workspace {
                             cx,
                         );
                     }
-                },
-                Err(err) => {
-                    self.notify_error(
-                        format!(
-                            "Couldn\u{2019}t read \u{201c}{}\u{201d}. {err}",
-                            document::display_name(Some(&path))
-                        ),
-                        window,
-                        cx,
-                    );
-                }
-            }
+                });
+            })
+            .detach();
             return;
         }
 
@@ -1214,7 +1240,8 @@ impl Workspace {
                             loaded.line_ending,
                             window,
                             cx,
-                        );
+                        )
+                        .with_encoding(loaded.encoding);
                         if plain {
                             doc.reduce(cx);
                         }
@@ -3987,6 +4014,7 @@ impl Workspace {
                     // The indentation the file uses, detected when it was
                     // read, as VS Code reports it.
                     .child(item(doc.indent().label()))
+                    .children(doc.encoding().label().map(|label| item(label.to_string())))
                     // VS Code's status bar switches the line ending when its
                     // EOL item is clicked; Malgel toggles LF and CRLF there
                     // too.
@@ -4832,6 +4860,25 @@ pub fn restored_bounds(cx: &App) -> Option<WindowBounds> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_binary_file_that_is_not_text_gets_no_way_to_open_it() {
+        use super::{OpenChoice::*, open_choices};
+        use crate::document::OpenCheck;
+        assert_eq!(open_choices(OpenCheck::Binary, false), &[Close("OK")]);
+        assert_eq!(
+            open_choices(OpenCheck::BinaryText, false),
+            &[Close("Cancel"), Anyway]
+        );
+        assert_eq!(
+            open_choices(OpenCheck::Large(1 << 30), false),
+            &[Close("Cancel"), PlainText, Anyway]
+        );
+        assert_eq!(
+            open_choices(OpenCheck::Large(1 << 30), true),
+            &[Close("Cancel"), Anyway]
+        );
+    }
+
     #[test]
     fn several_files_read_text_first_and_viewers_inline() {
         use std::path::Path;

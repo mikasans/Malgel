@@ -39,16 +39,76 @@ impl LineEnding {
     }
 }
 
+/// How a text file is encoded on disk; saved back the same way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Encoding {
+    #[default]
+    Utf8,
+    /// UTF-16 with a byte-order mark, little or big endian.
+    Utf16Le,
+    Utf16Be,
+}
+
+impl Encoding {
+    /// What the status bar shows; UTF-8 needs no mention.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Encoding::Utf8 => None,
+            Encoding::Utf16Le => Some("UTF-16 LE"),
+            Encoding::Utf16Be => Some("UTF-16 BE"),
+        }
+    }
+
+    /// The encoding a byte-order mark at the start of `bytes` names.
+    pub fn from_bom(bytes: &[u8]) -> Self {
+        match bytes {
+            [0xFF, 0xFE, ..] => Encoding::Utf16Le,
+            [0xFE, 0xFF, ..] => Encoding::Utf16Be,
+            _ => Encoding::Utf8,
+        }
+    }
+}
+
 /// Text read from disk, normalized to `\n` line endings for editing.
 pub struct LoadedText {
     pub text: String,
     pub line_ending: LineEnding,
+    pub encoding: Encoding,
 }
 
-/// Read a UTF-8 text file. A byte-order mark is dropped.
+fn decode_utf16(bytes: &[u8], encoding: Encoding) -> io::Result<String> {
+    let body = &bytes[2..];
+    if !body.len().is_multiple_of(2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "The file isn’t valid UTF-16 text.",
+        ));
+    }
+    let units = body.as_chunks::<2>().0.iter().map(|&pair| match encoding {
+        Encoding::Utf16Be => u16::from_be_bytes(pair),
+        _ => u16::from_le_bytes(pair),
+    });
+    char::decode_utf16(units)
+        .collect::<Result<String, _>>()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "The file isn’t valid UTF-16 text.",
+            )
+        })
+}
+
+/// Read a text file: UTF-8, or UTF-16 with a byte-order mark. A byte-order
+/// mark is dropped.
 pub fn load(path: &Path) -> io::Result<LoadedText> {
     let bytes = fs::read(path)?;
-    let text = String::from_utf8(bytes).map_err(|err| {
+    let encoding = Encoding::from_bom(&bytes);
+    let text = if encoding != Encoding::Utf8 {
+        Ok(decode_utf16(&bytes, encoding)?)
+    } else {
+        String::from_utf8(bytes)
+    };
+    let text = text.map_err(|err| {
         // Distinguish a genuinely binary file from text that merely has a
         // stray invalid byte, so the message tells the user what happened.
         let bytes = err.as_bytes();
@@ -69,7 +129,11 @@ pub fn load(path: &Path) -> io::Result<LoadedText> {
     if line_ending == LineEnding::CrLf {
         text = text.replace("\r\n", "\n");
     }
-    Ok(LoadedText { text, line_ending })
+    Ok(LoadedText {
+        text,
+        line_ending,
+        encoding,
+    })
 }
 
 /// Whether `bytes` look like binary data rather than text: a NUL byte, or a
@@ -94,9 +158,30 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
 /// flushed, then renamed over the target, so a crash never leaves a
 /// half-written document behind.
 pub fn save(path: &Path, text: &str, line_ending: LineEnding) -> io::Result<()> {
+    save_encoded(path, text, line_ending, Encoding::Utf8)
+}
+
+/// Write `text` to `path` in `encoding`; UTF-16 gets its byte-order mark.
+pub fn save_encoded(
+    path: &Path,
+    text: &str,
+    line_ending: LineEnding,
+    encoding: Encoding,
+) -> io::Result<()> {
     let contents = match line_ending {
         LineEnding::CrLf => text.replace('\n', "\r\n"),
         LineEnding::Lf => text.to_string(),
+    };
+    let contents = match encoding {
+        Encoding::Utf8 => contents.into_bytes(),
+        Encoding::Utf16Le => [0xFF, 0xFE]
+            .into_iter()
+            .chain(contents.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect(),
+        Encoding::Utf16Be => [0xFE, 0xFF]
+            .into_iter()
+            .chain(contents.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect(),
     };
 
     let dir = path
@@ -114,7 +199,7 @@ pub fn save(path: &Path, text: &str, line_ending: LineEnding) -> io::Result<()> 
 
     let result = (|| {
         let mut file = fs::File::create(&temp)?;
-        file.write_all(contents.as_bytes())?;
+        file.write_all(&contents)?;
         file.sync_all()?;
         // Keep the permissions of the file being replaced.
         if let Ok(metadata) = fs::metadata(path) {
@@ -396,9 +481,16 @@ pub enum OpenCheck {
     Fine,
     /// Larger than the threshold for its kind; the size in bytes.
     Large(u64),
-    /// Text by its name, but its first bytes hold NUL characters.
+    /// Text by its name, but its first bytes hold NUL characters, and it is
+    /// still valid UTF-8, so it can be opened as text if the user wants.
+    BinaryText,
+    /// Text by its name but not text: it cannot be opened in the editor.
     Binary,
 }
+
+/// Past this size a file with NUL bytes is not read whole to see whether it
+/// is UTF-8 after all; it is treated as binary.
+const BINARY_VALIDATE_BYTES: u64 = 16 * 1024 * 1024;
 
 pub fn open_check(path: &Path) -> OpenCheck {
     let Ok(metadata) = fs::metadata(path) else {
@@ -420,10 +512,18 @@ pub fn open_check(path: &Path) -> OpenCheck {
     let read = fs::File::open(path)
         .and_then(|mut file| std::io::Read::read(&mut file, &mut head))
         .unwrap_or(0);
-    if head[..read].contains(&0) {
-        OpenCheck::Binary
+    let head = &head[..read];
+    // UTF-16 holds NUL bytes in every ASCII character; its byte-order mark
+    // says it is text.
+    if Encoding::from_bom(head) != Encoding::Utf8 || !head.contains(&0) {
+        return OpenCheck::Fine;
+    }
+    if size <= BINARY_VALIDATE_BYTES
+        && fs::read(path).is_ok_and(|bytes| std::str::from_utf8(&bytes).is_ok())
+    {
+        OpenCheck::BinaryText
     } else {
-        OpenCheck::Fine
+        OpenCheck::Binary
     }
 }
 
@@ -436,6 +536,38 @@ pub fn display_name(path: Option<&PathBuf>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn utf16_with_a_bom_opens_and_saves_byte_for_byte() {
+        use super::{Encoding, OpenCheck, load, open_check, save_encoded};
+        let dir = std::env::temp_dir().join(format!("malgel-u16-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes, encoding) in [
+            (
+                "le.md",
+                &b"\xff\xfeh\x00i\x00\r\x00\n\x00"[..],
+                Encoding::Utf16Le,
+            ),
+            ("be.md", &b"\xfe\xff\x00h\x00i\x00\n"[..], Encoding::Utf16Be),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(open_check(&path), OpenCheck::Fine, "{name}");
+            let loaded = load(&path).unwrap();
+            assert_eq!(loaded.text, "hi\n");
+            assert_eq!(loaded.encoding, encoding);
+            save_encoded(&path, &loaded.text, loaded.line_ending, loaded.encoding).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name} round trip");
+        }
+        // A picture under a text name cannot be opened; UTF-8 with NULs can.
+        let png = dir.join("x.md");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xd8").unwrap();
+        assert_eq!(open_check(&png), OpenCheck::Binary);
+        let nul = dir.join("nul.md");
+        std::fs::write(&nul, b"text\x00more").unwrap();
+        assert_eq!(open_check(&nul), OpenCheck::BinaryText);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn language_names_follow_the_extension() {
         use std::path::Path;
@@ -471,6 +603,8 @@ mod tests {
         assert_eq!(open_check(&small), OpenCheck::Fine);
         let binary = dir.join("b.md");
         std::fs::write(&binary, [b'#', 0, 1, 2]).unwrap();
+        assert_eq!(open_check(&binary), OpenCheck::BinaryText);
+        std::fs::write(&binary, [b'#', 0, 0xff, 2]).unwrap();
         assert_eq!(open_check(&binary), OpenCheck::Binary);
         let big = dir.join("c.md");
         let file = std::fs::File::create(&big).unwrap();

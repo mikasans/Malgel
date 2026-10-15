@@ -117,6 +117,8 @@ pub struct DocumentView {
 
     path: Option<PathBuf>,
     line_ending: LineEnding,
+    /// How the file is encoded on disk; saved back the same way.
+    encoding: crate::document::Encoding,
     /// The line ending last read from or written to disk, so that changing
     /// only the line ending still counts as an unsaved change.
     saved_line_ending: LineEnding,
@@ -140,6 +142,8 @@ pub struct DocumentView {
     /// Highlighting, preview, outline and spell checking are off, as VS Code
     /// does for a large file, until "Enable anyway" in the info bar.
     reduced: bool,
+    /// The large-file info bar was closed for this tab.
+    bar_dismissed: bool,
     /// A heading to show once the outline is known, from following a link.
     pending_anchor: Option<String>,
 
@@ -248,6 +252,8 @@ impl DocumentView {
             preview_limited: false,
             large: false,
             reduced: false,
+            bar_dismissed: false,
+            encoding: Default::default(),
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -398,6 +404,8 @@ impl DocumentView {
             preview_limited: false,
             large: false,
             reduced: false,
+            bar_dismissed: false,
+            encoding: Default::default(),
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -450,6 +458,8 @@ impl DocumentView {
             preview_limited: false,
             large: false,
             reduced: false,
+            bar_dismissed: false,
+            encoding: Default::default(),
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -512,6 +522,8 @@ impl DocumentView {
             preview_limited: false,
             large: false,
             reduced: false,
+            bar_dismissed: false,
+            encoding: Default::default(),
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -713,6 +725,16 @@ impl DocumentView {
 
     pub fn analysis(&self) -> &Arc<Analysis> {
         &self.analysis
+    }
+
+    /// Record the encoding the file was read in, so saving keeps it.
+    pub fn with_encoding(mut self, encoding: crate::document::Encoding) -> Self {
+        self.encoding = encoding;
+        self
+    }
+
+    pub fn encoding(&self) -> crate::document::Encoding {
+        self.encoding
     }
 
     pub fn line_ending(&self) -> LineEnding {
@@ -1038,7 +1060,7 @@ impl DocumentView {
             return Ok(());
         }
         let text = self.editor.read(cx).value();
-        crate::document::save(path, &text, self.line_ending)?;
+        crate::document::save_encoded(path, &text, self.line_ending, self.encoding)?;
         self.saved_line_ending = self.line_ending;
         self.saved_hash = content_hash(&text);
         self.dirty = !self.large && self.source.as_ref() != text.as_ref();
@@ -1813,39 +1835,51 @@ impl DocumentView {
     /// and folding are off; it does not block anything.
     fn render_large_file_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let megabytes = self.editor.read(cx).text().len() as f64 / (1024. * 1024.);
+        let state = if self.reduced {
+            LargeFileState::Reduced
+        } else if self.analysis_task.is_some() {
+            LargeFileState::Building
+        } else {
+            LargeFileState::Enabled
+        };
+        // The window's own text colours, which every built-in theme keeps
+        // legible (see `the_large_file_bar_is_legible_in_every_theme`).
         h_flex()
             .id("large-file-bar")
             .w_full()
             .flex_none()
-            .gap_3()
+            .items_center()
+            .gap_2()
             .px_3()
             .py_1()
             .border_b_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().secondary)
+            .bg(cx.theme().background)
             .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(div().flex_1().child(if self.reduced {
-                format!(
-                    "Large file ({megabytes:.1} MB): highlighting, preview, outline and spell \
-                     checking are off to save memory."
-                )
-            } else if self.analysis_task.is_some() {
-                format!("Large file ({megabytes:.1} MB): building the outline and preview…")
-            } else {
-                format!(
-                    "Large file ({megabytes:.1} MB): preview (of the beginning) and outline \
-                     are on; highlighting and spell checking stay off at this size."
-                )
-            }))
+            .text_color(cx.theme().foreground)
+            .child(
+                gpui_kit::component::Icon::new(gpui_kit::component::IconName::Info)
+                    .text_color(cx.theme().primary),
+            )
+            .child(div().flex_1().child(large_file_message(megabytes, state)))
             .when(self.reduced, |bar| {
                 bar.child(
                     Button::new("enable-large-file-features")
-                        .label("Enable anyway")
+                        .label("Turn on preview and outline")
                         .ghost()
                         .on_click(cx.listener(|this, _, _, cx| this.enable_anyway(cx))),
                 )
             })
+            .child(
+                Button::new("dismiss-large-file-bar")
+                    .ghost()
+                    .icon(gpui_kit::assets::IconName::X)
+                    .tooltip("Dismiss")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.bar_dismissed = true;
+                        cx.notify();
+                    })),
+            )
     }
 
     fn render_editor(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2095,7 +2129,7 @@ impl Render for DocumentView {
                 )
                 .into_any_element(),
         };
-        if !self.large {
+        if !self.large || self.bar_dismissed {
             return body;
         }
         v_flex()
@@ -2103,6 +2137,31 @@ impl Render for DocumentView {
             .child(self.render_large_file_bar(cx))
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LargeFileState {
+    Reduced,
+    Building,
+    Enabled,
+}
+
+/// What the large-file info bar says. It never promises highlighting or
+/// spell checking: those stay off for a large file.
+fn large_file_message(megabytes: f64, state: LargeFileState) -> String {
+    match state {
+        LargeFileState::Reduced => format!(
+            "Large file ({megabytes:.1} MB): preview and outline are off to save memory; \
+             highlighting and spell checking stay off at this size."
+        ),
+        LargeFileState::Building => {
+            format!("Large file ({megabytes:.1} MB): building the outline and preview…")
+        }
+        LargeFileState::Enabled => format!(
+            "Large file ({megabytes:.1} MB): preview (of the beginning) and outline are on; \
+             highlighting and spell checking stay off at this size."
+        ),
     }
 }
 
@@ -2327,6 +2386,52 @@ fn column_inset(width: Pixels, cx: &App) -> Pixels {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_large_file_bar_promises_only_what_it_turns_on() {
+        use super::{LargeFileState::*, large_file_message};
+        let reduced = large_file_message(19.3, Reduced);
+        assert!(reduced.contains("19.3 MB") && reduced.contains("stay off"));
+        let enabled = large_file_message(19.3, Enabled);
+        assert!(enabled.contains("preview") && enabled.contains("outline are on"));
+        assert!(enabled.contains("highlighting and spell checking stay off"));
+        assert!(large_file_message(1., Building).contains("building"));
+    }
+
+    /// The bar draws `foreground` on `background`: WCAG AA (4.5:1) in every
+    /// built-in theme.
+    #[test]
+    fn the_large_file_bar_is_legible_in_every_theme() {
+        fn luminance(hex: &str) -> f64 {
+            let hex = hex.trim_start_matches('#');
+            let channel = |i: usize| {
+                let c = u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.;
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("themes");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap();
+            for theme in json["themes"].as_array().unwrap() {
+                let colors = &theme["colors"];
+                let (fg, bg) = (
+                    luminance(colors["foreground"].as_str().unwrap()),
+                    luminance(colors["background"].as_str().unwrap()),
+                );
+                let ratio = (fg.max(bg) + 0.05) / (fg.min(bg) + 0.05);
+                assert!(ratio >= 4.5, "{}: {ratio:.2}", theme["name"]);
+                checked += 1;
+            }
+        }
+        assert!(checked >= 8);
+    }
+
     #[test]
     fn a_large_document_previews_its_beginning_under_a_note() {
         let line = "word ".repeat(20) + "\n";
