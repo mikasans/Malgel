@@ -2236,9 +2236,11 @@ impl Workspace {
         let state = state.clone();
         let workspace = cx.weak_entity();
         let apply = Rc::new(apply);
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let focus = state.read(cx).focus_handle(cx);
-            window.defer(cx, move |window, cx| focus.focus(window, cx));
+        // Focus the query once, after the dialog has taken focus. Not in the
+        // builder: that runs on every render and kept pulling focus back.
+        let focus = state.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        window.open_dialog(cx, move |dialog, _window, _cx| {
             let typed = state.clone();
             let workspace = workspace.clone();
             let apply = apply.clone();
@@ -3403,9 +3405,11 @@ impl Workspace {
             .update(cx, |state, cx| state.set_query("", window, cx));
         let headings = self.headings.clone();
         let doc = self.active_document().clone();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let focus = headings.read(cx).focus_handle(cx);
-            window.defer(cx, move |window, cx| focus.focus(window, cx));
+        // Focus the query once, after the dialog has taken focus. Not in the
+        // builder: that runs on every render and kept pulling focus back.
+        let focus = headings.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let outline = doc.read(cx).analysis().outline.clone();
             let items = outline.iter().map(|heading| {
                 CommandItem::new()
@@ -3484,9 +3488,11 @@ impl Workspace {
                 recent.push(path.clone());
             }
         }
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let focus = state.read(cx).focus_handle(cx);
-            window.defer(cx, move |window, cx| focus.focus(window, cx));
+        // Focus the query once, after the dialog has taken focus. Not in the
+        // builder: that runs on every render and kept pulling focus back.
+        let focus = state.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        window.open_dialog(cx, move |dialog, _window, cx| {
             // A query that is a path is checked directly, VS Code style: a
             // file that exists is offered even when the listing left it out
             // (ignored, too deep, outside the folder), and a folder lists its
@@ -3625,9 +3631,11 @@ impl Workspace {
         // it from there.
         let ws_focus = self.focus_handle.clone();
         let restore = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let focus = state.read(cx).focus_handle(cx);
-            window.defer(cx, move |window, cx| focus.focus(window, cx));
+        // Focus the query once, after the dialog has taken focus. Not in the
+        // builder: that runs on every render and kept pulling focus back.
+        let focus = state.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        window.open_dialog(cx, move |dialog, _window, _cx| {
             let specs = commands::groups();
             let rows = commands::palette(&specs);
             let actions = commands::actions(&specs);
@@ -3684,9 +3692,11 @@ impl Workspace {
         self.go_to_line
             .update(cx, |state, cx| state.set_query("", window, cx));
         let state = self.go_to_line.clone();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let focus = state.read(cx).focus_handle(cx);
-            window.defer(cx, move |window, cx| focus.focus(window, cx));
+        // Focus the query once, after the dialog has taken focus. Not in the
+        // builder: that runs on every render and kept pulling focus back.
+        let focus = state.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        window.open_dialog(cx, move |dialog, _window, _cx| {
             let typed = state.clone();
             dialog.close_button(false).p_0().child(esc_closes(
                 Command::new(&state)
@@ -3780,9 +3790,11 @@ impl Workspace {
         };
         let revert = Rc::new(revert);
         let workspace = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let focus = state.read(cx).focus_handle(cx);
-            window.defer(cx, move |window, cx| focus.focus(window, cx));
+        // Focus the query once, after the dialog has taken focus. Not in the
+        // builder: that runs on every render and kept pulling focus back.
+        let focus = state.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        window.open_dialog(cx, move |dialog, _window, _cx| {
             let group = |label: &'static str, names: &[SharedString]| {
                 CommandGroup::new()
                     .label(label)
