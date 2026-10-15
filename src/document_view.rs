@@ -2504,6 +2504,43 @@ impl DocumentView {
                 .absolute()
                 .inset_0(),
             )
+            .child(self.render_other_match_outlines(cx))
+    }
+
+    /// Find's other matches: the editor paints them as a faint, desaturated
+    /// copy of the selection that all but vanishes on light backgrounds.
+    /// Outline each one in the theme's warning (amber) color, without
+    /// covering the glyphs; the current match keeps the selection fill.
+    fn render_other_match_outlines(&self, cx: &App) -> impl IntoElement {
+        let editor = self.editor.read(cx);
+        let session = editor.search_session();
+        let mut boxes = Vec::new();
+        if session.open && !session.query.is_empty() {
+            let viewport = editor.input_bounds();
+            let ranges = session.matcher.matched_ranges();
+            for range in other_matches(&ranges, session.matcher.current_match_index()) {
+                let Some(bounds) = editor.range_to_bounds(range) else {
+                    continue;
+                };
+                if bounds.intersects(&viewport) {
+                    boxes.push(bounds.intersect(&viewport));
+                }
+                if boxes.len() >= MAX_MATCH_OUTLINES {
+                    break;
+                }
+            }
+        }
+        let color = cx.theme().warning;
+        canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                for bounds in &boxes {
+                    window.paint_quad(gpui_kit::outline(*bounds, color, Default::default()));
+                }
+            },
+        )
+        .absolute()
+        .inset_0()
     }
 
     fn render_preview(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3039,6 +3076,19 @@ fn extend_line_selection(text: &str, anchor: &Range<usize>, caret: usize) -> Ran
     anchor.start.min(line.start)..anchor.end.max(line.end)
 }
 
+/// Outlines drawn at most per frame; more matches than this on screen only
+/// happen in a tiny font, where the fill alone is enough.
+const MAX_MATCH_OUTLINES: usize = 400;
+
+/// Every match but the current one, in document order.
+fn other_matches(ranges: &[Range<usize>], current: usize) -> impl Iterator<Item = &Range<usize>> {
+    ranges
+        .iter()
+        .enumerate()
+        .filter(move |(ix, _)| *ix != current)
+        .map(|(_, range)| range)
+}
+
 /// The first line to show when `rows` were on screen and the caret is on
 /// line `caret`: the caret keeps its distance from the top when visible.
 fn anchor_for(rows: Range<usize>, caret: usize) -> f32 {
@@ -3103,6 +3153,14 @@ mod tests {
         assert_eq!(anchor_for(100..140, 500), 100.);
         assert_eq!(centered_top(200, 40), 180.);
         assert_eq!(centered_top(3, 40), 0.);
+    }
+
+    #[test]
+    fn find_outlines_every_match_but_the_current_one() {
+        let ranges = vec![0..3, 10..13, 20..23];
+        let others: Vec<_> = super::other_matches(&ranges, 1).cloned().collect();
+        assert_eq!(others, vec![0..3, 20..23]);
+        assert_eq!(super::other_matches(&ranges, 9).count(), 3);
     }
 
     #[test]
