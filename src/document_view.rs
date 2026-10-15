@@ -176,6 +176,8 @@ pub struct DocumentView {
     /// Where the caret goes once a loading tab's text arrives, reported as
     /// its cursor meanwhile so a session saved now keeps it.
     pending_cursor: usize,
+    /// The layout and focus mode last applied, to notice a switch.
+    last_shape: Option<(Layout, bool)>,
     /// The line(s) a press on the line numbers started on, while it drags.
     gutter_anchor: Option<Range<usize>>,
     /// A Typst source's live preview: its compiler thread and the pages.
@@ -233,6 +235,16 @@ impl DocumentView {
                 }
             }),
             cx.observe_global_in::<AppSettings>(window, |this, window, cx| {
+                let settings = AppSettings::get(cx);
+                let shape = (settings.layout, settings.focus_mode);
+                if this
+                    .last_shape
+                    .replace(shape)
+                    .is_some_and(|last| last != shape)
+                    && let Some(line) = this.anchor_line(cx)
+                {
+                    this.editor_scroll_target = Some(EditorScrollTarget { line, attempts: 0 });
+                }
                 this.apply_settings(window, cx);
                 this.sync_preview(true, cx);
                 cx.notify();
@@ -279,6 +291,7 @@ impl DocumentView {
             editor_width: px(0.),
             preview_width: px(0.),
             loading: false,
+            last_shape: None,
             gutter_anchor: None,
             live: None,
             pending_cursor: 0,
@@ -453,6 +466,7 @@ impl DocumentView {
             editor_width: px(0.),
             preview_width: px(0.),
             loading: false,
+            last_shape: None,
             gutter_anchor: None,
             live: None,
             pending_cursor: 0,
@@ -510,6 +524,7 @@ impl DocumentView {
             editor_width: px(0.),
             preview_width: px(0.),
             loading: false,
+            last_shape: None,
             gutter_anchor: None,
             live: None,
             pending_cursor: 0,
@@ -738,7 +753,26 @@ impl DocumentView {
         let len = rope.len();
         let row = (line.max(1) - 1).min(rope.lines_len().saturating_sub(1));
         let offset = rope.line_start_offset(row);
+        let shown = editor.visible_row_range().map_or(0, |rows| rows.len());
         self.set_cursor(offset.min(len), window, cx);
+        // The line lands in the middle of the view, as VS Code's Go to Line
+        // puts it, not wherever scrolling just far enough leaves it.
+        self.editor_scroll_target = Some(EditorScrollTarget {
+            line: centered_top(row, shown),
+            attempts: 0,
+        });
+        self.scroll_editor_to_target(cx);
+    }
+
+    /// The line to keep at the top across a change of layout: the caret's
+    /// line keeps its place when it is on screen (a few lines down), the
+    /// first visible line otherwise. Soft wrap changes with the width, so a
+    /// pixel offset would land somewhere else.
+    fn anchor_line(&self, cx: &App) -> Option<f32> {
+        let editor = self.editor.read(cx);
+        let rows = editor.visible_row_range()?;
+        let caret = editor.text().offset_to_position(editor.cursor()).line as usize;
+        Some(anchor_for(rows, caret))
     }
 
     /// Replace the document with `text` read from `path`.
@@ -2286,6 +2320,9 @@ impl DocumentView {
                 // Notifying mid-frame can be lost; update once the frame is done.
                 cx.defer(move |cx| {
                     _ = document.update(cx, |this, cx| {
+                        if this.editor_scroll_target.is_some() {
+                            this.scroll_editor_to_target(cx);
+                        }
                         if (this.editor_width - bounds.size.width).abs() >= px(1.) {
                             this.editor_width = bounds.size.width;
                             cx.notify();
@@ -2805,6 +2842,21 @@ fn line_range_at(text: &str, offset: usize) -> Range<usize> {
     start..end
 }
 
+/// The first line to show when `rows` were on screen and the caret is on
+/// line `caret`: the caret keeps its distance from the top when visible.
+fn anchor_for(rows: Range<usize>, caret: usize) -> f32 {
+    if rows.contains(&caret) {
+        caret.saturating_sub((caret - rows.start).min(5)) as f32
+    } else {
+        rows.start as f32
+    }
+}
+
+/// The top line that puts `line` in the middle of `shown` lines.
+fn centered_top(line: usize, shown: usize) -> f32 {
+    line.saturating_sub(shown / 2) as f32
+}
+
 /// How many digits the gutter keeps room for: three at least, up to seven,
 /// as the editor lays it out.
 fn line_number_digits(lines: usize) -> usize {
@@ -2835,6 +2887,16 @@ mod tests {
         assert!(left > px(200.), "centered layout centers");
         let (left, _) = editor_side_padding(px(2000.), rem, true, false);
         assert!(left > px(200.), "focus mode centers");
+    }
+
+    #[test]
+    fn a_layout_switch_keeps_the_caret_line_and_go_to_line_centers() {
+        use super::{anchor_for, centered_top};
+        assert_eq!(anchor_for(100..140, 120), 115.);
+        assert_eq!(anchor_for(100..140, 102), 100.);
+        assert_eq!(anchor_for(100..140, 500), 100.);
+        assert_eq!(centered_top(200, 40), 180.);
+        assert_eq!(centered_top(3, 40), 0.);
     }
 
     #[test]
