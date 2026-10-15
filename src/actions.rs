@@ -42,6 +42,7 @@ actions!(
         ToggleSoftWrap,
         ToggleLineNumbers,
         ToggleAppearance,
+        SelectColorTheme,
         ToggleTabs,
         ToggleFileSidebar,
         ToggleOutline,
@@ -206,6 +207,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-w", CloseOtherTabs, workspace),
         // VS Code's Close All Editors and Reopen Closed Editor.
         KeyBinding::new("secondary-k secondary-w", CloseAllTabs, workspace),
+        // VS Code's chord, where Ctrl+K is not taken: outside the editor
+        // (there it is Link) and off macOS (see Open folder above). The
+        // palette's "Color theme…" reaches it from anywhere.
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("secondary-k secondary-t", SelectColorTheme, workspace),
         KeyBinding::new("secondary-shift-t", ReopenClosedEditor, workspace),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("alt-left", GoBack, workspace),

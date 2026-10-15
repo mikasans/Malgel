@@ -66,11 +66,20 @@ pub fn palette(groups: &[CommandGroupSpec]) -> Vec<CommandGroup> {
                     group.item(
                         CommandItem::new()
                             .label(item.label)
+                            .keywords(keywords(item.label))
                             .icon(Icon::new(item.icon)),
                     )
                 })
         })
         .collect()
+}
+
+/// What a row answers to besides its label: VS Code's names for it.
+fn keywords(label: &'static str) -> Vec<&'static str> {
+    match label {
+        "Color theme…" => vec![label, "theme", "colour theme", "preferences color theme"],
+        _ => vec![label],
+    }
 }
 
 /// The action behind every row, by group and by position within it — the same
@@ -219,6 +228,7 @@ pub fn groups() -> Vec<CommandGroupSpec> {
         "Settings",
         vec![
             cmd("Settings…", IconName::Settings, OpenSettings),
+            cmd("Color theme…", IconName::Sun, SelectColorTheme),
             cmd(
                 "Appearance: follow the system",
                 IconName::Sun,
@@ -246,4 +256,21 @@ pub fn groups() -> Vec<CommandGroupSpec> {
     );
 
     vec![file, explorer, edit, go, view, format, settings, help]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_palette_offers_the_color_theme_picker() {
+        let groups = groups();
+        let item = groups
+            .iter()
+            .flat_map(|group| &group.items)
+            .find(|item| item.label == "Color theme…")
+            .expect("Color theme… is in the palette");
+        assert!(item.action.partial_eq(&SelectColorTheme));
+        assert!(keywords(item.label).contains(&"theme"));
+    }
 }
