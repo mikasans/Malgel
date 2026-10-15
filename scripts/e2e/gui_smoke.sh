@@ -984,6 +984,48 @@ shot 43d-scrolled-click
   || fail "line-number click after Ctrl+End copied '${GOT:0:80}' (at $GX,$GY)"
 pass "line-number click after scrolling selects that line"
 
+# 21a3. G9: plain text (.txt) keeps the same gutter-to-text gap as Markdown.
+printf 'gap\nmmmm\n' >"$WS/notes/gap.md"
+printf 'gap\nmmmm\n' >"$WS/notes/gap.txt"
+text_x() { # text_x <shot>: x where row 2's text starts, after the digits
+  python3 - "$ART_DIR/$1.png" <<'PY'
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("L")
+w, h = im.size
+bg = im.getpixel((int(w * 0.6), int(h * 0.85)))
+rows, prev = [], False
+for y in range(int(h * 0.16), int(h * 0.5)):
+    xs = [x for x in range(int(w * 0.30), int(w * 0.75)) if abs(im.getpixel((x, y)) - bg) > 60]
+    ink = len(xs) >= 2
+    if ink and not prev:
+        rows.append(set())
+    if ink:
+        rows[-1].update(xs)
+    prev = ink
+xs = sorted(rows[1])
+for a, b in zip(xs, xs[1:]):
+    if b - a > 10:
+        print(b); break
+else:
+    raise SystemExit("no gap between digits and text")
+PY
+}
+for f in gap.md gap.txt; do
+  xdotool key --clearmodifiers ctrl+p
+  sleep 0.5
+  xdotool type --delay 30 "$f"
+  xdotool key --clearmodifiers Return
+  sleep 1.0
+  shot "43e-$f"
+done
+XMD="$(text_x 43e-gap.md)" || fail "no text edge in gap.md"
+XTXT="$(text_x 43e-gap.txt)" || fail "no text edge in gap.txt"
+echo "gap: md text@$XMD txt text@$XTXT"
+(( XMD - XTXT <= 1 && XTXT - XMD <= 1 )) \
+  || fail "plain-text gutter gap differs from Markdown (md $XMD, txt $XTXT)"
+pass "plain text keeps the Markdown gutter-to-text gap"
+
 # 21b. External edit while dirty: Ctrl+S must not clobber the on-disk line.
 #     The conflict alert must take keyboard focus: typing must not reach the
 #     file, and Esc must dismiss the dialog (Keep) without writing.

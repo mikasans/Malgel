@@ -207,7 +207,7 @@ impl DocumentView {
             EditorState::new(window, cx)
                 .language("markdown")
                 .line_number(show_line_numbers(&settings))
-                .folding(shows_folding("markdown", settings.focus_mode))
+                .folding(shows_folding(settings.focus_mode))
                 .soft_wrap(settings.soft_wrap)
                 .tab_size(TabSize {
                     tab_size: 2,
@@ -830,7 +830,7 @@ impl DocumentView {
         let focus_mode = AppSettings::get(cx).focus_mode;
         self.editor.update(cx, |editor, cx| {
             editor.set_highlighter(language, cx);
-            editor.set_folding(shows_folding(language, focus_mode), window, cx);
+            editor.set_folding(shows_folding(focus_mode), window, cx);
             editor.set_tab_size(
                 TabSize {
                     tab_size: indent.size,
@@ -1457,15 +1457,10 @@ impl DocumentView {
 
     fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let settings = AppSettings::get(cx).clone();
-        let language = if self.reduced {
-            "text"
-        } else {
-            self.highlight_language()
-        };
         self.editor.update(cx, |editor, cx| {
             editor.set_soft_wrap(settings.soft_wrap, window, cx);
             editor.set_line_number(show_line_numbers(&settings), window, cx);
-            editor.set_folding(shows_folding(language, settings.focus_mode), window, cx);
+            editor.set_folding(shows_folding(settings.focus_mode), window, cx);
         });
         self.schedule_spell_check(false, cx);
         self.focus_block = None;
@@ -2984,10 +2979,11 @@ fn show_line_numbers(settings: &crate::settings::Settings) -> bool {
     settings.line_numbers && !settings.focus_mode
 }
 
-/// Folding arrows: not in focus mode, and not for plain text, which has no
-/// blocks to fold.
-fn shows_folding(language: &str, focus_mode: bool) -> bool {
-    !focus_mode && language != "text"
+/// The folding column: everywhere but focus mode. Plain text (.txt, .typ)
+/// has nothing to fold, but keeps the empty column so the gap between the
+/// line numbers and the text matches Markdown and code (~1.5ch, G9).
+fn shows_folding(focus_mode: bool) -> bool {
+    !focus_mode
 }
 
 /// The editor's left and right padding in a pane `width` wide. Normally the
@@ -3097,8 +3093,6 @@ mod tests {
     #[test]
     fn plain_text_files_do_not_fold_as_markdown() {
         // G8: .txt used to fall through highlight_language to "markdown".
-        assert!(!super::shows_folding("text", false));
-        assert!(super::shows_folding("markdown", false));
     }
 
     #[test]
@@ -3152,13 +3146,9 @@ mod tests {
         settings.focus_mode = false;
         settings.line_numbers = false;
         assert!(!show_line_numbers(&settings));
-        assert!(shows_folding("markdown", false));
-        assert!(shows_folding("rust", false));
-        assert!(
-            !shows_folding("text", false),
-            "plain text has nothing to fold"
-        );
-        assert!(!shows_folding("markdown", true));
+        // Plain text keeps the (empty) column so its gutter gap matches.
+        assert!(shows_folding(false));
+        assert!(!shows_folding(true));
     }
 
     #[test]
