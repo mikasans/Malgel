@@ -112,6 +112,45 @@ pub fn write_recovery(id: &str, recovery: &Recovery) -> std::io::Result<()> {
     document::save(&path, &json, LineEnding::Lf)
 }
 
+/// Like `write_recovery`, with the text given as chunks (a rope's) that are
+/// escaped into the file one by one, so a large document is never held as
+/// one string. `recovery.text` is ignored.
+pub fn write_recovery_chunks<'a>(
+    id: &str,
+    recovery: &Recovery,
+    chunks: impl IntoIterator<Item = &'a str>,
+) -> std::io::Result<()> {
+    let path = recovery_path(id).ok_or_else(|| std::io::Error::other("no config folder"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let partial = path.with_extension("partial");
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&partial)?);
+    recovery_json(&mut out, recovery, chunks)?;
+    out.into_inner()
+        .map_err(|err| err.into_error())?
+        .sync_all()?;
+    std::fs::rename(partial, path)
+}
+
+fn recovery_json<'a>(
+    out: &mut impl std::io::Write,
+    recovery: &Recovery,
+    chunks: impl IntoIterator<Item = &'a str>,
+) -> std::io::Result<()> {
+    let path_json = serde_json::to_string(&recovery.path).map_err(std::io::Error::other)?;
+    write!(
+        out,
+        "{{\"path\":{path_json},\"crlf\":{},\"text\":\"",
+        recovery.crlf
+    )?;
+    for chunk in chunks {
+        let quoted = serde_json::to_string(chunk).map_err(std::io::Error::other)?;
+        out.write_all(&quoted.as_bytes()[1..quoted.len() - 1])?;
+    }
+    out.write_all(b"\"}")
+}
+
 pub fn read_recovery(id: &str) -> Option<Recovery> {
     let json = std::fs::read_to_string(recovery_path(id)?).ok()?;
     serde_json::from_str(&json).ok()
@@ -178,6 +217,23 @@ impl DiskStamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_streamed_recovery_reads_back_as_the_same_text() {
+        let text = "line \"one\"\n\ttab \\ 标题\u{1}";
+        let recovery = Recovery {
+            path: Some(PathBuf::from("/tmp/a b.md")),
+            text: String::new(),
+            crlf: true,
+        };
+        let mut out = Vec::new();
+        let chunks = ["line \"one\"\n", "\ttab \\ ", "标题\u{1}"];
+        recovery_json(&mut out, &recovery, chunks).unwrap();
+        let back: Recovery = serde_json::from_slice(&out).unwrap();
+        assert_eq!(back.text, text);
+        assert_eq!(back.path, recovery.path);
+        assert!(back.crlf);
+    }
 
     #[test]
     fn round_trips_sessions_and_recovery() {
