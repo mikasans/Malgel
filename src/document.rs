@@ -377,6 +377,50 @@ fn detect_indent_or(text: &str, fallback: Indent) -> Indent {
     }
 }
 
+/// Past this size a text file is not read until the user says how to open
+/// it, the way VS Code asks before opening a very large file.
+pub const PROMPT_TEXT_BYTES: u64 = 16 * 1024 * 1024;
+/// Past this size a PDF or picture asks first too: it is read whole.
+pub const PROMPT_MEDIA_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether a file can be opened straight away, judged from its size and its
+/// first few kilobytes only; nothing else is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenCheck {
+    Fine,
+    /// Larger than the threshold for its kind; the size in bytes.
+    Large(u64),
+    /// Text by its name, but its first bytes hold NUL characters.
+    Binary,
+}
+
+pub fn open_check(path: &Path) -> OpenCheck {
+    let Ok(metadata) = fs::metadata(path) else {
+        return OpenCheck::Fine;
+    };
+    let size = metadata.len();
+    let media = is_pdf_path(path) || is_image_path(path) || is_typst_path(path);
+    if media {
+        return if size > PROMPT_MEDIA_BYTES {
+            OpenCheck::Large(size)
+        } else {
+            OpenCheck::Fine
+        };
+    }
+    if size > PROMPT_TEXT_BYTES {
+        return OpenCheck::Large(size);
+    }
+    let mut head = [0u8; 8192];
+    let read = fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read(&mut file, &mut head))
+        .unwrap_or(0);
+    if head[..read].contains(&0) {
+        OpenCheck::Binary
+    } else {
+        OpenCheck::Fine
+    }
+}
+
 /// The name shown for a document in the title bar and dialogs.
 pub fn display_name(path: Option<&PathBuf>) -> String {
     path.and_then(|path| path.file_name())
@@ -409,6 +453,32 @@ mod tests {
         assert!(super::has_markdown_preview(None));
         assert!(super::has_markdown_preview(Some(Path::new("a.md"))));
         assert!(!super::has_markdown_preview(Some(Path::new("a.rs"))));
+    }
+
+    #[test]
+    fn large_and_binary_files_are_caught_before_reading() {
+        use super::{OpenCheck, PROMPT_TEXT_BYTES, open_check};
+        let dir = std::env::temp_dir().join(format!("malgel-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("a.md");
+        std::fs::write(&small, "# hi\n").unwrap();
+        assert_eq!(open_check(&small), OpenCheck::Fine);
+        let binary = dir.join("b.md");
+        std::fs::write(&binary, [b'#', 0, 1, 2]).unwrap();
+        assert_eq!(open_check(&binary), OpenCheck::Binary);
+        let big = dir.join("c.md");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(PROMPT_TEXT_BYTES + 1).unwrap();
+        assert_eq!(open_check(&big), OpenCheck::Large(PROMPT_TEXT_BYTES + 1));
+        // A sparse 17 MB PDF is under the media threshold.
+        let pdf = dir.join("d.pdf");
+        std::fs::File::create(&pdf)
+            .unwrap()
+            .set_len(PROMPT_TEXT_BYTES + 1)
+            .unwrap();
+        assert_eq!(open_check(&pdf), OpenCheck::Fine);
+        assert_eq!(open_check(&dir.join("missing.md")), OpenCheck::Fine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

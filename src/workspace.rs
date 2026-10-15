@@ -5,7 +5,7 @@
 
 use std::{
     cell::Cell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -232,6 +232,13 @@ enum TreePromptKind {
 }
 
 /// Where a document being opened should land once it has loaded.
+/// How the user chose to open a file they were warned about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenMode {
+    Full,
+    PlainText,
+}
+
 #[derive(Clone, Debug)]
 enum Target {
     /// The top of the document.
@@ -323,6 +330,8 @@ pub struct Workspace {
     discarded: HashSet<EntityId>,
     /// Files changed on disk that are waiting for the user to decide.
     pending_disk_prompt: HashSet<EntityId>,
+    /// Files the user chose to open despite the size warning, and how.
+    approved_opens: HashMap<PathBuf, OpenMode>,
     /// The paths of editors closed recently, newest last, so Ctrl+Shift+T
     /// can bring the last one back the way VS Code does.
     closed_documents: Vec<PathBuf>,
@@ -459,6 +468,7 @@ impl Workspace {
             closing: false,
             discarded: HashSet::new(),
             pending_disk_prompt: HashSet::new(),
+            approved_opens: HashMap::new(),
             closed_documents: Vec::new(),
             pinned: HashSet::new(),
             nav_history: Vec::new(),
@@ -509,6 +519,7 @@ impl Workspace {
                     if document::is_typst_path(path)
                         || document::is_pdf_path(path)
                         || document::is_image_path(path)
+                        || document::open_check(path) != document::OpenCheck::Fine
                     {
                         deferred_open.push(path.clone());
                         return None;
@@ -903,6 +914,87 @@ impl Workspace {
         }
     }
 
+    /// Ask how to open a file too large (or too binary) to load as is, the
+    /// way VS Code warns before opening one: open it anyway, open it as plain
+    /// text (the editor alone), or leave it.
+    fn ask_before_opening(
+        &mut self,
+        path: PathBuf,
+        check: document::OpenCheck,
+        placement: Placement,
+        target: Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = display_name(Some(&path));
+        let media = !reads_as_text(&path);
+        let description = match check {
+            document::OpenCheck::Large(size) => format!(
+                "It is {:.1} MB. Opening it may take a while and use a lot of memory{}.",
+                size as f64 / (1024. * 1024.),
+                if media {
+                    ""
+                } else {
+                    "; as plain text it opens without preview or highlighting"
+                }
+            ),
+            _ => "It looks like a binary file, not text.".to_string(),
+        };
+        if window.has_active_dialog(cx) {
+            self.notify_error(
+                format!("“{name}” was not opened. {description}"),
+                window,
+                cx,
+            );
+            return;
+        }
+        let workspace = cx.weak_entity();
+        let target = Rc::new(target);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let open = |mode: OpenMode| {
+                let workspace = workspace.clone();
+                let path = path.clone();
+                let target = target.clone();
+                move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
+                    window.close_dialog(cx);
+                    let path = path.clone();
+                    let target = (*target).clone();
+                    _ = workspace.update(cx, |this, cx| {
+                        this.approved_opens.insert(path.clone(), mode);
+                        this.load_path(path, placement, target, window, cx);
+                    });
+                }
+            };
+            let footer = DialogFooter::new().justify_end().child(
+                Button::new("open-cancel")
+                    .label("Cancel")
+                    .outline()
+                    .on_click(|_, window, cx| window.close_dialog(cx)),
+            );
+            let footer = if media {
+                footer
+            } else {
+                footer.child(
+                    Button::new("open-plain")
+                        .label("Open as Plain Text")
+                        .outline()
+                        .on_click(open(OpenMode::PlainText)),
+                )
+            };
+            alert
+                .title(format!("Open “{name}”?"))
+                .description(description.clone())
+                .footer(
+                    footer.child(
+                        Button::new("open-anyway")
+                            .label("Open Anyway")
+                            .primary()
+                            .on_click(open(OpenMode::Full)),
+                    ),
+                )
+        });
+    }
+
     /// Open several files at once (`malgel a.md b.rs c.pdf`), the way VS Code
     /// does: one tab each, in the order given, with the last one in front.
     /// Text is read in the background first, so a quick PDF does not jump
@@ -923,7 +1015,11 @@ impl Workspace {
             async move {
                 paths
                     .iter()
-                    .map(|path| reads_as_text(path).then(|| document::load(path)))
+                    .map(|path| {
+                        (reads_as_text(path)
+                            && document::open_check(path) == document::OpenCheck::Fine)
+                            .then(|| document::load(path))
+                    })
                     .collect::<Vec<_>>()
             }
         });
@@ -997,9 +1093,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A very large or binary file asks first, before anything is read.
+        let mode = self.approved_opens.remove(&path);
+        if mode.is_none() {
+            let check = document::open_check(&path);
+            if check != document::OpenCheck::Fine {
+                self.ask_before_opening(path, check, placement, target, window, cx);
+                return;
+            }
+        }
+        let plain = mode == Some(OpenMode::PlainText);
+
         // A Typst document's preview is its compiled pages, so it takes the
         // same path a PDF does and is watched for changes to refresh.
-        if document::is_typst_path(&path) {
+        if document::is_typst_path(&path) && !plain {
             match crate::typst_preview::TypstPreview::open(&path) {
                 Ok(compiled) => {
                     AppSettings::update(cx, |settings| settings.push_recent(&path));
@@ -1101,13 +1208,17 @@ impl Workspace {
                 Ok(loaded) => {
                     AppSettings::update(cx, |settings| settings.push_recent(&path));
                     let doc = cx.new(|cx| {
-                        DocumentView::new(
+                        let mut doc = DocumentView::new(
                             loaded.text,
                             Some(path.clone()),
                             loaded.line_ending,
                             window,
                             cx,
-                        )
+                        );
+                        if plain {
+                            doc.make_plain(cx);
+                        }
+                        doc
                     });
                     this.place_document(doc.clone(), placement, window, cx);
                     match target {
@@ -2555,6 +2666,8 @@ impl Workspace {
     /// Ask where to save, then render and write the export in the
     /// background.
     fn export(&mut self, format: ExportFormat, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_document()
+            .update(cx, |doc, cx| _ = doc.refresh_source(cx));
         let doc = self.active_document().read(cx);
         let dir = default_dir(doc.dir());
         let title = doc
@@ -2606,6 +2719,8 @@ impl Workspace {
 
     /// Copy the selection, or the whole document, as formatted text.
     fn copy_rich_text(&mut self, _: &CopyRichText, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_document()
+            .update(cx, |doc, cx| _ = doc.refresh_source(cx));
         let doc = self.active_document().read(cx);
         let editor = doc.editor().read(cx);
         let selection = editor.selected_range();
