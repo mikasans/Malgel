@@ -971,7 +971,7 @@ impl Workspace {
                     .outline()
                     .on_click(|_, window, cx| window.close_dialog(cx)),
             );
-            let footer = if media {
+            let footer = if media || check == document::OpenCheck::Binary {
                 footer
             } else {
                 footer.child(
