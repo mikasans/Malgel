@@ -162,11 +162,26 @@ pub struct Analysis {
     pub content_hash: u64,
 }
 
+/// Past this size the source is not parsed as Markdown: markdown-rs needs
+/// minutes for a 20 MB document. The outline then comes from a line scan
+/// for `#` headings, and there is no block index (a large document's
+/// preview shows only its beginning and does not follow the editor).
+pub const FULL_PARSE_LIMIT: usize = 2 * 1024 * 1024;
+
 impl Analysis {
     pub fn of(source: &str) -> Self {
         let stats = Stats::of(source);
         let mut starts = Vec::new();
         let mut outline = Vec::new();
+
+        if source.len() > FULL_PARSE_LIMIT {
+            return Self {
+                stats,
+                blocks: BlockIndex::new(Vec::new(), stats.lines),
+                outline: scan_atx_headings(source),
+                content_hash: content_hash(source),
+            };
+        }
 
         if let Ok(Node::Root(root)) = markdown::to_mdast(source, &preview_parse_options()) {
             for node in &root.children {
@@ -195,6 +210,47 @@ impl Analysis {
             content_hash: content_hash(source),
         }
     }
+}
+
+/// The `#` headings of `source`, outside fenced code, found line by line.
+fn scan_atx_headings(source: &str) -> Vec<Heading> {
+    let mut outline = Vec::new();
+    let mut fence: Option<&str> = None;
+    for (line_ix, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if line.len() - trimmed.len() > 3 {
+            continue;
+        }
+        for marker in ["```", "~~~"] {
+            if trimmed.starts_with(marker) {
+                fence = match fence {
+                    Some(open) if open == marker => None,
+                    None => Some(marker),
+                    other => other,
+                };
+            }
+        }
+        if fence.is_some() {
+            continue;
+        }
+        let level = trimmed.bytes().take_while(|&b| b == b'#').count();
+        if !(1..=6).contains(&level) {
+            continue;
+        }
+        let rest = &trimmed[level..];
+        if !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
+            continue;
+        }
+        let text = rest.trim().trim_end_matches('#').trim().to_string();
+        if !text.is_empty() {
+            outline.push(Heading {
+                level: level as u8,
+                text,
+                line: line_ix,
+            });
+        }
+    }
+    outline
 }
 
 /// The parse options the preview uses, so block boundaries agree with the
@@ -294,5 +350,27 @@ mod tests {
     fn hash_tracks_content() {
         assert_eq!(content_hash("a"), content_hash("a"));
         assert_ne!(content_hash("a"), content_hash("b"));
+    }
+}
+
+#[cfg(test)]
+mod large_tests {
+    use super::*;
+
+    #[test]
+    fn a_large_document_is_scanned_not_parsed() {
+        let line = "word ".repeat(20) + "\n";
+        let body = line.repeat(FULL_PARSE_LIMIT / line.len() + 1);
+        let source = format!("# Top\n\n```\n# not a heading\n```\n{body}## End ##\n");
+        let started = std::time::Instant::now();
+        let analysis = Analysis::of(&source);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(analysis.stats.words > 400_000);
+        let outline: Vec<_> = analysis
+            .outline
+            .iter()
+            .map(|heading| (heading.level, heading.text.as_str()))
+            .collect();
+        assert_eq!(outline, vec![(1, "Top"), (2, "End")]);
     }
 }
