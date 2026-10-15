@@ -1151,6 +1151,63 @@ kill -0 "$APP_PID" 2>/dev/null || fail "Esc in the quit dialog quit the app"
 ! grep -rq 'LEAK' "$WS/notes" || fail "keys typed into the quit dialog reached a file"
 pass "Ctrl+Q with unsaved changes: dialog holds keys, Esc cancels, file unchanged"
 
+# 21d. G5: in Tokyo Moon the line numbers render at >= 4.5:1 (they are painted
+#      with muted.foreground; the old #6e738d was 3.28:1). Last, since the
+#      theme choice persists.
+printf 'one\ntwo\nthree\nfour\nfive\nsix\n' >"$WS/notes/moon.md"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'moon.md'
+xdotool key --clearmodifiers Return
+sleep 0.8
+xdotool key --clearmodifiers ctrl+shift+p
+sleep 0.5
+xdotool type --delay 40 'color theme'
+sleep 0.3
+xdotool key --clearmodifiers Return
+sleep 0.5
+xdotool type --delay 40 'Tokyo Moon'
+sleep 0.3
+xdotool key --clearmodifiers Return
+sleep 1.0
+xdotool key --clearmodifiers ctrl+End
+sleep 0.5
+shot 49-moon-gutter
+python3 - "$ART_DIR/49-moon-gutter.png" <<'PY' || fail "Tokyo Moon line numbers below 4.5:1"
+from PIL import Image
+import sys
+def lum(c):
+    c = [v / 255 for v in c]
+    c = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+def ratio(a, b):
+    a, b = lum(a), lum(b)
+    return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+im = Image.open(sys.argv[1]).convert("RGB")
+w, h = im.size
+bg = (0x22, 0x24, 0x36)
+# The editor background must be Moon's, or the theme did not apply.
+found = sum(1 for x in range(int(w * .45), int(w * .55), 7) for y in range(int(h * .5), int(h * .7), 7)
+            if max(abs(a - b) for a, b in zip(im.getpixel((x, y)), bg)) <= 3)
+assert found > 20, f"Tokyo Moon background not found ({found})"
+# Gutter digits: the band left of the text, rows of lines 1-6 (the caret is
+# on line 7 after Ctrl+End, so its brighter number is not sampled).
+best = None
+for y in range(int(h * .17), int(h * .355)):
+    for x in range(int(w * .29), int(w * .33)):
+        px = im.getpixel((x, y))
+        if max(abs(a - b) for a, b in zip(px, bg)) > 3 and px[2] >= px[0]:
+            r = ratio(px, bg)
+            if best is None or r > best[0]:
+                best = (r, px)
+assert best, "no line-number ink found"
+r, px = best
+print(f"moon gutter: strongest digit pixel {'#%02x%02x%02x' % px} {r:.2f}:1")
+assert max(abs(a - b) for a, b in zip(px, (0x6e, 0x73, 0x8d))) > 6, "still the old #6e738d"
+assert r >= 4.5, r
+PY
+pass "Tokyo Moon line numbers read at >= 4.5:1"
+
 # 22. Still alive at the end — no crash from any of the above.
 kill -0 "$APP_PID" 2>/dev/null || fail "process died during the run"
 pass "process alive at exit"

@@ -179,21 +179,41 @@ mod dark_tuning_tests {
         u32::from_str_radix(&color.trim_start_matches('#')[..6], 16).unwrap()
     }
 
-    /// G5: the Tokyo themes' line numbers read at WCAG AA (4.5:1) against
-    /// their editor background.
+    /// G5: the gutter's line numbers are painted with the theme's
+    /// `muted.foreground` (gpui-base ignores `editor.line_number`), so that
+    /// is the color that must read at WCAG AA against the editor background,
+    /// in every bundled theme.
     #[test]
-    fn tokyo_line_numbers_meet_aa_contrast() {
-        let family: serde_json::Value =
-            serde_json::from_str(include_str!("../themes/tokyonight.json")).unwrap();
-        let themes = family["themes"].as_array().unwrap();
-        assert_eq!(themes.len(), 3);
-        for theme in themes {
-            let highlight = &theme["highlight"];
-            let numbers = hex(highlight["editor.line_number"].as_str().unwrap());
-            let background = hex(highlight["editor.background"].as_str().unwrap());
-            let ratio = contrast(numbers, background);
-            assert!(ratio >= 4.5, "{}: line numbers {ratio:.2}:1", theme["name"]);
+    fn rendered_line_numbers_meet_aa_contrast_in_every_theme() {
+        let mut checked = 0;
+        let mut failures = Vec::new();
+        for source in super::BUNDLED_THEMES {
+            let family: serde_json::Value = serde_json::from_str(source).unwrap();
+            for theme in family["themes"].as_array().unwrap() {
+                let colors = &theme["colors"];
+                let numbers = hex(colors["muted.foreground"].as_str().unwrap());
+                let background = theme["highlight"]["editor.background"]
+                    .as_str()
+                    .or(colors["background"].as_str())
+                    .map(hex)
+                    .unwrap();
+                let ratio = contrast(numbers, background);
+                if ratio < 4.5 {
+                    failures.push(format!("{} {ratio:.2}:1", theme["name"]));
+                }
+                assert!(
+                    theme["highlight"].get("editor.line_number").is_none(),
+                    "{}: editor.line_number is never rendered; drop it",
+                    theme["name"]
+                );
+                checked += 1;
+            }
         }
+        assert_eq!(checked, 19, "every bundled theme is checked");
+        assert!(
+            failures.is_empty(),
+            "line numbers under 4.5:1: {failures:?}"
+        );
     }
 
     /// The default dark editor background is neutral-950 (#0A0A0A).
