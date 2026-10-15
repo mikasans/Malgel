@@ -132,6 +132,11 @@ pub struct DocumentView {
     indent: crate::document::Indent,
     /// Whether the preview shows only the start of a large document.
     preview_limited: bool,
+    /// Opened "as plain text": no preview, highlighting or spell checking.
+    plain: bool,
+    /// The editor has changes `source` has not caught up with yet: a large
+    /// document copies its text out once typing pauses, not per key.
+    source_stale: bool,
     /// A heading to show once the outline is known, from following a link.
     pending_anchor: Option<String>,
 
@@ -238,6 +243,8 @@ impl DocumentView {
             analysis_task: None,
             indent: crate::document::Indent::DEFAULT,
             preview_limited: false,
+            plain: false,
+            source_stale: false,
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -386,6 +393,8 @@ impl DocumentView {
             analysis_task: None,
             indent: crate::document::Indent::DEFAULT,
             preview_limited: false,
+            plain: false,
+            source_stale: false,
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -436,6 +445,8 @@ impl DocumentView {
             analysis_task: None,
             indent: crate::document::Indent::DEFAULT,
             preview_limited: false,
+            plain: false,
+            source_stale: false,
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -496,6 +507,8 @@ impl DocumentView {
             analysis_task: None,
             indent: crate::document::Indent::DEFAULT,
             preview_limited: false,
+            plain: false,
+            source_stale: false,
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -556,6 +569,9 @@ impl DocumentView {
     /// document's pages are Typst's output, so saying "Markdown" beside them
     /// would name the wrong thing.
     pub fn language_label(&self) -> SharedString {
+        if self.plain {
+            return "Plain Text".into();
+        }
         crate::document::language_name(self.path.as_deref()).into()
     }
 
@@ -577,7 +593,32 @@ impl DocumentView {
     /// Whether this text document gets the rendered preview beside it:
     /// Markdown does, source code and other text open in the editor alone.
     pub fn has_preview(&self) -> bool {
-        crate::document::has_markdown_preview(self.path.as_deref())
+        !self.plain && crate::document::has_markdown_preview(self.path.as_deref())
+    }
+
+    /// Show this document as plain text, the way VS Code opens a file it
+    /// warned was too large: the editor alone, without highlighting, preview
+    /// or spell checking.
+    pub fn make_plain(&mut self, cx: &mut Context<Self>) {
+        self.plain = true;
+        self.preview_limited = false;
+        self.preview
+            .update(cx, |preview, cx| preview.set_text("", cx));
+        self.editor
+            .update(cx, |editor, cx| editor.set_highlighter("text", cx));
+        self.spell_task = None;
+        self.misspellings = Arc::default();
+        self.show_misspellings(cx);
+        cx.notify();
+    }
+
+    /// Bring `source` up to date with the editor (see `source_stale`).
+    pub fn refresh_source(&mut self, cx: &App) -> &SharedString {
+        if self.source_stale {
+            self.source = self.editor.read(cx).value();
+            self.source_stale = false;
+        }
+        &self.source
     }
 
     /// Whether the preview shows only the start of a large document.
@@ -773,6 +814,14 @@ impl DocumentView {
             .filter(|path| !crate::document::is_markdown_path(path))
             .and_then(crate::document::language_tag)
             .unwrap_or("markdown");
+        // Past the large-document size, highlighting is off, as VS Code turns
+        // tokenization off for large files: re-parsing megabytes per key
+        // costs more memory and time than the colours are worth.
+        let language = if text.len() > LARGE_DOCUMENT_BYTES {
+            "text"
+        } else {
+            language
+        };
         let indent = crate::document::detect_indent_for(&text, self.path.as_deref());
         self.indent = indent;
         self.editor.update(cx, |editor, cx| {
@@ -852,7 +901,21 @@ impl DocumentView {
     }
 
     fn on_text_changed(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        if debounce && self.source.len() > LARGE_DOCUMENT_BYTES {
+            // Typing in a large document: copying megabytes out of the
+            // editor on every key is what made it lag; the debounced
+            // analysis copies it once typing pauses.
+            self.source_stale = true;
+            self.dirty = true;
+            self.set_scroll_driver(ScrollDriver::Editor);
+            self.revision += 1;
+            self.focus_block = None;
+            self.schedule_analysis(debounce, cx);
+            cx.notify();
+            return;
+        }
         let source = self.editor.read(cx).value();
+        self.source_stale = false;
         // Non-markdown text files render as one highlighted code block: the
         // extension picks the tree-sitter language for the preview's
         // highlighter. Markdown keeps its normal document rendering.
@@ -886,8 +949,7 @@ impl DocumentView {
     /// thread once typing pauses. Stale results are discarded.
     fn schedule_analysis(&mut self, debounce: bool, cx: &mut Context<Self>) {
         let revision = self.revision;
-        let source = self.source.clone();
-        let delay = if source.len() > LARGE_DOCUMENT_BYTES {
+        let delay = if self.source.len() > LARGE_DOCUMENT_BYTES {
             LARGE_ANALYSIS_DEBOUNCE
         } else {
             ANALYSIS_DEBOUNCE
@@ -896,6 +958,9 @@ impl DocumentView {
             if debounce {
                 cx.background_executor().timer(delay).await;
             }
+            let Ok(source) = this.update(cx, |this, cx| this.refresh_source(cx).clone()) else {
+                return;
+            };
             let analysis = cx
                 .background_executor()
                 .spawn(async move { Analysis::of(&source) })
@@ -1025,7 +1090,7 @@ impl DocumentView {
             }
             return;
         };
-        if self.source.len() > LARGE_DOCUMENT_BYTES {
+        if self.plain || self.source.len() > LARGE_DOCUMENT_BYTES {
             // Checking megabytes on every pause would keep a core busy.
             self.spell_task = None;
             return;
