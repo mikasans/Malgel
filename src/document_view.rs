@@ -14,7 +14,8 @@ use gpui_kit::{
     Entity, EventEmitter, FocusHandle, Focusable as _, HighlightStyle, Image,
     InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Render, ScrollWheelEvent,
-    SharedString, Styled as _, Subscription, Task, Window,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, UnderlineStyle,
+    Window,
     base::{
         TextView, TextViewState,
         input::{Diagnostic, DiagnosticSeverity},
@@ -178,6 +179,8 @@ pub struct DocumentView {
     pending_cursor: usize,
     /// The layout and focus mode last applied, to notice a switch.
     last_shape: Option<(Layout, bool)>,
+    /// The line kept at the top while the pane's width changes.
+    shown_line: Option<f32>,
     /// The line(s) a press on the line numbers started on, while it drags.
     gutter_anchor: Option<Range<usize>>,
     /// A Typst source's live preview: its compiler thread and the pages.
@@ -247,6 +250,7 @@ impl DocumentView {
                 }
                 this.apply_settings(window, cx);
                 this.sync_preview(true, cx);
+                this.recolor_typst_highlights(cx);
                 cx.notify();
             }),
         ];
@@ -292,6 +296,7 @@ impl DocumentView {
             preview_width: px(0.),
             loading: false,
             last_shape: None,
+            shown_line: None,
             gutter_anchor: None,
             live: None,
             pending_cursor: 0,
@@ -467,6 +472,7 @@ impl DocumentView {
             preview_width: px(0.),
             loading: false,
             last_shape: None,
+            shown_line: None,
             gutter_anchor: None,
             live: None,
             pending_cursor: 0,
@@ -525,6 +531,7 @@ impl DocumentView {
             preview_width: px(0.),
             loading: false,
             last_shape: None,
+            shown_line: None,
             gutter_anchor: None,
             live: None,
             pending_cursor: 0,
@@ -589,11 +596,16 @@ impl DocumentView {
 
     /// The tree-sitter language the editor highlights this file with.
     fn highlight_language(&self) -> &'static str {
-        self.path
-            .as_deref()
-            .filter(|path| !crate::document::is_markdown_path(path))
-            .and_then(crate::document::language_tag)
-            .unwrap_or("markdown")
+        let Some(path) = self.path.as_deref() else {
+            return "markdown";
+        };
+        if crate::document::is_markdown_path(path) {
+            return "markdown";
+        }
+        // Plain text must not fall through to Markdown: that turns on
+        // heading fold chevrons (G8). Typst keeps "text" so tree-sitter
+        // stays off; its colours come from typst_live decorations.
+        crate::document::language_tag(path).unwrap_or("text")
     }
 
     /// The whole text as one string, copied out of the editor for a large
@@ -1043,6 +1055,24 @@ impl DocumentView {
             && position.y < bounds.origin.y + bounds.size.height
     }
 
+    /// The logical line under `y` in the gutter, from the visible rows.
+    fn line_at_gutter_y(&self, y: Pixels, _window: &Window, cx: &App) -> Option<usize> {
+        let editor = self.editor.read(cx);
+        let bounds = editor.text_bounds()?;
+        let rows = editor.visible_row_range()?;
+        let line_height = editor.line_height()?;
+        if line_height <= px(0.) {
+            return None;
+        }
+        let row = ((y - bounds.origin.y) / line_height).floor() as isize;
+        if row < 0 {
+            return None;
+        }
+        let line = rows.start.saturating_add(row as usize);
+        let last = editor.text().lines_len().saturating_sub(1);
+        Some(line.min(last))
+    }
+
     /// Select from the line the gutter press started on to the caret's line.
     fn extend_gutter_selection(&mut self, cx: &mut Context<Self>) {
         let Some(anchor) = self.gutter_anchor.clone() else {
@@ -1114,6 +1144,8 @@ impl DocumentView {
             diagnostics: Vec::new(),
             compiled_once: false,
             highlights: None,
+            syntax_decorations: None,
+            last_tags: Vec::new(),
             send_task: None,
             reveal_task: None,
             revealed_cursor: None,
@@ -1205,6 +1237,7 @@ impl DocumentView {
                 }
                 live.diagnostics = compiled.diagnostics;
                 if compiled.revision == current {
+                    live.last_tags = compiled.highlights.clone();
                     let theme = cx.theme().highlight_theme.clone();
                     let decorations: Vec<TextDecoration> = compiled
                         .highlights
@@ -1213,6 +1246,7 @@ impl DocumentView {
                             Some(TextDecoration::new(range, typst_tag_style(tag, &theme)?))
                         })
                         .collect();
+                    live.syntax_decorations = Some(decorations.clone());
                     match &live.highlights {
                         Some(collection) => collection.set(decorations, cx),
                         None => {
@@ -1265,7 +1299,20 @@ impl DocumentView {
                     None => first.to_string(),
                 }
             });
+        let jump_line = live
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.error)
+            .and_then(|diagnostic| diagnostic.range.as_ref())
+            .map(|range| {
+                let upto = range.start.min(self.source.len());
+                self.source[..floor_char_boundary(&self.source, upto)]
+                    .matches('\n')
+                    .count()
+                    + 1
+            });
         let banner = error.map(|message| {
+            let document = cx.weak_entity();
             h_flex()
                 .id("typst-error")
                 .w_full()
@@ -1275,6 +1322,12 @@ impl DocumentView {
                 .text_sm()
                 .bg(theme.danger.opacity(0.12))
                 .text_color(theme.danger)
+                .cursor_pointer()
+                .when_some(jump_line, |this, line| {
+                    this.on_click(move |_, window, cx| {
+                        _ = document.update(cx, |this, cx| this.go_to_line(line, window, cx));
+                    })
+                })
                 .child(div().flex_1().min_w_0().truncate().child(message))
                 .when(live.compiled_once, |this| {
                     this.child(
@@ -1486,6 +1539,12 @@ impl DocumentView {
             .as_ref()
             .map(|live| live.diagnostics.clone())
             .unwrap_or_default();
+        // Language "text" (Typst, plain text) has no tree-sitter highlighter.
+        // gpui then skips painting DiagnosticSet, so Typst errors also go into
+        // the decoration layer as underlines.
+        let paint_typst_underlines = self.live.is_some();
+        let theme_danger = cx.theme().danger;
+        let theme_warning = cx.theme().warning;
         self.editor.update(cx, |editor, cx| {
             let text = editor.text().clone();
             let Some(diagnostics) = editor.diagnostics_mut() else {
@@ -1521,6 +1580,91 @@ impl DocumentView {
             }));
             cx.notify();
         });
+        if paint_typst_underlines {
+            self.paint_typst_diagnostic_underlines(&typst, theme_danger, theme_warning, cx);
+        }
+    }
+
+    /// Squiggles for Typst diagnostics via the decoration layer (see
+    /// `show_misspellings`): language "text" never gets a tree-sitter
+    /// highlighter, and without one gpui drops DiagnosticSet paint.
+    /// Re-apply Typst syntax colours from the current theme (dark/light
+    /// switch) without waiting for the next keystroke's compile.
+    fn recolor_typst_highlights(&mut self, cx: &mut Context<Self>) {
+        let tags = self
+            .live
+            .as_ref()
+            .map(|live| live.last_tags.clone())
+            .unwrap_or_default();
+        if tags.is_empty() {
+            return;
+        }
+        let theme = cx.theme().highlight_theme.clone();
+        let decorations: Vec<TextDecoration> = tags
+            .iter()
+            .filter_map(|(range, tag)| {
+                Some(TextDecoration::new(
+                    range.clone(),
+                    typst_tag_style(*tag, &theme)?,
+                ))
+            })
+            .collect();
+        if let Some(live) = &mut self.live {
+            live.syntax_decorations = Some(decorations);
+        }
+        self.show_misspellings(cx);
+    }
+
+    fn paint_typst_diagnostic_underlines(
+        &mut self,
+        typst: &[crate::typst_live::LiveDiagnostic],
+        danger: gpui_kit::Hsla,
+        warning: gpui_kit::Hsla,
+        cx: &mut Context<Self>,
+    ) {
+        let len = self.editor.read(cx).text().len();
+        let underlines: Vec<TextDecoration> = typst
+            .iter()
+            .filter_map(|diagnostic| {
+                let range = diagnostic.range.clone()?;
+                let start = range.start.min(len);
+                let end = range.end.clamp(start, len);
+                if start >= end {
+                    return None;
+                }
+                let color = if diagnostic.error { danger } else { warning };
+                Some(TextDecoration::new(
+                    start..end,
+                    HighlightStyle {
+                        underline: Some(UnderlineStyle {
+                            thickness: px(1.5),
+                            color: Some(color),
+                            wavy: true,
+                        }),
+                        ..HighlightStyle::default()
+                    },
+                ))
+            })
+            .collect();
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        // Keep syntax colours and replace only the diagnostic layer.
+        let syntax = live.syntax_decorations.clone().unwrap_or_default();
+        let mut all = syntax;
+        all.extend(underlines);
+        match &live.highlights {
+            Some(collection) => collection.set(all, cx),
+            None if !all.is_empty() => {
+                let collection = self.editor.update(cx, |editor, cx| {
+                    editor.create_decorations_collection(all, cx)
+                });
+                if let Some(live) = &mut self.live {
+                    live.highlights = Some(collection);
+                }
+            }
+            None => {}
+        }
     }
 
     fn misspelling_at(&self, offset: usize) -> Option<&spell::Misspelling> {
@@ -2223,22 +2367,31 @@ impl DocumentView {
                 {
                     return;
                 }
+                // Resolve the line from the click's Y: waiting on the editor
+                // to move the caret first made plain clicks flaky (drag still
+                // worked because move events kept extending).
                 let editor = this.editor.read(cx);
                 let previous = editor.selected_range();
                 let shift = event.modifiers.shift;
-                let document = cx.entity();
-                window.defer(cx, move |_, cx| {
-                    document.update(cx, |this, cx| {
-                        let text = this.editor.read(cx).text().to_string();
-                        let anchor = if shift {
-                            line_range_at(&text, previous.start)
-                        } else {
-                            line_range_at(&text, this.editor.read(cx).cursor())
-                        };
-                        this.gutter_anchor = Some(anchor);
-                        this.extend_gutter_selection(cx);
-                    });
+                let Some(line) = this.line_at_gutter_y(event.position.y, window, cx) else {
+                    return;
+                };
+                let text = editor.text().to_string();
+                let clicked = {
+                    let start = editor.text().line_start_offset(line);
+                    line_range_at(&text, start)
+                };
+                let anchor = if shift {
+                    let other = line_range_at(&text, previous.start);
+                    other.start.min(clicked.start)..other.end.max(clicked.end)
+                } else {
+                    clicked
+                };
+                this.gutter_anchor = Some(anchor.clone());
+                this.editor.update(cx, |editor, cx| {
+                    editor.set_selected_range(anchor, cx);
                 });
+                cx.stop_propagation();
             }))
             .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, _, _| {
                 this.gutter_anchor = None;
@@ -2323,7 +2476,21 @@ impl DocumentView {
                         if this.editor_scroll_target.is_some() {
                             this.scroll_editor_to_target(cx);
                         }
-                        if (this.editor_width - bounds.size.width).abs() >= px(1.) {
+                        let resized = (this.editor_width - bounds.size.width).abs() >= px(1.);
+                        if resized {
+                            // A drag of the split re-wraps the lines: go back
+                            // to the line that was at the top (or the caret's)
+                            // rather than keep a pixel offset.
+                            if let Some(line) = this.shown_line.filter(|_| {
+                                this.editor_width > px(0.) && this.editor_scroll_target.is_none()
+                            }) {
+                                this.editor_scroll_target =
+                                    Some(EditorScrollTarget { line, attempts: 0 });
+                            }
+                        } else if this.editor_scroll_target.is_none() {
+                            this.shown_line = this.anchor_line(cx);
+                        }
+                        if resized {
                             this.editor_width = bounds.size.width;
                             cx.notify();
                         }
@@ -2511,6 +2678,11 @@ struct TypstLive {
     /// Whether any compile has succeeded, so there are pages to show.
     compiled_once: bool,
     highlights: Option<TextDecorationCollection>,
+    /// Syntax colours alone, so diagnostic underlines can be layered on top
+    /// without waiting for another compile.
+    syntax_decorations: Option<Vec<TextDecoration>>,
+    /// Tags from the last compile, for recolouring when the theme changes.
+    last_tags: Vec<(std::ops::Range<usize>, typst::syntax::Tag)>,
     send_task: Option<Task<()>>,
     reveal_task: Option<Task<()>>,
     revealed_cursor: Option<usize>,
@@ -2846,7 +3018,11 @@ fn line_range_at(text: &str, offset: usize) -> Range<usize> {
 /// line `caret`: the caret keeps its distance from the top when visible.
 fn anchor_for(rows: Range<usize>, caret: usize) -> f32 {
     if rows.contains(&caret) {
-        caret.saturating_sub((caret - rows.start).min(5)) as f32
+        // Keep a little context above the caret so a layout change that
+        // half-clips the top line does not hide it (split → Editor only).
+        let from_top = caret - rows.start;
+        let offset = from_top.clamp(2, 8);
+        caret.saturating_sub(offset) as f32
     } else {
         rows.start as f32
     }
@@ -2890,9 +3066,16 @@ mod tests {
     }
 
     #[test]
+    fn plain_text_files_do_not_fold_as_markdown() {
+        // G8: .txt used to fall through highlight_language to "markdown".
+        assert!(!super::shows_folding("text", false));
+        assert!(super::shows_folding("markdown", false));
+    }
+
+    #[test]
     fn a_layout_switch_keeps_the_caret_line_and_go_to_line_centers() {
         use super::{anchor_for, centered_top};
-        assert_eq!(anchor_for(100..140, 120), 115.);
+        assert_eq!(anchor_for(100..140, 120), 112.);
         assert_eq!(anchor_for(100..140, 102), 100.);
         assert_eq!(anchor_for(100..140, 500), 100.);
         assert_eq!(centered_top(200, 40), 180.);
