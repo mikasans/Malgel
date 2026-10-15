@@ -375,6 +375,8 @@ pub struct Workspace {
     /// (Ctrl+G). Each keeps its own query and focus across openings.
     command_palette: Entity<CommandState>,
     theme_picker: Entity<CommandState>,
+    /// Focus for the alert dialogs' buttons (initial focus, ring, Tab trap).
+    alert_focus: std::rc::Rc<crate::dialog_focus::DialogFocus>,
     go_to_line: Entity<CommandState>,
     /// The one-line prompt New File / New Folder / Rename ask their name in.
     tree_prompt: Entity<CommandState>,
@@ -534,6 +536,7 @@ impl Workspace {
             quick_open,
             command_palette,
             theme_picker,
+            alert_focus: std::rc::Rc::new(crate::dialog_focus::DialogFocus::new(cx)),
             go_to_line,
             tree_prompt,
             find_query,
@@ -2678,7 +2681,9 @@ impl Workspace {
 
         let name = doc.read(cx).name();
         let workspace = cx.weak_entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        let focus = self.alert_focus.clone();
+        focus.focus_primary_soon(window, cx);
+        window.open_alert_dialog(cx, move |alert, window, cx| {
             let (save, discard, cancel) = (workspace.clone(), workspace.clone(), workspace.clone());
             let (save_next, discard_next) = (next.clone(), next.clone());
             let (save_doc, discard_doc) = (doc.clone(), doc.clone());
@@ -2711,45 +2716,51 @@ impl Workspace {
                     true
                 })
                 .footer(
-                    DialogFooter::new()
-                        .justify_end()
-                        .child(
-                            Button::new("discard")
-                                .label("Don’t save")
-                                .outline()
-                                .on_click(move |_, window, cx| {
+                    focus.trap(
+                        DialogFooter::new()
+                            .justify_end()
+                            .child(
+                                Button::new("discard")
+                                    .label("Don’t save")
+                                    .outline()
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        let next = discard_next.clone();
+                                        let id = discard_doc.entity_id();
+                                        discard_doc.update(cx, |doc, _| doc.discard_recovery());
+                                        _ = discard.update(cx, |this, cx| {
+                                            this.discarded.insert(id);
+                                            this.focus_active(window, cx);
+                                            this.run_after_confirm(next, window, cx)
+                                        });
+                                    }),
+                            )
+                            .child(div().flex_1())
+                            .child(Button::new("cancel").label("Cancel").outline().on_click(
+                                move |_, window, cx| {
                                     window.close_dialog(cx);
-                                    let next = discard_next.clone();
-                                    let id = discard_doc.entity_id();
-                                    discard_doc.update(cx, |doc, _| doc.discard_recovery());
-                                    _ = discard.update(cx, |this, cx| {
-                                        this.discarded.insert(id);
+                                    _ = cancel.update(cx, |this, cx| {
+                                        this.discarded.clear();
                                         this.focus_active(window, cx);
-                                        this.run_after_confirm(next, window, cx)
                                     });
-                                }),
-                        )
-                        .child(div().flex_1())
-                        .child(Button::new("cancel").label("Cancel").outline().on_click(
-                            move |_, window, cx| {
-                                window.close_dialog(cx);
-                                _ = cancel.update(cx, |this, cx| {
-                                    this.discarded.clear();
-                                    this.focus_active(window, cx);
-                                });
-                            },
-                        ))
-                        .child(Button::new("save").label("Save").primary().on_click(
-                            move |_, window, cx| {
-                                window.close_dialog(cx);
-                                let next = save_next.clone();
-                                let doc = save_doc.clone();
-                                _ = save.update(cx, |this, cx| {
-                                    this.focus_active(window, cx);
-                                    this.save_document(doc, Some(next), window, cx)
-                                });
-                            },
-                        )),
+                                },
+                            ))
+                            .child(focus.primary(
+                                Button::new("save").label("Save").primary().on_click(
+                                    move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        let next = save_next.clone();
+                                        let doc = save_doc.clone();
+                                        _ = save.update(cx, |this, cx| {
+                                            this.focus_active(window, cx);
+                                            this.save_document(doc, Some(next), window, cx)
+                                        });
+                                    },
+                                ),
+                                window,
+                                cx,
+                            )),
+                    ),
                 )
         });
     }

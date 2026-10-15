@@ -9,6 +9,7 @@ mod commands;
 mod default_app;
 mod diagram;
 mod diagram_viewer;
+mod dialog_focus;
 mod document;
 mod document_view;
 mod docx;

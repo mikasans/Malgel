@@ -1159,6 +1159,22 @@ shot 47-quit-confirm
 kill -0 "$APP_PID" 2>/dev/null || fail "Ctrl+Q with unsaved changes quit without asking"
 [[ "$(pixels_differ 46-quit-dirty 47-quit-confirm)" -gt 1000 ]] \
   || fail "Ctrl+Q with unsaved changes showed no dialog"
+# The dialog opens with Save (primary) ringed; Tab moves the ring, and three
+# Tabs (Don't save, Cancel, Save) come back around without leaving it.
+xdotool key --clearmodifiers Tab
+sleep 0.3
+shot 47a-quit-tab1
+[[ "$(region_differ 47-quit-confirm 47a-quit-tab1 600x220+520+150)" -gt 30 ]] \
+  || fail "Tab in the quit dialog did not move the focus ring"
+xdotool key --clearmodifiers Tab
+sleep 0.2
+xdotool key --clearmodifiers Tab
+sleep 0.3
+shot 47b-quit-tab3
+# Dialog region only: the editor behind may repaint (caret).
+[[ "$(region_differ 47-quit-confirm 47b-quit-tab3 600x220+520+150)" -lt 30 ]] \
+  || fail "three Tabs did not cycle back to Save (focus left the dialog?)"
+pass "quit dialog: primary focused, Tab cycles inside the dialog"
 xdotool type --delay 30 'LEAK'
 sleep 0.3
 xdotool key --clearmodifiers Escape
