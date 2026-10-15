@@ -24,7 +24,7 @@ use gpui_kit::{
     assets::IconName,
     base::Disableable as _,
     component::{
-        ActiveTheme as _, Icon, Sizable as _, VirtualListScrollHandle,
+        ActiveTheme as _, ElementExt as _, Icon, Sizable as _, VirtualListScrollHandle,
         button::{Button, ButtonVariants as _},
         h_flex,
         menu::{DropdownMenu as _, PopupMenuItem},
@@ -429,6 +429,11 @@ impl PdfView {
     }
 
     /// Current zoom level.
+    /// The page at the top of the viewport, counted from zero.
+    pub fn current_page(&self) -> usize {
+        self.current_page
+    }
+
     pub fn zoom(&self) -> f32 {
         self.zoom
     }
@@ -1063,8 +1068,22 @@ impl Render for PdfView {
         // Name the current page before the toolbar, the pages and the
         // thumbnail strip are built, so all three agree within a frame.
         self.current_page = self.visible_page();
+        // The pages were laid out against last frame's viewport. When the
+        // pane changes size under them (the thumbnail strip opening or
+        // closing, a resized split) draw once more against the new one, or
+        // the pages stay off-centre until the pointer next moves.
+        let entity = cx.entity();
 
         v_flex()
+            .on_prepaint(move |_, _, cx| {
+                cx.defer(move |cx| {
+                    entity.update(cx, |this, cx| {
+                        if this.scroll.bounds().size != viewport {
+                            cx.notify();
+                        }
+                    });
+                });
+            })
             .id("pdf-view")
             .track_focus(&self.focus_handle)
             .size_full()

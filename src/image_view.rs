@@ -146,6 +146,16 @@ impl ImageView {
         }
     }
 
+    /// The picture's own size in logical pixels.
+    pub fn natural_size(&self) -> (f32, f32) {
+        (self.width, self.height)
+    }
+
+    /// The factor the picture is drawn at.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
     pub fn zoom_in(&mut self, cx: &mut Context<Self>) {
         self.set_zoom(self.zoom * zoom::BUTTON_STEP, cx);
     }
@@ -390,13 +400,15 @@ impl ImageView {
         // zoom handlers cover the whole view even around a small image.
         let content_width = px(image_width.max(self.viewport.width.as_f32()));
         let content_height = px(image_height.max(self.viewport.height.as_f32()));
-        let entity = cx.entity();
-
         v_flex()
             .id("image-pages-scroll")
-            .flex_1()
+            // The pane's size, never the picture's: without `min_w_0` the
+            // scroll area grew to a wide image's width, so the viewport it
+            // measured (and the fit computed from it) was the image's own,
+            // and a large picture opened over-zoomed and off-centre.
+            .size_full()
+            .min_w_0()
             .min_h_0()
-            .w_full()
             .bg(theme.background)
             .child(
                 v_flex()
@@ -429,17 +441,6 @@ impl ImageView {
                     ),
             )
             .track_scroll(&self.scroll)
-            .on_prepaint(move |bounds, _, cx| {
-                // Notifying mid-frame can be lost; update once it's done.
-                cx.defer(move |cx| {
-                    entity.update(cx, |this, cx| {
-                        if this.viewport != bounds.size {
-                            this.viewport = bounds.size;
-                            cx.notify();
-                        }
-                    });
-                });
-            })
             .overflow_scrollbar()
     }
 }
@@ -476,6 +477,28 @@ impl Render for ImageView {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
+                    .w_full()
+                    .overflow_hidden()
+                    // Measured here, outside the scroll area: an absolutely
+                    // placed child of a scroll area is sized by what it
+                    // scrolls, so a picture wider than the pane used to be
+                    // fitted to its own width.
+                    .on_prepaint({
+                        let entity = cx.entity();
+                        move |bounds, _, cx| {
+                            // Notifying mid-frame can be lost; update once
+                            // it's done.
+                            cx.defer(move |cx| {
+                                entity.update(cx, |this, cx| {
+                                    if this.viewport != bounds.size {
+                                        this.viewport = bounds.size;
+                                        cx.notify();
+                                    }
+                                });
+                            });
+                        }
+                    })
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -486,6 +509,21 @@ impl Render for ImageView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_wide_rgba_plot_reports_its_pixel_size() {
+        // A matplotlib figure: 4050x1560 RGBA at 300 dpi. Its size must be
+        // read from the file, so Fit Page can scale it into the pane.
+        let mut png = Vec::new();
+        image::RgbaImage::new(4050, 1560)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let (_, width, height) = load_image(Path::new("plot.png"), png).unwrap();
+        assert_eq!((width, height), (4050., 1560.));
+        // In a 1280-wide pane it opens well under 100%, whole and centred.
+        let zoom = fit_zoom(FitMode::Page, width, height, viewport(1280., 760.));
+        assert!(zoom < 0.32, "got {zoom}");
+    }
+
     use super::*;
 
     fn viewport(width: f32, height: f32) -> Size<Pixels> {
