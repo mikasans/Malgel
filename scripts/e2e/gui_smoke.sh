@@ -292,7 +292,12 @@ pass "window $WIN mapped ($(xdotool getwindowgeometry "$WIN" | tail -1 | tr -s '
 # No window manager under Xvfb, so focus the window directly for key events.
 xdotool windowfocus "$WIN" 2>/dev/null || true
 xdotool windowraise "$WIN" 2>/dev/null || true
-shot 01-startup
+# The first frame can land a moment after the window maps (slow CI): poll.
+for _ in $(seq 1 20); do
+  shot 01-startup
+  [[ "$(colours 01-startup)" -gt 8 ]] && break
+  sleep 0.25
+done
 [[ "$(colours 01-startup)" -gt 8 ]] || fail "startup frame is blank ($(colours 01-startup) colours)"
 pass "startup painted ($(colours 01-startup) colours)"
 
@@ -427,6 +432,25 @@ shot 07l-theme-reverted
 [[ "$(pixels_differ 07j-theme-picker 07k-theme-preview)" -gt 1000 ]] \
   || fail "moving through the themes did not preview them"
 pass "the theme picker previews and Escape reverts"
+
+# 4e. Ctrl+K Ctrl+T inside the editor is the theme chord, not Insert Link:
+#     the picker opens, and after Escape + Ctrl+S the file has no link.
+xdotool key --clearmodifiers ctrl+s
+sleep 0.4
+before_chord="$(cat "$WS/README.md")"
+shot 07m-before-chord
+xdotool key --clearmodifiers ctrl+k ctrl+t
+sleep 0.5
+shot 07n-chord-picker
+[[ "$(pixels_differ 07m-before-chord 07n-chord-picker)" -gt 1000 ]] \
+  || fail "Ctrl+K Ctrl+T in the editor did not open the theme picker"
+xdotool key --clearmodifiers Escape
+sleep 0.3
+xdotool key --clearmodifiers ctrl+s
+sleep 0.5
+[[ "$(cat "$WS/README.md")" == "$before_chord" ]] \
+  || fail "Ctrl+K Ctrl+T in the editor changed the text (Insert Link ate the chord)"
+pass "Ctrl+K Ctrl+T in the editor opens the theme picker"
 
 # 5. Ctrl+B in the editor is Bold, as in VS Code (Toggle Side Bar is the same
 #    key outside the editor). Assert on the file, not the pixels.
