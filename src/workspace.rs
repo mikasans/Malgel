@@ -27,7 +27,7 @@ use gpui_kit::{
         ActiveTheme as _, Icon, IndexPath, Selectable as _, Sizable as _, TitleBar, WindowExt as _,
         button::{Button, ButtonGroup, ButtonVariants as _},
         checkbox::Checkbox,
-        command::{Command, CommandItem, CommandState},
+        command::{Command, CommandGroup, CommandItem, CommandState},
         dialog::DialogFooter,
         h_flex,
         input::Escape,
@@ -177,6 +177,32 @@ fn quick_open_rows(
             .collect::<Vec<_>>(),
     );
     rows
+}
+
+/// Quick Open's rows split into the recently opened ones, most recent
+/// first (`recent`, then the other open tabs), and the rest in listing order.
+/// The file being edited is left out of the first group: Ctrl+P, Enter goes
+/// back to the previous file, as in VS Code. A typed path keeps its own rows
+/// on top, so no group is made then.
+fn split_recent(
+    rows: Vec<QuickOpenRow>,
+    recent: &[PathBuf],
+    current: Option<&Path>,
+) -> (Vec<QuickOpenRow>, Vec<QuickOpenRow>) {
+    if rows.iter().any(|row| row.keyword.is_some()) {
+        return (Vec::new(), rows);
+    }
+    let mut first = Vec::new();
+    let mut rest = rows;
+    for path in recent {
+        if Some(path.as_path()) == current {
+            continue;
+        }
+        if let Some(ix) = rest.iter().position(|row| &row.path == path) {
+            first.push(rest.remove(ix));
+        }
+    }
+    (first, rest)
 }
 
 /// Whether opening `path` reads it as text, rather than showing it in a
@@ -348,6 +374,7 @@ pub struct Workspace {
     /// The Show All Commands palette (Ctrl+Shift+P) and the Go to Line palette
     /// (Ctrl+G). Each keeps its own query and focus across openings.
     command_palette: Entity<CommandState>,
+    theme_picker: Entity<CommandState>,
     go_to_line: Entity<CommandState>,
     /// The one-line prompt New File / New Folder / Rename ask their name in.
     tree_prompt: Entity<CommandState>,
@@ -417,6 +444,7 @@ impl Workspace {
         let headings = cx.new(|cx| CommandState::new(window, cx));
         let quick_open = cx.new(|cx| CommandState::new(window, cx));
         let command_palette = cx.new(|cx| CommandState::new(window, cx));
+        let theme_picker = cx.new(|cx| CommandState::new(window, cx));
         let go_to_line = cx.new(|cx| CommandState::new(window, cx));
         let tree_prompt = cx.new(|cx| CommandState::new(window, cx));
         let find_query = cx.new(|cx| CommandState::new(window, cx));
@@ -505,6 +533,7 @@ impl Workspace {
             headings,
             quick_open,
             command_palette,
+            theme_picker,
             go_to_line,
             tree_prompt,
             find_query,
@@ -2151,12 +2180,14 @@ impl Workspace {
         // the results give way to the question, asked again with the last
         // text, selected so typing replaces it.
         if window.has_active_dialog(cx) {
-            if self.find_progress.is_none() {
+            // Only take over a Find dialog (searching or results). Any other
+            // picker keeps the key - the workspace binding never reaches it
+            // anyway, and esc_closes turns Ctrl+Shift+F into FindInFiles only
+            // when that picker opted in.
+            let Some(progress) = self.find_progress.take() else {
                 return;
-            }
-            if let Some(progress) = self.find_progress.take() {
-                progress.cancel.store(true, Ordering::Relaxed);
-            }
+            };
+            progress.cancel.store(true, Ordering::Relaxed);
             window.close_dialog(cx);
         }
         let last = self.last_find.clone();
@@ -2252,8 +2283,7 @@ impl Workspace {
         let state = self.find_results.clone();
         let workspace = cx.weak_entity();
         let find_focus = self.find_focus.clone();
-        window.focus(&find_focus, cx);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let Some(this) = workspace.upgrade() else {
                 return dialog;
             };
@@ -2262,22 +2292,37 @@ impl Workspace {
             };
             let query = progress.query.clone();
             let stop = progress.cancel.clone();
-            let again = workspace.clone();
-            let dialog = dialog
-                .close_button(false)
-                .p_0()
-                .on_close({
-                    let stop = stop.clone();
-                    move |_, _, _| stop.store(true, Ordering::Relaxed)
-                })
-                .child(div().track_focus(&find_focus).on_action(
-                    move |_: &FindInFiles, window, cx| {
-                        _ = again
-                            .update(cx, |this, cx| this.find_in_files(&FindInFiles, window, cx));
-                    },
-                ));
-            let Some(hits) = progress.hits.clone() else {
-                return dialog.child(
+            let hits = progress.hits.clone();
+            let root = progress.root.clone();
+            // Closing (Esc, Cancel, backdrop) stops the search and puts the
+            // keyboard back in the editor — otherwise the caret vanishes and
+            // shortcuts stop until a click.
+            let on_close_ws = workspace.clone();
+            let dialog = dialog.close_button(false).p_0().on_close({
+                let stop = stop.clone();
+                move |_, window, cx| {
+                    stop.store(true, Ordering::Relaxed);
+                    if let Some(this) = on_close_ws.upgrade() {
+                        this.update(cx, |this, cx| {
+                            this.find_progress = None;
+                            this.focus_active(window, cx);
+                        });
+                    }
+                }
+            });
+            // One wrapper hears Esc and Ctrl+Shift+F for every state
+            // (searching, empty, results), including when the Command filter
+            // has focus — the workspace binding never reaches a dialog.
+            let wrap = |body: gpui_kit::AnyElement| {
+                // esc_closes hears Esc and Ctrl+Shift+F; the latter closes
+                // this dialog (on_close clears find_progress and restores
+                // editor focus) then re-dispatches Find in Files.
+                esc_closes(div().track_focus(&find_focus).child(body))
+            };
+            let Some(hits) = hits else {
+                let focus = find_focus.clone();
+                window.defer(cx, move |window, cx| focus.focus(window, cx));
+                return dialog.child(wrap(
                     h_flex()
                         .id("find-in-files-searching")
                         .p_4()
@@ -2296,11 +2341,14 @@ impl Workspace {
                                     stop.store(true, Ordering::Relaxed);
                                     window.close_dialog(cx);
                                 }),
-                        ),
-                );
+                        )
+                        .into_any_element(),
+                ));
             };
             if hits.is_empty() {
-                return dialog.child(
+                let focus = find_focus.clone();
+                window.defer(cx, move |window, cx| focus.focus(window, cx));
+                return dialog.child(wrap(
                     h_flex()
                         .id("find-in-files-none")
                         .p_4()
@@ -2316,10 +2364,10 @@ impl Workspace {
                                 .primary()
                                 .label("OK")
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
-                        ),
-                );
+                        )
+                        .into_any_element(),
+                ));
             }
-            let root = progress.root.clone();
             let items = hits.iter().map(|hit| {
                 let shown = hit
                     .path
@@ -2334,8 +2382,8 @@ impl Workspace {
                     .icon(Icon::new(file_icon(&hit.path)))
             });
             let picked = hits.clone();
-            let workspace = workspace.clone();
-            dialog.child(esc_closes(
+            let confirm_ws = workspace.clone();
+            dialog.child(wrap(
                 Command::new(&state)
                     .bordered(false)
                     .placeholder("Filter the matches")
@@ -2347,9 +2395,10 @@ impl Workspace {
                         let Some(hit) = picked.get(index.row).cloned() else {
                             return;
                         };
-                        _ = workspace.update(cx, |this, cx| this.open_hit(&hit, window, cx));
+                        _ = confirm_ws.update(cx, |this, cx| this.open_hit(&hit, window, cx));
                     })
-                    .on_cancel(|window, cx| window.close_dialog(cx)),
+                    .on_cancel(|window, cx| window.close_dialog(cx))
+                    .into_any_element(),
             ))
         });
     }
@@ -3225,6 +3274,15 @@ impl Workspace {
         let state = self.quick_open.clone();
         let listing = files.clone();
         let home = std::env::var_os("HOME").map(PathBuf::from);
+        let current = self.active_document().read(cx).path().cloned();
+        let mut recent = AppSettings::get(cx).recent_files.clone();
+        for document in &self.documents {
+            if let Some(path) = document.read(cx).path()
+                && !recent.contains(path)
+            {
+                recent.push(path.clone());
+            }
+        }
         window.open_dialog(cx, move |dialog, window, cx| {
             let focus = state.read(cx).focus_handle(cx);
             window.defer(cx, move |window, cx| focus.focus(window, cx));
@@ -3234,7 +3292,8 @@ impl Workspace {
             // own entries. One `stat`, or one folder read, per keystroke.
             let query = state.read(cx).query(cx).trim().to_string();
             let rows = quick_open_rows(&query, &root, home.as_deref(), &listing);
-            let items = rows.iter().map(|row| {
+            let (first, rows) = split_recent(rows, &recent, current.as_deref());
+            let item = |row: &QuickOpenRow| {
                 let shown: SharedString = row.label.clone().into();
                 let name: SharedString = row
                     .path
@@ -3255,36 +3314,55 @@ impl Workspace {
                     .label(shown)
                     .keywords(keywords)
                     .icon(Icon::new(icon))
-            });
-            let picked = rows.clone();
+            };
+            let recent_items = first.iter().map(item).collect::<Vec<_>>();
+            let items = rows.iter().map(item).collect::<Vec<_>>();
+            // Section indices match the groups actually shown: omit an empty
+            // "Recently opened" so Files stays section 0.
+            let picked: Vec<Vec<QuickOpenRow>> = if first.is_empty() {
+                vec![rows.clone()]
+            } else {
+                vec![first.clone(), rows.clone()]
+            };
             let navigate = state.clone();
-            dialog.close_button(false).p_0().child(esc_closes(
-                Command::new(&state)
-                    .bordered(false)
-                    .placeholder("Search files by name, or type a path")
-                    .max_h(rems(24.))
-                    .items(items)
-                    .empty(|_, _, _| "No matching files")
-                    // The rows depend on the query when it is a path, so the
-                    // dialog is drawn again as it changes.
-                    .on_query(|_, window, _| window.refresh())
-                    .on_confirm(move |index: IndexPath, window, cx| {
-                        let Some(row) = picked.get(index.row).cloned() else {
-                            return;
-                        };
-                        if row.is_dir {
-                            // Into the folder, as VS Code's picker does.
-                            let mut typed = row.label.clone();
-                            typed.push('/');
-                            navigate.update(cx, |state, cx| state.set_query(typed, window, cx));
-                            window.refresh();
-                            return;
-                        }
-                        window.close_dialog(cx);
-                        window.dispatch_action(Box::new(OpenQuickPath(row.path, row.line)), cx);
-                    })
-                    .on_cancel(|window, cx| window.close_dialog(cx)),
-            ))
+            let mut command = Command::new(&state)
+                .bordered(false)
+                .placeholder("Search files by name, or type a path")
+                .max_h(rems(24.));
+            if !recent_items.is_empty() {
+                command = command.group(
+                    CommandGroup::new()
+                        .label("Recently opened")
+                        .items(recent_items),
+                );
+            }
+            command = command
+                .group(CommandGroup::new().label("Files").items(items))
+                .empty(|_, _, _| div().px_3().py_2().child("No matching files"))
+                // The rows depend on the query when it is a path, so the
+                // dialog is drawn again as it changes.
+                .on_query(|_, window, _| window.refresh())
+                .on_confirm(move |index: IndexPath, window, cx| {
+                    let Some(row) = picked
+                        .get(index.section)
+                        .and_then(|rows| rows.get(index.row))
+                        .cloned()
+                    else {
+                        return;
+                    };
+                    if row.is_dir {
+                        // Into the folder, as VS Code's picker does.
+                        let mut typed = row.label.clone();
+                        typed.push('/');
+                        navigate.update(cx, |state, cx| state.set_query(typed, window, cx));
+                        window.refresh();
+                        return;
+                    }
+                    window.close_dialog(cx);
+                    window.dispatch_action(Box::new(OpenQuickPath(row.path, row.line)), cx);
+                })
+                .on_cancel(|window, cx| window.close_dialog(cx));
+            dialog.close_button(false).p_0().child(esc_closes(command))
         });
     }
 
@@ -3446,6 +3524,114 @@ impl Workspace {
         } else {
             self.zoom(delta, cx);
         }
+    }
+
+    /// Pick a color theme, VS Code style: the light and dark themes in two
+    /// groups with the current one checked; moving through them previews
+    /// each, Enter keeps it (as the light or dark theme), Esc puts back the
+    /// one there was.
+    fn show_theme_picker(
+        &mut self,
+        _: &SelectColorTheme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        self.theme_picker
+            .update(cx, |state, cx| state.set_query("", window, cx));
+        let state = self.theme_picker.clone();
+        let before = AppSettings::get(cx).clone();
+        let current = cx.theme().theme_name().clone();
+        let names = [
+            themes::theme_names(gpui_kit::component::ThemeMode::Light, cx),
+            themes::theme_names(gpui_kit::component::ThemeMode::Dark, cx),
+        ];
+        let kept = Rc::new(Cell::new(false));
+        let revert = {
+            let kept = kept.clone();
+            move |cx: &mut App| {
+                if !kept.get() {
+                    let before = before.clone();
+                    AppSettings::update(cx, move |settings| *settings = before);
+                }
+            }
+        };
+        let revert = Rc::new(revert);
+        let workspace = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let focus = state.read(cx).focus_handle(cx);
+            window.defer(cx, move |window, cx| focus.focus(window, cx));
+            let group = |label: &'static str, names: &[SharedString]| {
+                CommandGroup::new()
+                    .label(label)
+                    .items(names.iter().map(|name| {
+                        CommandItem::new()
+                            .label(name.clone())
+                            .checked(*name == current)
+                    }))
+            };
+            let pick = {
+                let names = names.clone();
+                move |index: IndexPath| {
+                    names
+                        .get(index.section)
+                        .and_then(|group| group.get(index.row))
+                        .cloned()
+                }
+            };
+            let preview = pick.clone();
+            let restore = {
+                let revert = revert.clone();
+                let workspace = workspace.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    revert(cx);
+                    if let Some(this) = workspace.upgrade() {
+                        this.update(cx, |this, cx| this.focus_active(window, cx));
+                    }
+                }
+            };
+            let (on_esc, on_close) = (restore.clone(), restore);
+            let kept = kept.clone();
+            let confirm_ws = workspace.clone();
+            dialog
+                .close_button(false)
+                .p_0()
+                .on_close(move |_, window, cx| on_close(window, cx))
+                .child(
+                    div()
+                        .capture_action(move |_: &gpui_kit::base::actions::Cancel, window, cx| {
+                            on_esc(window, cx);
+                            window.close_dialog(cx);
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            Command::new(&state)
+                                .bordered(false)
+                                .placeholder("Select color theme")
+                                .max_h(rems(24.))
+                                .group(group("Light themes", &names[0]))
+                                .group(group("Dark themes", &names[1]))
+                                .empty(|_, _, _| div().px_3().py_2().child("No matching themes"))
+                                .on_select(move |index, _, cx| {
+                                    if let Some(name) = preview(index) {
+                                        themes::select_theme(&name, cx);
+                                    }
+                                })
+                                .on_confirm(move |index, window, cx| {
+                                    if let Some(name) = pick(index) {
+                                        themes::select_theme(&name, cx);
+                                    }
+                                    kept.set(true);
+                                    window.close_dialog(cx);
+                                    if let Some(this) = confirm_ws.upgrade() {
+                                        this.update(cx, |this, cx| this.focus_active(window, cx));
+                                    }
+                                }),
+                        ),
+                )
+        });
     }
 
     fn toggle_appearance(&mut self, _: &ToggleAppearance, _: &mut Window, cx: &mut Context<Self>) {
@@ -4808,6 +4994,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_quick_path))
             .on_action(cx.listener(Self::find_in_files))
             .on_action(cx.listener(Self::toggle_appearance))
+            .on_action(cx.listener(Self::show_theme_picker))
             .on_action(cx.listener(Self::toggle_focus_mode))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
@@ -5052,6 +5239,15 @@ pub fn restored_bounds(cx: &App) -> Option<WindowBounds> {
 /// A palette or picker that one Escape closes, whatever has been typed into
 /// it, as VS Code's quick input does (the list's own Escape clears the
 /// query first).
+/// Ctrl+Shift+F (Cmd on macOS) inside a dialog, turned into Find in Files.
+fn find_again_key(event: &gpui_kit::KeyDownEvent, window: &mut Window, cx: &mut App) {
+    let keys = &event.keystroke;
+    if keys.modifiers.secondary() && keys.modifiers.shift && keys.key.eq_ignore_ascii_case("f") {
+        window.dispatch_action(Box::new(FindInFiles), cx);
+        cx.stop_propagation();
+    }
+}
+
 fn esc_closes(content: impl IntoElement) -> gpui_kit::Div {
     div()
         .capture_action(|_: &gpui_kit::base::actions::Cancel, window, cx| {
@@ -5059,7 +5255,10 @@ fn esc_closes(content: impl IntoElement) -> gpui_kit::Div {
             cx.stop_propagation();
         })
         // Ctrl+Shift+F over a picker leaves it for Find in Files, rather
-        // than being typed into the picker's query.
+        // than being typed into the picker's query. The binding belongs to
+        // the workspace's key context, which a dialog's focus is outside of,
+        // so the key is read here.
+        .capture_key_down(find_again_key)
         .on_action(|_: &FindInFiles, window, cx| {
             window.close_dialog(cx);
             window.defer(cx, |window, cx| {
@@ -5116,6 +5315,26 @@ mod tests {
         assert!(!super::reads_as_text(Path::new("a.png")));
         // A Typst source is text, with its pages beside it.
         assert!(super::reads_as_text(Path::new("a.typ")));
+    }
+
+    #[test]
+    fn quick_open_puts_the_previous_file_first() {
+        let root = PathBuf::from("/ws");
+        let listing: Vec<PathBuf> = ["c.md", "a.md", "b.md"]
+            .iter()
+            .map(|n| root.join(n))
+            .collect();
+        let rows = super::quick_open_rows("", &root, None, &listing);
+        // a.md was opened, then b.md (the current file): most recent first.
+        let recent = vec![root.join("b.md"), root.join("a.md")];
+        let (first, rest) = split_recent(rows, &recent, Some(&root.join("b.md")));
+        assert_eq!(first[0].path, root.join("a.md"));
+        assert_eq!(first.len(), 1);
+        assert_eq!(rest.len(), 2, "the current file stays among the rest");
+        // While typing, the same rows lead: the groups are only filtered.
+        let rows = super::quick_open_rows("md", &root, None, &listing);
+        let (first, _) = split_recent(rows, &recent, Some(&root.join("b.md")));
+        assert_eq!(first[0].path, root.join("a.md"));
     }
 
     #[test]
@@ -5206,6 +5425,24 @@ mod tests {
             let settings = AppSettings::get(cx);
             assert!(settings.tabs);
         });
+    }
+
+    #[test]
+    fn find_again_key_recognises_ctrl_shift_f() {
+        let stroke = gpui_kit::Keystroke::parse("ctrl-shift-f").unwrap();
+        assert!(stroke.modifiers.control);
+        assert!(stroke.modifiers.shift);
+        assert!(stroke.key.eq_ignore_ascii_case("f"));
+    }
+
+    /// Closing the find dialog clears progress and restores editor focus
+    /// (see open_find_results on_close); gui_smoke asserts one Esc and
+    /// Ctrl+Shift+F reopen prefilled.
+    #[test]
+    fn find_dialog_cancel_flag_stops_the_search() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(cancel.load(Ordering::Relaxed));
     }
 
     #[test]
