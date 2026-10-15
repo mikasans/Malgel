@@ -302,6 +302,14 @@ pub fn bind_keys(cx: &mut App) {
             CloseAllTabs,
             Some(EDITOR_CONTEXT),
         ),
+        // Redo: the editor library binds Ctrl+Y off macOS (and Cmd+Shift+Z on
+        // it); Ctrl+Shift+Z is the other key every Linux/Windows editor takes.
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new(
+            "ctrl-shift-z",
+            gpui_kit::component::input::Redo,
+            Some(INPUT_CONTEXT),
+        ),
         KeyBinding::new("secondary-shift-c", CodeBlock, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-shift-.", Quote, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-shift-8", BulletList, Some(EDITOR_CONTEXT)),
@@ -321,6 +329,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-down", MoveLineDown, Some(EDITOR_CONTEXT)),
     ]);
 }
+
+/// gpui-base's key context for its text inputs and editors.
+#[cfg(not(target_os = "macos"))]
+const INPUT_CONTEXT: &str = "Input";
 
 #[cfg(test)]
 mod tests {

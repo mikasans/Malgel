@@ -486,6 +486,21 @@ for _ in 1 2 3 4 5 6; do
 done
 [[ "$(cat "$WS/README.md")" == "$before_chord" ]] || fail "undo did not take the link back out"
 pass "Ctrl+K then another key inserts a link and keeps the key"
+# Ctrl+Shift+Z redoes (as well as Ctrl+Y) off macOS.
+xdotool key --clearmodifiers ctrl+End
+xdotool type --delay 30 'RDO'
+sleep 0.3
+xdotool key --clearmodifiers ctrl+z
+sleep 0.3
+xdotool key --clearmodifiers ctrl+shift+z
+sleep 0.3
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 grep -q 'RDO' "$WS/README.md" || fail "Ctrl+Shift+Z did not redo the undone typing"
+xdotool key --clearmodifiers BackSpace BackSpace BackSpace
+sleep 0.2
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 bash -c "! grep -q 'RDO' '$WS/README.md'" || fail "could not take RDO back out"
+pass "Ctrl+Shift+Z redoes"
 
 # 5. Ctrl+B in the editor is Bold, as in VS Code (Toggle Side Bar is the same
 #    key outside the editor). Assert on the file, not the pixels.
