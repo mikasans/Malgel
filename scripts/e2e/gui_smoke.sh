@@ -38,7 +38,7 @@ cd "$ROOT"
 BIN="${MALGEL_BIN:-$ROOT/target/release/malgel}"
 [[ -x "$BIN" ]] || BIN="$ROOT/target/debug/malgel"
 ART_DIR="${E2E_ARTIFACTS:-$ROOT/target/e2e-artifacts}"
-DISPLAY_NUM="${E2E_DISPLAY:-:99}"
+DISPLAY_NUM="${E2E_DISPLAY:-}"
 SETTLE="${E2E_SETTLE:-1.2}" # seconds to let a frame land before each shot
 
 mkdir -p "$ART_DIR"
@@ -79,19 +79,29 @@ mkdir -m 700 "$TMP_ROOT/xdg"
 export HOME="$TMP_ROOT/home"
 mkdir -p "$HOME"
 export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share"
-export DISPLAY="$DISPLAY_NUM"
-num="${DISPLAY_NUM#:}"
+# Our own Xvfb, on a free display unless E2E_DISPLAY names one. Never kill
+# a server by display number: another run (or a reviewer's) may own it, and
+# killing it mid-run is exactly the kind of "flake" that wastes a day.
 start_xvfb() {
-  pkill -f "Xvfb $DISPLAY_NUM" 2>/dev/null || true
-  sleep 0.3
-  rm -f "/tmp/.X${num}-lock" "/tmp/.X11-unix/X${num}" 2>/dev/null || true
-  Xvfb "$DISPLAY_NUM" -screen 0 1600x1000x24 +extension GLX +render -nolisten tcp \
-    >"$ART_DIR/xvfb.log" 2>&1 &
+  local fdfile="$TMP_ROOT/xvfb-display"
+  : >"$fdfile"
+  if [[ -n "${E2E_DISPLAY:-}" ]]; then
+    Xvfb "$DISPLAY_NUM" -screen 0 1600x1000x24 +extension GLX +render -nolisten tcp \
+      >"$ART_DIR/xvfb.log" 2>&1 &
+  else
+    Xvfb -displayfd 3 -screen 0 1600x1000x24 +extension GLX +render -nolisten tcp \
+      3>"$fdfile" >"$ART_DIR/xvfb.log" 2>&1 &
+  fi
   XVFB_PID=$!
   for _ in $(seq 1 50); do
-    xdotool getdisplaygeometry >/dev/null 2>&1 && return 0
+    if [[ -z "${E2E_DISPLAY:-}" && -s "$fdfile" ]]; then
+      DISPLAY_NUM=":$(tr -dc 0-9 <"$fdfile")"
+    fi
+    export DISPLAY="$DISPLAY_NUM"
+    [[ -n "$DISPLAY" && "$DISPLAY" != ":" ]] && xdotool getdisplaygeometry >/dev/null 2>&1 && return 0
     sleep 0.1
   done
+  kill "$XVFB_PID" 2>/dev/null || true
   return 1
 }
 start_xvfb || start_xvfb || { cat "$ART_DIR/xvfb.log" >&2; fail "Xvfb did not come up on $DISPLAY_NUM"; }
@@ -363,6 +373,8 @@ editor_has_focus() { # type a marker, save, find it, then take it back out
     fi
     # No click here: that would hide a real focus regression.
   done
+  shot "focus-lost-$(date +%s)"
+  echo "focus diag: README head: $(head -c 120 "$WS/README.md" | tr '\n' '|')" >&2
   return 1
 }
 xdotool key --clearmodifiers ctrl+shift+p
@@ -965,6 +977,32 @@ shot 43b-wrapsel-click
 [[ "$GOT" == "wrapword0 "*"wrapword79" ]] \
   || fail "gutter click on wrap row copied '${GOT:0:80}' (at $GX,$GY)"
 pass "gutter click on a wrap continuation selects the logical line"
+
+# 21a1. Find: matches other than the current one are outlined (the library's
+#       desaturated fill alone is nearly invisible on a light background).
+xdotool key --clearmodifiers ctrl+f
+sleep 0.5
+xdotool type --delay 30 'wrapword'
+sleep 0.6
+shot 43f-find-others
+xdotool key --clearmodifiers Escape
+sleep 0.3
+python3 - "$ART_DIR/43f-find-others.png" <<'PY' || fail "Find's other matches are not outlined"
+from PIL import Image
+import colorsys, sys
+im = Image.open(sys.argv[1]).convert("RGB")
+w, h = im.size
+n = 0
+for y in range(int(h * 0.25), int(h * 0.80), 2):
+    for x in range(int(w * 0.33), int(w * 0.75), 2):
+        r, g, b = (c / 255 for c in im.getpixel((x, y)))
+        _, l, s = colorsys.rgb_to_hls(r, g, b)
+        if s > 0.45 and 0.25 < l < 0.75:
+            n += 1
+print(f"find outlines: {n} saturated samples")
+assert n > 150, n
+PY
+pass "Find outlines the other matches"
 
 # 21a2. After scrolling (Ctrl+End in the 12k-line file) a line-number click
 #       still selects: click the last line's number and copy it.
