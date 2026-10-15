@@ -160,7 +160,7 @@ pub fn render(source: &str, theme: &DiagramTheme, id: &str) -> Result<Diagram, S
     };
     let control = OperationControl::new().with_deadline(DEADLINE);
     match renderer.render(RenderRequest::svg(source, control, request)) {
-        Ok(RenderOutput::Svg(Some(svg))) => sized(svg.svg()),
+        Ok(RenderOutput::Svg(Some(svg))) => sized(&pad_edge_labels(svg.svg())),
         Ok(_) => Err("This isn’t a Mermaid diagram Malgel recognizes.".into()),
         Err(err) => Err(describe(&err.to_string())),
     }
@@ -213,6 +213,85 @@ fn sized(svg: &str) -> Result<Diagram, String> {
         width,
         height,
     })
+}
+
+/// The group class merman gives an edge label's drawn background and text.
+const EDGE_LABEL_GROUP: &str = "data-merman-source-classes=\"root edgeLabels";
+
+/// Widen each edge label's background to fit its text, with a little room.
+///
+/// merman sizes the rect from its own font metrics, narrower than what resvg
+/// draws, so the label ran past its background and the edge line showed
+/// through the text ("yes" / "no" on a flowchart branch).
+fn pad_edge_labels(svg: &str) -> String {
+    let mut out = String::with_capacity(svg.len() + 64);
+    let mut rest = svg;
+    while let Some(at) = rest.find(EDGE_LABEL_GROUP) {
+        let (head, tail) = rest.split_at(at);
+        out.push_str(head);
+        let group_end = tail.find("</g>").map_or(tail.len(), |end| end + 4);
+        out.push_str(&pad_one_label(&tail[..group_end]));
+        rest = &tail[group_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One fallback label group: its first `<rect …/>` resized around the text.
+fn pad_one_label(group: &str) -> String {
+    let fitted = (|| {
+        let rect_start = group.find("<rect ")?;
+        let rect_end = group[rect_start..].find("/>")? + rect_start + 2;
+        let rect = &group[rect_start..rect_end];
+        let text_start = group.find("<text ")?;
+        let open_end = group[text_start..].find('>')? + text_start;
+        let label_end = group[open_end..].find("</text>")? + open_end;
+        let label = &group[open_end + 1..label_end];
+        let style = attribute(&group[text_start..open_end], "style").unwrap_or("");
+        let font_size = style
+            .split(';')
+            .find_map(|part| part.trim().strip_prefix("font-size:"))
+            .and_then(|size| size.trim_end_matches("px").parse::<f32>().ok())
+            .unwrap_or(16.);
+        let number = |name| attribute(rect, name)?.parse::<f32>().ok();
+        let (x, y, width, height) = (
+            number("x")?,
+            number("y")?,
+            number("width")?,
+            number("height")?,
+        );
+        let (new_width, new_height) = fitted_label_size(label, font_size, width, height);
+        let center_x = x + width / 2.;
+        let center_y = y + height / 2.;
+        let mut fitted = rect.to_string();
+        for (name, new) in [
+            ("x", center_x - new_width / 2.),
+            ("y", center_y - new_height / 2.),
+            ("width", new_width),
+            ("height", new_height),
+        ] {
+            let value = attribute(&fitted, name)?.to_string();
+            fitted = fitted.replacen(
+                &format!(" {name}=\"{value}\""),
+                &format!(" {name}=\"{new:.2}\""),
+                1,
+            );
+        }
+        Some(format!(
+            "{}{fitted}{}",
+            &group[..rect_start],
+            &group[rect_end..]
+        ))
+    })();
+    fitted.unwrap_or_else(|| group.to_string())
+}
+
+/// The background for `label` at `font_size`: wide enough for the text as
+/// resvg draws it (about 0.62 em per character in the sans fallback), plus
+/// 4px either side, and never smaller than merman made it.
+fn fitted_label_size(label: &str, font_size: f32, width: f32, height: f32) -> (f32, f32) {
+    let text = label.chars().count() as f32 * font_size * 0.62;
+    (width.max(text) + 8., height + 2.)
 }
 
 /// The value of `name="…"` in an element's start tag.
@@ -281,5 +360,35 @@ mod tests {
         let error = render("flowchart LR\n  A -->", &DiagramTheme::document(), "t").unwrap_err();
         assert!(!error.is_empty());
         assert!(render("not a diagram", &DiagramTheme::document(), "t").is_err());
+    }
+
+    #[test]
+    fn edge_labels_get_a_background_wider_than_their_text() {
+        let (width, _) = fitted_label_size("yes", 16., 22.56, 24.);
+        assert!(width >= 3. * 16. * 0.62 + 8., "{width}");
+        let diagram = render(
+            "flowchart LR\n  A[Write] -- yes --> C[Ship]",
+            &DiagramTheme::document(),
+            "test-label",
+        )
+        .unwrap();
+        let group = &diagram.svg[diagram.svg.find(EDGE_LABEL_GROUP).expect("an edge label")..];
+        let rect = &group[group.find("<rect ").unwrap()..];
+        let rect = &rect[..rect.find("/>").unwrap()];
+        let rect_width: f32 = attribute(rect, "width").unwrap().parse().unwrap();
+        assert!(
+            rect_width >= 37.,
+            "label background {rect_width}px for 'yes'"
+        );
+        let x: f32 = attribute(rect, "x").unwrap().parse().unwrap();
+        let text = &group[group.find("<text ").unwrap()..];
+        let text_x: f32 = attribute(text, "x").unwrap().parse().unwrap();
+        assert!(
+            (x + rect_width / 2. - text_x).abs() < 0.1,
+            "centered on the text"
+        );
+        assert!(
+            resvg::usvg::Tree::from_str(&diagram.svg, &resvg::usvg::Options::default()).is_ok()
+        );
     }
 }
