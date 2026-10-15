@@ -77,12 +77,32 @@ pub fn search_text(text: &str, query: &str, limit: usize) -> Vec<(usize, usize, 
 }
 
 /// Search `files` in the order given, at most `limit` hits in total.
+#[cfg(test)]
 pub fn search_files(files: &[PathBuf], query: &str, limit: usize) -> Vec<Hit> {
+    search_files_until(
+        files,
+        query,
+        limit,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+/// [`search_files`], stopping between files once `cancel` is set, so a
+/// search the user dismissed stops reading the folder.
+pub fn search_files_until(
+    files: &[PathBuf],
+    query: &str,
+    limit: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<Hit> {
     let mut hits = Vec::new();
     if query.is_empty() {
         return hits;
     }
     for path in files {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         let left = limit.saturating_sub(hits.len());
         if left == 0 {
             break;
@@ -118,6 +138,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_cancelled_search_reads_no_further() {
+        let dir = scratch("cancel");
+        let file = dir.join("a.md");
+        std::fs::write(&file, "needle\n").unwrap();
+        let files = vec![file.clone(), file];
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        assert!(search_files_until(&files, "needle", 10, &cancel).is_empty());
+        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(search_files_until(&files, "needle", 10, &cancel).len(), 2);
     }
 
     #[test]

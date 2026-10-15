@@ -174,6 +174,12 @@ pub struct DocumentView {
     /// Measured widths used to center the text column.
     editor_width: Pixels,
     preview_width: Pixels,
+    /// A stand-in tab for a PDF or picture still being read off the UI
+    /// thread; the workspace swaps the finished document in, or removes it.
+    loading: bool,
+    /// Where the caret goes once a loading tab's text arrives, reported as
+    /// its cursor meanwhile so a session saved now keeps it.
+    pending_cursor: usize,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -271,6 +277,8 @@ impl DocumentView {
             synced_preview_rows: 0,
             editor_width: px(0.),
             preview_width: px(0.),
+            loading: false,
+            pending_cursor: 0,
             _subscriptions: subscriptions,
         };
         this.load_text(text, path, line_ending, window, cx);
@@ -368,6 +376,25 @@ impl DocumentView {
         }
     }
 
+    /// A placeholder for `path` while it loads in the background: its tab
+    /// carries the file's name and its body says it is loading.
+    pub fn new_loading(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut doc = Self::new(String::new(), Some(path), LineEnding::Lf, window, cx);
+        doc.loading = true;
+        doc
+    }
+
+    /// A loading tab that will put the caret at `cursor`.
+    pub fn with_pending_cursor(mut self, cursor: usize) -> Self {
+        self.pending_cursor = cursor;
+        self
+    }
+
+    /// Whether this is a placeholder for a file still loading.
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
     /// A document displaying an image (PNG, JPEG, SVG, …) with zoom.
     pub fn new_image(
         path: PathBuf,
@@ -423,6 +450,8 @@ impl DocumentView {
             synced_preview_rows: 0,
             editor_width: px(0.),
             preview_width: px(0.),
+            loading: false,
+            pending_cursor: 0,
             _subscriptions: Vec::new(),
         }
     }
@@ -477,6 +506,8 @@ impl DocumentView {
             synced_preview_rows: 0,
             editor_width: px(0.),
             preview_width: px(0.),
+            loading: false,
+            pending_cursor: 0,
             _subscriptions: Vec::new(),
         }
     }
@@ -541,6 +572,8 @@ impl DocumentView {
             synced_preview_rows: 0,
             editor_width: px(0.),
             preview_width: px(0.),
+            loading: false,
+            pending_cursor: 0,
             _subscriptions: Vec::new(),
         }
     }
@@ -702,7 +735,7 @@ impl DocumentView {
     /// Whether this document shows a media view (PDF or image) rather than
     /// editable text, so zoom commands act on the viewer instead of the UI.
     pub fn is_media(&self) -> bool {
-        self.pdf.is_some() || self.image.is_some()
+        self.pdf.is_some() || self.image.is_some() || self.loading
     }
 
     /// Forward a zoom step (positive zooms in, negative out, zero resets) to
@@ -806,6 +839,9 @@ impl DocumentView {
     }
 
     pub fn cursor(&self, cx: &App) -> usize {
+        if self.loading {
+            return self.pending_cursor;
+        }
         self.editor.read(cx).cursor()
     }
 
@@ -2093,6 +2129,17 @@ impl DocumentView {
 
 impl Render for DocumentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.loading {
+            return h_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .gap_2()
+                .text_color(cx.theme().muted_foreground)
+                .child(gpui_kit::component::spinner::Spinner::new())
+                .child(format!("Loading \u{201c}{}\u{201d}\u{2026}", self.name()))
+                .into_any_element();
+        }
         if let Some(pdf) = &self.pdf {
             return pdf.clone().into_any_element();
         }

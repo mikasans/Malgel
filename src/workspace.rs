@@ -8,7 +8,10 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -16,8 +19,8 @@ use gpui_kit::{
     Anchor, App, AppContext as _, Bounds, ClipboardItem, Context, DragMoveEvent, Entity, EntityId,
     ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
     MouseButton, MouseDownEvent, ParentElement as _, PathPromptOptions, Pixels, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    WindowBounds,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
+    Window, WindowBounds,
     assets::IconName,
     base::Disableable as _,
     component::{
@@ -34,6 +37,7 @@ use gpui_kit::{
         radio::RadioGroup,
         resizable::{h_resizable, resizable_panel},
         scroll::ScrollableElement as _,
+        spinner::Spinner,
         status_bar::StatusBar,
         switch::Switch,
         v_flex,
@@ -260,6 +264,15 @@ fn open_choices(check: document::OpenCheck, media: bool) -> &'static [OpenChoice
 }
 
 /// A PDF or picture read and decoded in the background.
+/// A Find in Files search: what was asked, where, a flag that stops it,
+/// and its matches once it has finished.
+struct FindProgress {
+    root: PathBuf,
+    query: String,
+    cancel: Arc<AtomicBool>,
+    hits: Option<Vec<Hit>>,
+}
+
 enum MediaLoad {
     Pdf(crate::pdf_view::PdfDocument),
     Image(Arc<gpui_kit::Image>, f32, f32),
@@ -346,6 +359,8 @@ pub struct Workspace {
     /// the hits it lists.
     find_query: Entity<CommandState>,
     find_results: Entity<CommandState>,
+    /// The running or finished Find in Files search its dialog shows.
+    find_progress: Option<FindProgress>,
     file_tree: Entity<FileTree>,
     app_menu_bar: Entity<AppMenuBar>,
 
@@ -375,6 +390,12 @@ pub struct Workspace {
     /// The tab bar's bounds as of the last drag move, so a drop outside the
     /// bar can clear the insertion line.
     tab_bar_bounds: Cell<Option<Bounds<Pixels>>>,
+    /// The tab strip's scroll position, so the active tab is brought fully
+    /// into view, its close button included, when it changes.
+    tab_scroll: ScrollHandle,
+    /// The (active tab, tab count) last scrolled into view; a change of
+    /// either asks for a reveal, and a manual scroll is otherwise left alone.
+    tab_revealed: Cell<Option<(usize, usize)>>,
     /// Whether the invert key is held while a tab drags: the drop then
     /// duplicates the tab instead of moving it, as in VS Code.
     tab_drag_copy: Cell<bool>,
@@ -488,6 +509,7 @@ impl Workspace {
             tree_prompt,
             find_query,
             find_results,
+            find_progress: None,
             file_tree,
             app_menu_bar,
             window_title: String::new(),
@@ -502,6 +524,8 @@ impl Workspace {
             last_session: None,
             tab_insertion: None,
             tab_bar_bounds: Cell::new(None),
+            tab_scroll: ScrollHandle::new(),
+            tab_revealed: Cell::new(None),
             tab_drag_copy: Cell::new(false),
             _watch_task: watch_task,
             document_subscriptions: Vec::new(),
@@ -526,6 +550,7 @@ impl Workspace {
         let mut active = None;
         let mut referenced = HashSet::new();
         let mut deferred_open = paths.clone();
+        let mut restoring: Vec<(EntityId, PathBuf, usize)> = Vec::new();
 
         for (ix, entry) in previous.documents.iter().enumerate() {
             let recovery = entry.recovery.as_deref().and_then(|id| {
@@ -550,17 +575,16 @@ impl Workspace {
                         deferred_open.push(path.clone());
                         return None;
                     }
-                    let loaded = document::load(path).ok()?;
-                    Some(cx.new(|cx| {
-                        DocumentView::new(
-                            loaded.text,
-                            Some(path.clone()),
-                            loaded.line_ending,
-                            window,
-                            cx,
-                        )
-                        .with_encoding(loaded.encoding)
-                    }))
+                    // The text is read off the UI thread, so a session of
+                    // big files does not hold the window back from showing;
+                    // a loading tab keeps the file's place meanwhile.
+                    let cursor = entry.cursor;
+                    let doc = cx.new(|cx| {
+                        DocumentView::new_loading(path.clone(), window, cx)
+                            .with_pending_cursor(cursor)
+                    });
+                    restoring.push((doc.entity_id(), path.clone(), cursor));
+                    Some(doc)
                 }),
                 None => None,
             };
@@ -619,6 +643,13 @@ impl Workspace {
         // open_paths spawns async loads that must update this workspace
         // through the window; defer until the build callback has returned,
         // otherwise update_in is rejected while the window is on the stack.
+        if !restoring.is_empty() {
+            cx.defer_in(window, move |this, window, cx| {
+                for (id, path, cursor) in restoring {
+                    this.finish_restoring(id, path, cursor, window, cx);
+                }
+            });
+        }
         if !deferred_open.is_empty() {
             cx.defer_in(window, move |this, window, cx| {
                 this.open_paths(deferred_open, Placement::Default, window, cx);
@@ -626,6 +657,48 @@ impl Workspace {
         }
         self.focus_active(window, cx);
         self.sync_file_tree(cx);
+    }
+
+    /// Read a restored file's text in the background and swap it into its
+    /// loading tab, caret where it was; a file gone meanwhile just leaves.
+    fn finish_restoring(
+        &mut self,
+        id: EntityId,
+        path: PathBuf,
+        cursor: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let read_path = path.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { document::load(&read_path) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                let Some(ix) = this.document_index(id) else {
+                    return;
+                };
+                match result {
+                    Ok(loaded) => {
+                        let doc = cx.new(|cx| {
+                            DocumentView::new(
+                                loaded.text,
+                                Some(path.clone()),
+                                loaded.line_ending,
+                                window,
+                                cx,
+                            )
+                            .with_encoding(loaded.encoding)
+                        });
+                        doc.update(cx, |doc, cx| doc.set_cursor(cursor, window, cx));
+                        this.swap_in_loaded(id, ix, doc, window, cx);
+                    }
+                    Err(_) => this.drop_loading(Some(id), &path, window, cx),
+                }
+            });
+        })
+        .detach();
     }
 
     fn restored_document(
@@ -771,6 +844,83 @@ impl Workspace {
             self.preview = None;
         }
         self.activate(position, window, cx);
+    }
+
+    /// Show a loading tab for `path` where `placement` puts the file, when
+    /// that is safe (see [`placeholder_is_safe`]); its id, if one was shown.
+    fn place_loading(
+        &mut self,
+        path: &Path,
+        placement: Placement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<EntityId> {
+        if !placeholder_is_safe(
+            placement,
+            self.active_document().read(cx).is_blank(),
+            AppSettings::get(cx).tabs,
+        ) {
+            return None;
+        }
+        let loading = cx.new(|cx| DocumentView::new_loading(path.to_path_buf(), window, cx));
+        let id = loading.entity_id();
+        self.place_document(loading, placement, window, cx);
+        Some(id)
+    }
+
+    /// Where a finished load goes: `Some(None)` with no loading tab (place
+    /// it normally), `Some(Some((id, ix)))` in its loading tab, and `None`
+    /// when that tab was closed meanwhile, which means never mind.
+    fn loading_slot(&self, placeholder: Option<EntityId>) -> Option<Option<(EntityId, usize)>> {
+        match placeholder {
+            Some(id) => self.document_index(id).map(|ix| Some((id, ix))),
+            None => Some(None),
+        }
+    }
+
+    /// Take a failed load's loading tab away, leaving no empty tab and no
+    /// Reopen Closed Editor entry behind.
+    fn drop_loading(
+        &mut self,
+        placeholder: Option<EntityId>,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = placeholder
+            && self.document_index(id).is_some()
+        {
+            self.remove_document(id, window, cx);
+            self.closed_documents.retain(|closed| closed != path);
+        }
+    }
+
+    /// Put a finished document in the place of its loading tab `id` at
+    /// `ix`, keeping that tab's preview slot and pin.
+    fn swap_in_loaded(
+        &mut self,
+        id: EntityId,
+        ix: usize,
+        doc: Entity<DocumentView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let new = doc.entity_id();
+        let was_preview = self.preview == Some(id);
+        let was_pinned = self.pinned.remove(&id);
+        let was_active = self.active == ix;
+        let active = self.active;
+        self.replace_document_at(ix, doc, window, cx);
+        if was_preview {
+            self.preview = Some(new);
+        }
+        if was_pinned {
+            self.pinned.insert(new);
+        }
+        if !was_active {
+            // The user moved on while it loaded; leave them where they are.
+            self.activate(active, window, cx);
+        }
     }
 
     /// Show `doc` where `placement` asks: the preview slot, in place of the
@@ -1142,30 +1292,51 @@ impl Workspace {
 
         // A Typst document's preview is its compiled pages, so it takes the
         // same path a PDF does and is watched for changes to refresh.
+        // It compiles off the UI thread, a loading tab standing in meanwhile.
         if document::is_typst_path(&path) && !plain {
-            match crate::typst_preview::TypstPreview::open(&path) {
-                Ok(compiled) => {
-                    AppSettings::update(cx, |settings| settings.push_recent(&path));
-                    let doc =
-                        cx.new(|cx| DocumentView::new_typst(path.clone(), compiled, window, cx));
-                    self.place_document(doc, placement, window, cx);
-                    return;
-                }
-                Err(err) => {
-                    // Show the source so the mistake can be fixed here, the
-                    // way VS Code opens a file whose preview fails; it stays
-                    // in the recent files, as it still exists.
-                    self.notify_error(
-                        format!(
-                            "Couldn’t compile “{}”. {err} Showing the source instead; reopen it once it compiles to see its pages.",
-                            document::display_name(Some(&path))
-                        ),
-                        window,
-                        cx,
-                    );
-                    // Falls through to open the source as text.
-                }
-            }
+            let compile_path = path.clone();
+            let task = cx
+                .background_executor()
+                .spawn(async move { crate::typst_preview::TypstPreview::open(&compile_path) });
+            let placeholder = self.place_loading(&path, placement, window, cx);
+            cx.spawn_in(window, async move |this, cx| {
+                let result = task.await;
+                _ = this.update_in(cx, |this, window, cx| match result {
+                    Ok(compiled) => {
+                        let Some(slot) = this.loading_slot(placeholder) else {
+                            return;
+                        };
+                        AppSettings::update(cx, |settings| settings.push_recent(&path));
+                        let doc = cx
+                            .new(|cx| DocumentView::new_typst(path.clone(), compiled, window, cx));
+                        match slot {
+                            Some((id, ix)) => this.swap_in_loaded(id, ix, doc, window, cx),
+                            None => this.place_document(doc, placement, window, cx),
+                        }
+                    }
+                    Err(err) => {
+                        if this.loading_slot(placeholder).is_none() {
+                            return;
+                        }
+                        this.drop_loading(placeholder, &path, window, cx);
+                        // Show the source so the mistake can be fixed here,
+                        // the way VS Code opens a file whose preview fails;
+                        // it stays in the recent files, as it still exists.
+                        this.notify_error(
+                            format!(
+                                "Couldn\u{2019}t compile \u{201c}{}\u{201d}. {err} Showing the source instead; reopen it once it compiles to see its pages.",
+                                document::display_name(Some(&path))
+                            ),
+                            window,
+                            cx,
+                        );
+                        this.approved_opens.insert(path.clone(), OpenMode::PlainText);
+                        this.load_path(path, placement, target, window, cx);
+                    }
+                });
+            })
+            .detach();
+            return;
         }
 
         // A PDF is parsed and a picture decoded off the UI thread, so a large
@@ -1183,10 +1354,14 @@ impl Workspace {
                         .map(|(image, width, height)| MediaLoad::Image(image, width, height))
                 }
             });
+            let placeholder = self.place_loading(&path, placement, window, cx);
             cx.spawn_in(window, async move |this, cx| {
                 let result = task.await;
                 _ = this.update_in(cx, |this, window, cx| match result {
                     Ok(media) => {
+                        let Some(slot) = this.loading_slot(placeholder) else {
+                            return;
+                        };
                         AppSettings::update(cx, |settings| settings.push_recent(&path));
                         let doc = cx.new(|cx| match media {
                             MediaLoad::Pdf(document) => {
@@ -1201,9 +1376,15 @@ impl Workspace {
                                 cx,
                             ),
                         });
-                        this.place_document(doc, placement, window, cx);
+                        match slot {
+                            Some((id, ix)) => this.swap_in_loaded(id, ix, doc, window, cx),
+                            None => this.place_document(doc, placement, window, cx),
+                        }
                     }
                     Err(err) => {
+                        // No empty tab is left behind: the stand-in goes,
+                        // and the error says why.
+                        this.drop_loading(placeholder, &path, window, cx);
                         if pdf {
                             AppSettings::update(cx, |settings| {
                                 settings.recent_files.retain(|recent| recent != &path)
@@ -2089,49 +2270,121 @@ impl Workspace {
         }
         // The walk and the reads are off the UI thread: a folder of notes
         // runs to thousands of files, and the window used to sit still while
-        // Quick Open listed them for the same reason.
+        // Quick Open listed them for the same reason. The results dialog
+        // opens at once, saying it is searching, and closing it stops the
+        // search between files.
+        if let Some(previous) = self.find_progress.take() {
+            previous.cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.find_progress = Some(FindProgress {
+            root: root.clone(),
+            query: needle.clone(),
+            cancel: cancel.clone(),
+            hits: None,
+        });
         let show_hidden = AppSettings::get(cx).show_hidden_entries;
         let opened = self.file_tree.read(cx).expanded_folders();
-        let walk_root = root.clone();
-        let wanted = needle.clone();
+        let walk_root = root;
+        let wanted = needle;
+        let stop = cancel.clone();
         let listing = cx.background_executor().spawn(async move {
             let files =
                 quick_open::files_under(&walk_root, show_hidden, &opened, quick_open::MAX_FILES);
-            search::search_files(&files, &wanted, search::MAX_HITS)
+            search::search_files_until(&files, &wanted, search::MAX_HITS, &stop)
+        });
+        // The prompt that asked for the text is closing; open after it.
+        let workspace = cx.entity();
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |this, cx| this.open_find_results(window, cx));
         });
         cx.spawn_in(window, async move |this, cx| {
             let hits = listing.await;
             _ = this.update_in(cx, |this, window, cx| {
-                this.open_find_results(root, needle, hits, window, cx)
+                let Some(progress) = this.find_progress.as_mut() else {
+                    return;
+                };
+                if !Arc::ptr_eq(&progress.cancel, &cancel) || cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                progress.hits = Some(hits);
+                this.find_results
+                    .update(cx, |state, cx| state.set_query("", window, cx));
+                let focus = this.find_results.read(cx).focus_handle(cx);
+                window.defer(cx, move |window, cx| focus.focus(window, cx));
+                window.refresh();
             });
         })
         .detach();
     }
 
-    /// List what the search found; confirming a line opens the file it came
-    /// from with the caret on it.
-    fn open_find_results(
-        &mut self,
-        root: PathBuf,
-        query: String,
-        hits: Vec<Hit>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if window.has_active_dialog(cx) {
+    /// The Find in Files dialog: “Searching…” with a Cancel button while
+    /// the search runs, then the matches, or “No matches” in place, so the
+    /// answer is where the question was asked rather than a passing toast.
+    /// Confirming a match opens its file with the caret on its line.
+    fn open_find_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find_progress.is_none() || window.has_active_dialog(cx) {
             return;
         }
-        if hits.is_empty() {
-            window.push_notification(Notification::info(format!("No matches for “{query}”.")), cx);
-            return;
-        }
-        self.find_results
-            .update(cx, |state, cx| state.set_query("", window, cx));
         let state = self.find_results.clone();
         let workspace = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let focus = state.read(cx).focus_handle(cx);
-            window.defer(cx, move |window, cx| focus.focus(window, cx));
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let Some(this) = workspace.upgrade() else {
+                return dialog;
+            };
+            let Some(progress) = this.read(cx).find_progress.as_ref() else {
+                return dialog;
+            };
+            let query = progress.query.clone();
+            let stop = progress.cancel.clone();
+            let dialog = dialog.close_button(false).p_0().on_close({
+                let stop = stop.clone();
+                move |_, _, _| stop.store(true, Ordering::Relaxed)
+            });
+            let Some(hits) = progress.hits.clone() else {
+                return dialog.child(
+                    h_flex()
+                        .id("find-in-files-searching")
+                        .p_4()
+                        .gap_3()
+                        .items_center()
+                        .child(Spinner::new())
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(format!("Searching for \u{201c}{query}\u{201d}\u{2026}")),
+                        )
+                        .child(
+                            Button::new("find-in-files-cancel")
+                                .label("Cancel")
+                                .on_click(move |_, window, cx| {
+                                    stop.store(true, Ordering::Relaxed);
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                );
+            };
+            if hits.is_empty() {
+                return dialog.child(
+                    h_flex()
+                        .id("find-in-files-none")
+                        .p_4()
+                        .gap_3()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(format!("No matches for \u{201c}{query}\u{201d}.")),
+                        )
+                        .child(
+                            Button::new("find-in-files-ok")
+                                .primary()
+                                .label("OK")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
+                );
+            }
+            let root = progress.root.clone();
             let items = hits.iter().map(|hit| {
                 let shown = hit
                     .path
@@ -2147,7 +2400,7 @@ impl Workspace {
             });
             let picked = hits.clone();
             let workspace = workspace.clone();
-            dialog.close_button(false).p_0().child(
+            dialog.child(
                 Command::new(&state)
                     .bordered(false)
                     .placeholder("Filter the matches")
@@ -2555,6 +2808,9 @@ impl Workspace {
 
     fn save_as(&mut self, _: &SaveAs, window: &mut Window, cx: &mut Context<Self>) {
         let doc = self.active_document().clone();
+        if doc.read(cx).is_loading() {
+            return;
+        }
         self.prompt_save_path(doc, None, window, cx);
     }
 
@@ -2567,6 +2823,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if doc.read(cx).is_loading() {
+            // Nothing is there to save until the file has loaded.
+            return;
+        }
         match doc.read(cx).path().cloned() {
             Some(path) => {
                 if self.write(&doc, &path, window, cx)
@@ -3460,6 +3720,14 @@ impl Workspace {
         let active_ix = self.active;
         let count = self.documents.len();
         let workspace = cx.weak_entity();
+        // A newly active tab, or one added or closed, is scrolled fully into
+        // view; the handle waits for the tab's bounds if it has none yet.
+        let now = (active_ix, count);
+        if tab_needs_reveal(self.tab_revealed.get(), now) {
+            self.tab_scroll.scroll_to_item(active_ix);
+            self.tab_revealed.set(Some(now));
+        }
+        let tab_scroll = self.tab_scroll.clone();
 
         h_flex()
             .id("tabs")
@@ -3503,141 +3771,222 @@ impl Workspace {
                 )
             })
             .child(
-                h_flex()
-                    .id("tabs-scroll-area")
+                div()
+                    .relative()
                     .flex_1()
+                    .min_w_0()
                     .h_full()
-                    .items_center()
-                    .gap_1()
-                    .overflow_x_scrollbar()
-                    .children(self.documents.iter().enumerate().map(|(ix, doc_entity)| {
-                        let doc = doc_entity.read(cx);
-                        let doc_id = doc_entity.entity_id();
-                        let active = ix == active_ix;
-                        let dirty = doc.is_dirty();
-                        // The preview tab reads like a draft: the next file
-                        // clicked replaces it until it is edited or opened
-                        // for good, the way VS Code marks its preview.
-                        let is_preview = self.preview == Some(doc_id);
-                        let is_pinned = self.pinned.contains(&doc_id);
-                        let is_last = ix + 1 >= count;
-                        let has_other = count > 1;
-                        let name = doc.name().to_string();
-                        // The tab carries its file's type icon, as in VS Code.
-                        let tab_icon = doc.path().map(|path| file_icon(path));
-                        let tab_path = doc.path().cloned();
-                        let theme = cx.theme();
-                        let doc_weak = doc_entity.clone();
-                        let ws_menu = workspace.clone();
-                        let drag_label: SharedString = name.clone().into();
-
+                    .horizontal_scrollbar(&tab_scroll)
+                    .child(
                         h_flex()
-                            .id(("tab", ix))
-                            .group("tab")
-                            .relative()
-                            .h(px(28.))
-                            .max_w(px(220.))
-                            .flex_none()
-                            .pl_2p5()
-                            .pr_1p5()
-                            .gap_1p5()
+                            .id("tabs-scroll-area")
+                            .size_full()
                             .items_center()
-                            .rounded_md()
-                            .text_sm()
-                            .cursor_pointer()
-                            // Tabs drag to a new position, the way they
-                            // reorder in VS Code.
-                            .on_drag(TabDrag { index: ix }, move |_, _, _, cx| {
-                                cx.new(|_| DragGhost {
-                                    label: drag_label.clone(),
-                                })
-                            })
-                            .on_drag_move::<TabDrag>(cx.listener(
-                                move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
-                                    this.set_tab_insertion(event, ix, cx);
-                                },
-                            ))
-                            .when(active, |this| {
-                                this.bg(theme.tab_active)
-                                    .text_color(theme.tab_active_foreground)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .border_1()
-                                    .border_color(theme.border)
-                            })
-                            .when(!active, |this| {
-                                this.bg(theme.tab_bar)
-                                    .text_color(theme.muted_foreground)
-                                    .border_1()
-                                    .border_color(theme.tab_bar)
-                                    .hover(|style| {
-                                        style
-                                            .bg(theme.list_hover)
-                                            .text_color(theme.foreground)
-                                            .border_color(theme.border.opacity(0.5))
-                                    })
-                            })
-                            .child(
-                                div()
+                            .gap_1()
+                            // Tracked by the workspace's own handle, so the active
+                            // tab can be scrolled into view; its children are the
+                            // tabs alone, so a child index is a tab index.
+                            .overflow_x_scroll()
+                            .track_scroll(&tab_scroll)
+                            .children(self.documents.iter().enumerate().map(|(ix, doc_entity)| {
+                                let doc = doc_entity.read(cx);
+                                let doc_id = doc_entity.entity_id();
+                                let active = ix == active_ix;
+                                let dirty = doc.is_dirty();
+                                // The preview tab reads like a draft: the next file
+                                // clicked replaces it until it is edited or opened
+                                // for good, the way VS Code marks its preview.
+                                let is_preview = self.preview == Some(doc_id);
+                                let is_pinned = self.pinned.contains(&doc_id);
+                                let is_last = ix + 1 >= count;
+                                let has_other = count > 1;
+                                let name = doc.name().to_string();
+                                // The tab carries its file's type icon, as in VS Code.
+                                let tab_icon = doc.path().map(|path| file_icon(path));
+                                let tab_path = doc.path().cloned();
+                                let theme = cx.theme();
+                                let doc_weak = doc_entity.clone();
+                                let ws_menu = workspace.clone();
+                                let drag_label: SharedString = name.clone().into();
+
+                                h_flex()
+                                    .id(("tab", ix))
+                                    .group("tab")
+                                    .relative()
+                                    .h(px(28.))
+                                    .max_w(px(220.))
                                     .flex_none()
-                                    .text_color(if active {
-                                        theme.tab_active_foreground
-                                    } else {
-                                        theme.muted_foreground
+                                    .pl_2p5()
+                                    .pr_1p5()
+                                    .gap_1p5()
+                                    .items_center()
+                                    .rounded_md()
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    // Tabs drag to a new position, the way they
+                                    // reorder in VS Code.
+                                    .on_drag(TabDrag { index: ix }, move |_, _, _, cx| {
+                                        cx.new(|_| DragGhost {
+                                            label: drag_label.clone(),
+                                        })
+                                    })
+                                    .on_drag_move::<TabDrag>(cx.listener(
+                                        move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
+                                            this.set_tab_insertion(event, ix, cx);
+                                        },
+                                    ))
+                                    .when(active, |this| {
+                                        this.bg(theme.tab_active)
+                                            .text_color(theme.tab_active_foreground)
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .border_1()
+                                            .border_color(theme.border)
+                                    })
+                                    .when(!active, |this| {
+                                        this.bg(theme.tab_bar)
+                                            .text_color(theme.muted_foreground)
+                                            .border_1()
+                                            .border_color(theme.tab_bar)
+                                            .hover(|style| {
+                                                style
+                                                    .bg(theme.list_hover)
+                                                    .text_color(theme.foreground)
+                                                    .border_color(theme.border.opacity(0.5))
+                                            })
                                     })
                                     .child(
-                                        Icon::new(tab_icon.unwrap_or(IconName::FileText)).xsmall(),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .when(is_preview, |this| this.italic())
-                                    .child(name),
-                            )
-                            .child(
-                                div()
-                                    .size(px(18.))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_sm()
-                                    .hover(|style| style.bg(theme.list_active))
-                                    // A pinned tab shows a pin where the
-                                    // close box would be, and the pin is
-                                    // what takes the click — the way VS
-                                    // Code's pinned tabs read.
-                                    .when(is_pinned, |this| {
-                                        this.child(
-                                            Icon::new(IconName::Pin)
-                                                .xsmall()
-                                                .text_color(theme.muted_foreground),
-                                        )
-                                    })
-                                    .when(!is_pinned, |this| {
-                                        this.child(div().when(dirty, |this| {
+                                        div()
+                                            .flex_none()
+                                            .text_color(if active {
+                                                theme.tab_active_foreground
+                                            } else {
+                                                theme.muted_foreground
+                                            })
+                                            .child(
+                                                Icon::new(tab_icon.unwrap_or(IconName::FileText))
+                                                    .xsmall(),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .when(is_preview, |this| this.italic())
+                                            .child(name),
+                                    )
+                                    .child(
+                                        div()
+                                            .size(px(18.))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_sm()
+                                            .hover(|style| style.bg(theme.list_active))
+                                            // A pinned tab shows a pin where the
+                                            // close box would be, and the pin is
+                                            // what takes the click — the way VS
+                                            // Code's pinned tabs read.
+                                            .when(is_pinned, |this| {
+                                                this.child(
+                                                    Icon::new(IconName::Pin)
+                                                        .xsmall()
+                                                        .text_color(theme.muted_foreground),
+                                                )
+                                            })
+                                            .when(!is_pinned, |this| {
+                                                this.child(div().when(dirty, |this| {
+                                                    this.child(
+                                                        div()
+                                                            .size(px(7.))
+                                                            .rounded_full()
+                                                            .bg(theme.primary),
+                                                    )
+                                                    .group_hover("tab", |style| style.invisible())
+                                                }))
+                                                .child(
+                                                    div()
+                                                        .absolute()
+                                                        .invisible()
+                                                        .when(active && !dirty, |this| {
+                                                            this.visible()
+                                                        })
+                                                        .group_hover("tab", |style| style.visible())
+                                                        .child(Icon::new(IconName::Close).xsmall()),
+                                                )
+                                            })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    if is_pinned {
+                                                        this.toggle_pin_by_id(doc_id, cx);
+                                                        return;
+                                                    }
+                                                    let doc = this.documents[ix].clone();
+                                                    let id = doc.entity_id();
+                                                    this.confirm_unsaved(
+                                                        doc,
+                                                        AfterConfirm::CloseDocument(id),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                            ),
+                                    )
+                                    // VS Code-style insertion line where a dragged
+                                    // tab would land: left edge of this tab, or the
+                                    // right edge of the last one.
+                                    .when(
+                                        self.tab_insertion.map(|insertion| insertion.gap)
+                                            == Some(ix),
+                                        |this| {
                                             this.child(
-                                                div().size(px(7.)).rounded_full().bg(theme.primary),
+                                                div()
+                                                    .absolute()
+                                                    .left_0()
+                                                    .top(px(4.))
+                                                    .bottom(px(4.))
+                                                    .w(px(2.))
+                                                    .rounded_full()
+                                                    .bg(theme.primary),
                                             )
-                                            .group_hover("tab", |style| style.invisible())
-                                        }))
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .invisible()
-                                                .when(active && !dirty, |this| this.visible())
-                                                .group_hover("tab", |style| style.visible())
-                                                .child(Icon::new(IconName::Close).xsmall()),
-                                        )
-                                    })
+                                        },
+                                    )
+                                    .when(
+                                        ix + 1 == count
+                                            && self.tab_insertion.map(|insertion| insertion.gap)
+                                                == Some(count),
+                                        |this| {
+                                            this.child(
+                                                div()
+                                                    .absolute()
+                                                    .right_0()
+                                                    .top(px(4.))
+                                                    .bottom(px(4.))
+                                                    .w(px(2.))
+                                                    .rounded_full()
+                                                    .bg(theme.primary),
+                                            )
+                                        },
+                                    )
                                     .on_mouse_down(
                                         MouseButton::Left,
+                                        cx.listener(
+                                            move |this, event: &MouseDownEvent, window, cx| {
+                                                // A double click keeps the file: the
+                                                // preview slot is given up, as in VS
+                                                // Code.
+                                                if event.click_count > 1 {
+                                                    this.unpreview(doc_id);
+                                                }
+                                                this.activate(ix, window, cx)
+                                            },
+                                        ),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Middle,
                                         cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            if is_pinned {
-                                                this.toggle_pin_by_id(doc_id, cx);
-                                                return;
-                                            }
                                             let doc = this.documents[ix].clone();
                                             let id = doc.entity_id();
                                             this.confirm_unsaved(
@@ -3647,155 +3996,100 @@ impl Workspace {
                                                 cx,
                                             );
                                         }),
-                                    ),
-                            )
-                            // VS Code-style insertion line where a dragged
-                            // tab would land: left edge of this tab, or the
-                            // right edge of the last one.
-                            .when(
-                                self.tab_insertion.map(|insertion| insertion.gap) == Some(ix),
-                                |this| {
-                                    this.child(
-                                        div()
-                                            .absolute()
-                                            .left_0()
-                                            .top(px(4.))
-                                            .bottom(px(4.))
-                                            .w(px(2.))
-                                            .rounded_full()
-                                            .bg(theme.primary),
                                     )
-                                },
-                            )
-                            .when(
-                                ix + 1 == count
-                                    && self.tab_insertion.map(|insertion| insertion.gap)
-                                        == Some(count),
-                                |this| {
-                                    this.child(
-                                        div()
-                                            .absolute()
-                                            .right_0()
-                                            .top(px(4.))
-                                            .bottom(px(4.))
-                                            .w(px(2.))
-                                            .rounded_full()
-                                            .bg(theme.primary),
-                                    )
-                                },
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                    // A double click keeps the file: the
-                                    // preview slot is given up, as in VS
-                                    // Code.
-                                    if event.click_count > 1 {
-                                        this.unpreview(doc_id);
-                                    }
-                                    this.activate(ix, window, cx)
-                                }),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Middle,
-                                cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    let doc = this.documents[ix].clone();
-                                    let id = doc.entity_id();
-                                    this.confirm_unsaved(
-                                        doc,
-                                        AfterConfirm::CloseDocument(id),
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                            )
-                            .context_menu({
-                                let ws = ws_menu.clone();
-                                let path = tab_path.clone();
-                                move |menu, _, _| {
-                                    let ws_close = ws.clone();
-                                    let ws_other = ws.clone();
-                                    let ws_right = ws.clone();
-                                    let ws_pin = ws.clone();
-                                    let doc = doc_weak.clone();
+                                    .context_menu({
+                                        let ws = ws_menu.clone();
+                                        let path = tab_path.clone();
+                                        move |menu, _, _| {
+                                            let ws_close = ws.clone();
+                                            let ws_other = ws.clone();
+                                            let ws_right = ws.clone();
+                                            let ws_pin = ws.clone();
+                                            let doc = doc_weak.clone();
 
-                                    let menu = menu
-                                        .item(
-                                            PopupMenuItem::new(if is_pinned {
-                                                "Unpin"
-                                            } else {
-                                                "Pin"
-                                            })
-                                            .on_click(move |_, _, cx| {
-                                                _ = ws_pin.update(cx, |this, cx| {
-                                                    this.toggle_pin_by_id(doc_id, cx);
-                                                });
-                                            }),
-                                        )
-                                        .item(PopupMenuItem::new("Close").on_click(
-                                            move |_, window, cx| {
-                                                _ = ws_close.update(cx, |this, cx| {
-                                                    let id = doc.entity_id();
-                                                    this.confirm_unsaved(
-                                                        doc.clone(),
-                                                        AfterConfirm::CloseDocument(id),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                });
-                                            },
-                                        ))
-                                        .item(
-                                            PopupMenuItem::new("Close Other Tabs")
-                                                .disabled(!has_other)
-                                                .on_click(move |_, window, cx| {
-                                                    _ = ws_other.update(cx, |this, cx| {
-                                                        this.close_other_tabs_by_id(
-                                                            doc_id, window, cx,
-                                                        );
-                                                    });
-                                                }),
-                                        )
-                                        .item(
-                                            PopupMenuItem::new("Close Tabs to the Right")
-                                                .disabled(is_last)
-                                                .on_click(move |_, window, cx| {
-                                                    _ = ws_right.update(cx, |this, cx| {
-                                                        this.close_tabs_to_the_right_by_id(
-                                                            doc_id, window, cx,
-                                                        );
-                                                    });
-                                                }),
-                                        );
-
-                                    // The document's file, when it has one. An
-                                    // untitled buffer has nowhere to reveal or
-                                    // copy, so these rows only appear for a
-                                    // saved file, as in VS Code.
-                                    match path.clone() {
-                                        Some(path) => {
-                                            let text = path.display().to_string();
-                                            let reveal = path.clone();
-                                            menu.item(PopupMenuItem::new("Copy Path").on_click(
-                                                move |_, _, cx| {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(text.clone()),
-                                                    );
-                                                },
-                                            ))
-                                            .item(
-                                                PopupMenuItem::new("Reveal in File Manager")
+                                            let menu = menu
+                                                .item(
+                                                    PopupMenuItem::new(if is_pinned {
+                                                        "Unpin"
+                                                    } else {
+                                                        "Pin"
+                                                    })
                                                     .on_click(move |_, _, cx| {
-                                                        cx.reveal_path(&reveal);
+                                                        _ = ws_pin.update(cx, |this, cx| {
+                                                            this.toggle_pin_by_id(doc_id, cx);
+                                                        });
                                                     }),
-                                            )
+                                                )
+                                                .item(PopupMenuItem::new("Close").on_click(
+                                                    move |_, window, cx| {
+                                                        _ = ws_close.update(cx, |this, cx| {
+                                                            let id = doc.entity_id();
+                                                            this.confirm_unsaved(
+                                                                doc.clone(),
+                                                                AfterConfirm::CloseDocument(id),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    },
+                                                ))
+                                                .item(
+                                                    PopupMenuItem::new("Close Other Tabs")
+                                                        .disabled(!has_other)
+                                                        .on_click(move |_, window, cx| {
+                                                            _ = ws_other.update(cx, |this, cx| {
+                                                                this.close_other_tabs_by_id(
+                                                                    doc_id, window, cx,
+                                                                );
+                                                            });
+                                                        }),
+                                                )
+                                                .item(
+                                                    PopupMenuItem::new("Close Tabs to the Right")
+                                                        .disabled(is_last)
+                                                        .on_click(move |_, window, cx| {
+                                                            _ = ws_right.update(cx, |this, cx| {
+                                                                this.close_tabs_to_the_right_by_id(
+                                                                    doc_id, window, cx,
+                                                                );
+                                                            });
+                                                        }),
+                                                );
+
+                                            // The document's file, when it has one. An
+                                            // untitled buffer has nowhere to reveal or
+                                            // copy, so these rows only appear for a
+                                            // saved file, as in VS Code.
+                                            match path.clone() {
+                                                Some(path) => {
+                                                    let text = path.display().to_string();
+                                                    let reveal = path.clone();
+                                                    menu.item(
+                                                        PopupMenuItem::new("Copy Path").on_click(
+                                                            move |_, _, cx| {
+                                                                cx.write_to_clipboard(
+                                                                    ClipboardItem::new_string(
+                                                                        text.clone(),
+                                                                    ),
+                                                                );
+                                                            },
+                                                        ),
+                                                    )
+                                                    .item(
+                                                        PopupMenuItem::new(
+                                                            "Reveal in File Manager",
+                                                        )
+                                                        .on_click(move |_, _, cx| {
+                                                            cx.reveal_path(&reveal);
+                                                        }),
+                                                    )
+                                                }
+                                                None => menu,
+                                            }
                                         }
-                                        None => menu,
-                                    }
-                                }
-                            })
-                    })),
+                                    })
+                            })),
+                    ),
             )
             .when(count > 1, |this| {
                 this.child(
@@ -4858,6 +5152,23 @@ pub fn restored_bounds(cx: &App) -> Option<WindowBounds> {
     visible.then_some(bounds)
 }
 
+/// Whether a loading tab may stand in for a file while it loads: only when
+/// it takes a new tab or a slot nobody is using (a blank document or the
+/// preview tab), never when it would replace a document being worked on.
+fn placeholder_is_safe(placement: Placement, active_blank: bool, tabs: bool) -> bool {
+    match placement {
+        Placement::Preview | Placement::NewTab => true,
+        Placement::ReplaceActive => active_blank,
+        Placement::Default => active_blank || tabs,
+    }
+}
+
+/// Whether the tab strip should scroll its active tab into view: on the
+/// first frame, and whenever the active tab or the number of tabs changed.
+fn tab_needs_reveal(revealed: Option<(usize, usize)>, now: (usize, usize)) -> bool {
+    revealed != Some(now)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4977,5 +5288,24 @@ mod tests {
             let settings = AppSettings::get(cx);
             assert!(settings.tabs);
         });
+    }
+
+    #[test]
+    fn the_tab_strip_reveals_the_active_tab_only_when_it_changes() {
+        assert!(tab_needs_reveal(None, (0, 1)));
+        assert!(!tab_needs_reveal(Some((3, 5)), (3, 5)));
+        assert!(tab_needs_reveal(Some((3, 5)), (4, 5)));
+        assert!(tab_needs_reveal(Some((4, 5)), (4, 6)));
+    }
+
+    #[test]
+    fn a_loading_tab_never_stands_in_for_a_document_in_use() {
+        assert!(placeholder_is_safe(Placement::Preview, false, false));
+        assert!(placeholder_is_safe(Placement::NewTab, false, false));
+        assert!(placeholder_is_safe(Placement::Default, false, true));
+        assert!(placeholder_is_safe(Placement::Default, true, false));
+        assert!(!placeholder_is_safe(Placement::Default, false, false));
+        assert!(!placeholder_is_safe(Placement::ReplaceActive, false, true));
+        assert!(placeholder_is_safe(Placement::ReplaceActive, true, true));
     }
 }
