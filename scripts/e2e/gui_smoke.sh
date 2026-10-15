@@ -25,6 +25,13 @@
 
 set -euo pipefail
 
+# The whole run is bounded, so a hang fails instead of stalling CI.
+if [[ -z "${E2E_INNER:-}" ]]; then
+  E2E_INNER=1 exec timeout --kill-after=10 "${E2E_TIMEOUT:-600}" "$0" "$@"
+fi
+# Name the step that failed: `set -e` alone stops silently.
+trap 'echo "FAIL: line $LINENO: $BASH_COMMAND (exit $?)" >&2' ERR
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
@@ -45,10 +52,14 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # drive the stale window from the failed one.
 APP_PID=""
 XVFB_PID=""
+# Everything the run writes outside the artifacts lives here, so parallel
+# runs never share a HOME or a runtime folder and nothing else is deleted.
+TMP_ROOT="$(mktemp -d -t malgel-e2e.XXXXXX)"
 cleanup() {
-  [[ -n "$APP_PID" ]] && kill "$APP_PID" 2>/dev/null
-  [[ -n "$XVFB_PID" ]] && kill "$XVFB_PID" 2>/dev/null
-  rm -f "/tmp/.X${DISPLAY_NUM#:}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM#:}" 2>/dev/null
+  # Only the processes this run started.
+  [[ -n "${APP_PID:-}" ]] && kill "$APP_PID" 2>/dev/null || true
+  [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
+  rm -rf "$TMP_ROOT"
   return 0
 }
 trap cleanup EXIT
@@ -59,26 +70,19 @@ command -v xdotool >/dev/null || fail "xdotool not installed"
 command -v import >/dev/null || fail "ImageMagick 'import' not installed"
 [[ -x "$BIN" ]] || fail "no binary at $BIN — build it first (cargo build)"
 
-cleanup() {
-  [[ -n "${APP_PID:-}" ]] && kill "$APP_PID" 2>/dev/null || true
-  [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
-}
-trap cleanup EXIT
-
 # A previous run that was killed can leave a server, a lock and a socket
 # behind; a second Xvfb on the same display then refuses to start and the app
 # fails to connect. Clear ours, then start and wait for it, retrying once.
-rm -rf /tmp/malgel-e2e-xdg && mkdir -p /tmp/malgel-e2e-xdg && chmod 700 /tmp/malgel-e2e-xdg
+mkdir -m 700 "$TMP_ROOT/xdg"
 # A fresh HOME keeps the run reproducible: no session to restore, no settings
 # or recently-opened list carried over from an earlier run or a real profile.
-export HOME=/tmp/malgel-e2e-home
-rm -rf "$HOME" && mkdir -p "$HOME"
+export HOME="$TMP_ROOT/home"
+mkdir -p "$HOME"
 export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share"
 export DISPLAY="$DISPLAY_NUM"
 num="${DISPLAY_NUM#:}"
 start_xvfb() {
   pkill -f "Xvfb $DISPLAY_NUM" 2>/dev/null || true
-pkill -f "$BIN" 2>/dev/null || true
   sleep 0.3
   rm -f "/tmp/.X${num}-lock" "/tmp/.X11-unix/X${num}" 2>/dev/null || true
   Xvfb "$DISPLAY_NUM" -screen 0 1600x1000x24 +extension GLX +render -nolisten tcp \
@@ -92,7 +96,7 @@ pkill -f "$BIN" 2>/dev/null || true
 }
 start_xvfb || start_xvfb || { cat "$ART_DIR/xvfb.log" >&2; fail "Xvfb did not come up on $DISPLAY_NUM"; }
 
-export XDG_RUNTIME_DIR=/tmp/malgel-e2e-xdg
+export XDG_RUNTIME_DIR="$TMP_ROOT/xdg"
 if [[ "${E2E_GPU:-0}" != "1" ]]; then
   export LIBGL_ALWAYS_SOFTWARE=1
   export GALLIUM_DRIVER=llvmpipe
@@ -256,7 +260,8 @@ echo "binary:   $BIN"
 echo "display:  $DISPLAY ($(xdotool getdisplaygeometry))"
 
 # Open the folder so the file tree is exercised, and a file so the editor is.
-"$BIN" "$WS" "$WS/README.md" >"$ART_DIR/app.log" 2>&1 &
+# --new-instance: never hand the files to a Malgel some other run left open.
+"$BIN" --new-instance "$WS" "$WS/README.md" >"$ART_DIR/app.log" 2>&1 &
 APP_PID=$!
 
 # 1. The window comes up and the process survives.
@@ -455,14 +460,24 @@ toggle_thumbnails() {
 }
 read -r win_x win_y <<<"$(xdotool getwindowgeometry "$WIN" |
   awk '/Position/ { gsub(",", " "); print $2, $3 }')"
+# The strip renders its pages in the background, so wait for the frame
+# rather than trusting one fixed pause.
 toggle_thumbnails
-shot 21-pdf-thumbnails
+for _ in $(seq 1 10); do
+  shot 21-pdf-thumbnails
+  [[ "$(pixels_differ 20-pdf-open 21-pdf-thumbnails)" -gt 2000 ]] && break
+  sleep 0.5
+done
 [[ "$(pixels_differ 20-pdf-open 21-pdf-thumbnails)" -gt 2000 ]] \
   || fail "the page thumbnails did not appear"
 toggle_thumbnails
-shot 22-pdf-thumbnails-off
 # Back to within a scrollbar's worth of pixels of where it started: the two
 # frames are not identical to the last pixel, but the page is back.
+for _ in $(seq 1 10); do
+  shot 22-pdf-thumbnails-off
+  [[ "$(pixels_differ 20-pdf-open 22-pdf-thumbnails-off)" -lt 1500 ]] && break
+  sleep 0.5
+done
 [[ "$(pixels_differ 20-pdf-open 22-pdf-thumbnails-off)" -lt 1500 ]] \
   || fail "hiding the thumbnails did not put the page back"
 pass "PDF page thumbnails toggle on and off"
@@ -546,7 +561,13 @@ pass "Ctrl+wheel zooms the editor"
 #     the pages the compiler produced — no typst CLI, no PDF export step, and
 #     the pages follow the source as it is edited. The app is single-instance,
 #     so the second launch hands the path to the running window.
-"$BIN" "$WS/paper.typ" >"$ART_DIR/app-typst.log" 2>&1 || true
+# Bounded: if the handover failed, this would be a second window that never
+# exits on its own.
+timeout 20 "$BIN" "$WS/paper.typ" >"$ART_DIR/app-typst.log" 2>&1 \
+  || fail "the second launch did not hand over to the running window; see $ART_DIR/app-typst.log"
+grep -q "handed over" "$ART_DIR/app-typst.log" \
+  || fail "the second launch did not say it handed over"
+pass "a second launch hands its file to the running window"
 sleep 3
 shot 29-typst-open
 # The compiled page is a white sheet on the pane's background, and the tab bar
