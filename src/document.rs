@@ -3,6 +3,7 @@
 use std::{
     fs,
     io::{self, Write as _},
+    os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
 };
 
@@ -183,6 +184,34 @@ pub fn save_encoded(
             .chain(contents.encode_utf16().flat_map(u16::to_be_bytes))
             .collect(),
     };
+
+    // Symlinks and hard links must be written through in place: a temp+rename
+    // would replace the link with a new regular file.
+    let meta = fs::symlink_metadata(path).ok();
+    let write_in_place = meta
+        .as_ref()
+        .is_some_and(|m| m.file_type().is_symlink() || m.nlink() > 1);
+    if path.exists() {
+        let perms = meta
+            .as_ref()
+            .map(|m| m.permissions())
+            .or_else(|| fs::metadata(path).ok().map(|m| m.permissions()));
+        if perms.is_some_and(|p| p.readonly()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no write permission",
+            ));
+        }
+    }
+    if write_in_place {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        return Ok(());
+    }
 
     let dir = path
         .parent()
@@ -780,5 +809,48 @@ mod tests {
         assert!(!is_typst_path(Path::new("paper.typo")));
         assert!(!is_typst_path(Path::new("notes.md")));
         assert!(!is_typst_path(Path::new("typ")));
+    }
+
+    #[test]
+    fn readonly_file_is_not_clobbered_by_save() {
+        let dir = std::env::temp_dir().join(format!("malgel-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("locked.md");
+        std::fs::write(&path, "safe\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let err = save(&path, "clobber\n", LineEnding::Lf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("no write permission"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "safe\n");
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_readonly(false);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_through_a_symlink_keeps_the_link() {
+        let dir = std::env::temp_dir().join(format!("malgel-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.md");
+        let link = dir.join("link.md");
+        std::fs::write(&target, "old\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        save(&link, "new\n", LineEnding::Lf).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
