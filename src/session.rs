@@ -155,6 +155,17 @@ pub struct DiskStamp {
 }
 
 impl DiskStamp {
+    /// A stamp no file has: the newest modification time none and a length of
+    /// zero. A watcher comparing against it reports a change on the next
+    /// pass, which is what a document whose stamps have never been read
+    /// needs.
+    pub fn of_nowhere() -> Self {
+        Self {
+            modified: None,
+            len: 0,
+        }
+    }
+
     pub fn of(path: &Path) -> Option<Self> {
         let metadata = std::fs::metadata(path).ok()?;
         Some(Self {

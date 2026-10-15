@@ -96,6 +96,10 @@ pub struct DocumentView {
     preview: Entity<TextViewState>,
     pdf: Option<Entity<crate::pdf_view::PdfView>>,
     image: Option<Entity<crate::image_view::ImageView>>,
+    /// The Typst document a `.typ` file's preview is: its source and the
+    /// pages its last compile produced, so the preview follows the source as
+    /// it changes on disk.
+    typst: Option<crate::typst_preview::TypstPreview>,
     /// Parser configuration for the preview; built once so the preview can
     /// tell that it is unchanged between frames.
     markdown_extensions: gpui_kit::component::text::MarkdownExtensions,
@@ -206,6 +210,7 @@ impl DocumentView {
             editor,
             pdf: None,
             image: None,
+            typst: None,
             markdown_extensions: preview_ext::markdown_extensions(&preview),
             preview,
             path: None,
@@ -352,6 +357,7 @@ impl DocumentView {
             preview,
             pdf: None,
             image: Some(image),
+            typst: None,
             markdown_extensions,
             path: Some(path),
             line_ending: LineEnding::Lf,
@@ -400,6 +406,7 @@ impl DocumentView {
             markdown_extensions,
             pdf: Some(pdf),
             image: None,
+            typst: None,
             path: Some(path),
             line_ending: LineEnding::Lf,
             saved_line_ending: LineEnding::Lf,
@@ -428,6 +435,109 @@ impl DocumentView {
             editor_width: px(0.),
             preview_width: px(0.),
             _subscriptions: Vec::new(),
+        }
+    }
+
+    /// A document whose preview is the Typst compiler's output for `source`.
+    ///
+    /// The pages are handed to the same PDF viewer a `.pdf` file uses, so a
+    /// Typst document reads exactly like a PDF one: same scrolling, same
+    /// zoom, same thumbnail strip, same toolbar.
+    pub fn new_typst(
+        source: PathBuf,
+        compiled: crate::typst_preview::TypstPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let pdf = cx
+            .new(|cx| crate::pdf_view::PdfView::new(Some(source.clone()), compiled.document(), cx));
+        // The files as they are right now, so the first watcher pass has
+        // something to compare against instead of reporting every typst
+        // document as changed.
+        let disk = Some(compiled.stamp());
+        let editor = cx.new(|cx| EditorState::new(window, cx));
+        let preview = cx.new(|cx| TextViewState::markdown("", cx));
+        let markdown_extensions = preview_ext::markdown_extensions(&preview);
+        Self {
+            editor,
+            preview,
+            markdown_extensions,
+            pdf: Some(pdf),
+            image: None,
+            typst: Some(compiled),
+            path: Some(source),
+            line_ending: LineEnding::Lf,
+            saved_line_ending: LineEnding::Lf,
+            saved_hash: 0,
+            dirty: false,
+            disk,
+            source: "".into(),
+            revision: 0,
+            analysis: Arc::new(Analysis::default()),
+            analysis_task: None,
+            pending_anchor: None,
+            recovery_id: session::new_recovery_id(),
+            recovery_written: false,
+            recovery_task: None,
+            misspellings: Arc::default(),
+            spell_task: None,
+            spell_checked: None,
+            last_cursor: 0,
+            focus_decorations: None,
+            focus_block: None,
+            scroll_driver: ScrollDriver::Editor,
+            synced_editor_scroll: None,
+            synced_preview_scroll: None,
+            editor_scroll_target: None,
+            synced_preview_rows: 0,
+            editor_width: px(0.),
+            preview_width: px(0.),
+            _subscriptions: Vec::new(),
+        }
+    }
+
+    /// A document whose preview is a Typst source's compiled pages, so the
+    /// viewer the preview hands its work to.
+    pub fn is_typst(&self) -> bool {
+        self.typst.is_some()
+    }
+
+    /// Recompile the Typst source this document previews, showing the new
+    /// pages. A failed compile leaves the pages on screen and reports why.
+    /// Returns `false` when this document is not a Typst preview, or when the
+    /// source no longer compiles.
+    pub fn refresh_typst(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(compiled) = &mut self.typst else {
+            return false;
+        };
+        if compiled.refresh().is_err() {
+            return false;
+        }
+        // Keep the reader's place: the new pages replace the old in the
+        // viewer, which holds on to its zoom, spread, scroll and thumbnails.
+        if let Some(pdf) = &self.pdf {
+            pdf.update(cx, |pdf, cx| pdf.reload(compiled.document(), cx));
+        }
+        true
+    }
+
+    /// The paths whose changes should refresh a Typst preview: its source and
+    /// everything the source named.
+    pub fn watched_paths(&self) -> Vec<PathBuf> {
+        self.typst
+            .as_ref()
+            .map(|compiled| compiled.watched().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The language the status bar names: empty for a Markdown document, and
+    /// the source's own language for a preview that is not Markdown's. A Typst
+    /// document's pages are Typst's output, so saying "Markdown" beside them
+    /// would name the wrong thing.
+    pub fn language_label(&self) -> SharedString {
+        match self.path.as_deref().and_then(Path::extension) {
+            Some(extension) if extension.eq_ignore_ascii_case("typ") => "Typst".into(),
+            _ => "".into(),
         }
     }
 
@@ -488,8 +598,31 @@ impl DocumentView {
         cx.notify();
     }
 
+    /// The file as last read or written. A Typst preview's stamp covers its
+    /// source and every file that source named, so one comparison notices a
+    /// change to any of them; it is set when the preview is compiled and
+    /// updated when the watcher accepts the files as they are.
     pub fn disk_stamp(&self) -> Option<DiskStamp> {
+        if self.typst.is_some() {
+            return Some(self.disk.unwrap_or_else(DiskStamp::of_nowhere));
+        }
         self.disk
+    }
+
+    /// The stamp a Typst preview's next watcher pass compares against.
+    pub fn watch_stamp(&self) -> DiskStamp {
+        self.typst
+            .as_ref()
+            .map(|compiled| compiled.stamp())
+            .unwrap_or(DiskStamp::of_nowhere())
+    }
+
+    /// Accept the stamp the watcher has just read, so the next pass does not
+    /// report the same change again.
+    pub fn accept_watch_stamp(&mut self, stamp: DiskStamp) {
+        if self.typst.is_some() {
+            self.disk = Some(stamp);
+        }
     }
 
     pub fn saved_hash(&self) -> u64 {

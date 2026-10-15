@@ -194,6 +194,36 @@ impl PdfDocument {
         &self.pages
     }
 
+    /// A second handle on the same pages, for handing a recompiled document
+    /// to a viewer without taking the original apart. The file's bytes are
+    /// shared; rendered sheets are not, so each copy draws its own and the
+    /// cache is never the reason a page looks stale.
+    pub fn clone_document(&self) -> Self {
+        let pdf = Pdf::new(self.pdf.data().clone())
+            .expect("the bytes this document was parsed from still parse");
+        let pages = pdf
+            .pages()
+            .iter()
+            .enumerate()
+            .map(|(index, page)| {
+                let (width, height) = page.render_dimensions();
+                PdfPage {
+                    index,
+                    page_number: index + 1,
+                    width,
+                    height,
+                }
+            })
+            .collect();
+        Self {
+            pdf,
+            pages,
+            rendered: HashMap::new(),
+            interpreter_settings: self.interpreter_settings.clone(),
+            render_settings: self.render_settings.clone(),
+        }
+    }
+
     /// Total number of pages.
     pub fn page_count(&self) -> usize {
         self.pages.len()
@@ -311,6 +341,22 @@ impl PdfView {
             thumb_scroll: VirtualListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Show a recompiled version of the same document, the way a Typst
+    /// preview updates when its source changes on disk.
+    ///
+    /// The reader's view is kept where it makes sense: zoom, spread and the
+    /// thumbnail strip survive, and the scroll stays on the page that was
+    /// showing (which the pages are then re-laid out around). Rendered sheets
+    /// are dropped, so the new pages are drawn from the new content rather
+    /// than from the old cache.
+    pub fn reload(&mut self, doc: PdfDocument, cx: &mut Context<Self>) {
+        let current_page = self.current_page;
+        self.doc = Some(doc);
+        // Clamped: a document that shrank leaves the reader on its last page.
+        self.current_page = current_page.min(self.page_count().saturating_sub(1));
+        cx.notify();
     }
 
     /// Whether two pages are shown side by side.

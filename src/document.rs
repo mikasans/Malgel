@@ -194,6 +194,19 @@ pub fn is_pdf_path(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
 }
 
+/// Whether `path` is a Typst source file.
+///
+/// A Typst document is not read as text: its preview is the PDF the Typst
+/// compiler makes of it, so opening one compiles the file and shows the
+/// result. Malgel does not ship the `typst` command, so the preview can only
+/// ever be as fresh as the last time Malgel compiled it — it is refreshed
+/// when the file is opened and whenever it changes on disk.
+pub fn is_typst_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("typ"))
+}
+
 /// The name shown for a document in the title bar and dialogs.
 pub fn display_name(path: Option<&PathBuf>) -> String {
     path.and_then(|path| path.file_name())
@@ -267,5 +280,14 @@ mod tests {
         assert!(!is_pdf_path(Path::new("document.md")));
         assert!(!is_pdf_path(Path::new("image.png")));
         assert!(!is_pdf_path(Path::new("pdf")));
+    }
+
+    #[test]
+    fn recognizes_typst_extensions() {
+        assert!(is_typst_path(Path::new("paper.typ")));
+        assert!(is_typst_path(Path::new("THESIS.TYP")));
+        assert!(!is_typst_path(Path::new("paper.typo")));
+        assert!(!is_typst_path(Path::new("notes.md")));
+        assert!(!is_typst_path(Path::new("typ")));
     }
 }

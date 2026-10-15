@@ -61,6 +61,7 @@ use crate::{
     settings::{Appearance, Layout, LinkPlacement, clamp_font_size},
     spell,
     themes::{self, AppSettings},
+    typst_preview,
 };
 
 /// Shown when Malgel starts for the first time.
@@ -166,6 +167,9 @@ enum DiskChange {
         stamp: Option<DiskStamp>,
     },
     Touched(Option<DiskStamp>),
+    /// A Typst preview whose source — or a file it named — changed, so
+    /// the pages are recompiled.
+    Recompiled,
 }
 
 /// A tab being dragged to a new position, the way tabs reorder in VS Code.
@@ -410,9 +414,12 @@ impl Workspace {
             let doc = match recovery {
                 Some((id, recovery)) => Some(self.restored_document(id, recovery, window, cx)),
                 None if wanted => entry.path.as_ref().and_then(|path| {
-                    // PDFs cannot be loaded as text documents; open them after
-                    // the window finishes building via the normal PDF path.
-                    if document::is_pdf_path(path) || document::is_image_path(path) {
+                    // Typst and PDF files are not text documents; open them
+                    // after the window finishes building via their own path.
+                    if document::is_typst_path(path)
+                        || document::is_pdf_path(path)
+                        || document::is_image_path(path)
+                    {
                         deferred_open.push(path.clone());
                         return None;
                     }
@@ -811,6 +818,34 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A Typst document's preview is its compiled pages, so it takes the
+        // same path a PDF does and is watched for changes to refresh.
+        if document::is_typst_path(&path) {
+            match crate::typst_preview::TypstPreview::open(&path) {
+                Ok(compiled) => {
+                    AppSettings::update(cx, |settings| settings.push_recent(&path));
+                    let doc =
+                        cx.new(|cx| DocumentView::new_typst(path.clone(), compiled, window, cx));
+                    self.place_document(doc, placement, window, cx);
+                    return;
+                }
+                Err(err) => {
+                    AppSettings::update(cx, |settings| {
+                        settings.recent_files.retain(|recent| recent != &path)
+                    });
+                    self.notify_error(
+                        format!(
+                            "Couldn’t compile “{}”. {err}",
+                            document::display_name(Some(&path))
+                        ),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            }
+        }
+
         if document::is_pdf_path(&path) {
             // The async spawn_in continuation never resumes under the current
             // gpui-pre build when spawned from the startup path, so render
@@ -1035,6 +1070,7 @@ impl Workspace {
         let targets: Vec<(EntityId, PathBuf, Option<DiskStamp>, u64)> = self
             .documents
             .iter()
+            .filter(|doc| !doc.read(cx).is_typst())
             .filter_map(|doc| {
                 let id = doc.entity_id();
                 let doc = doc.read(cx);
@@ -1043,35 +1079,60 @@ impl Workspace {
                     .then(|| (id, path, doc.disk_stamp(), doc.saved_hash()))
             })
             .collect();
-        if targets.is_empty() {
+        // A Typst preview's file is not text: its pages come from compiling the
+        // source, so it is watched as a compilation instead. It watches its
+        // source and every file the source named, and one stamp over them is
+        // what a change has to move.
+        let recompilable: Vec<(EntityId, Vec<PathBuf>, Option<DiskStamp>)> = self
+            .documents
+            .iter()
+            .filter(|doc| doc.read(cx).is_typst())
+            .filter(|doc| !self.pending_disk_prompt.contains(&doc.entity_id()))
+            .map(|entity| {
+                let doc = entity.read(cx);
+                (entity.entity_id(), doc.watched_paths(), doc.disk_stamp())
+            })
+            .collect();
+        if targets.is_empty() && recompilable.is_empty() {
             return;
         }
         let task = cx.background_executor().spawn(async move {
-            targets
-                .into_iter()
-                .filter_map(|(id, path, known, saved_hash)| {
-                    let stamp = DiskStamp::of(&path);
-                    if stamp == known {
-                        return None;
-                    }
-                    let change = match stamp {
-                        None if known.is_some() => DiskChange::Missing,
-                        None => return None,
-                        Some(_) => match document::load(&path) {
-                            Ok(loaded) if content_hash(&loaded.text) == saved_hash => {
-                                DiskChange::Touched(stamp)
-                            }
-                            Ok(loaded) => DiskChange::Changed {
-                                text: loaded.text,
-                                line_ending: loaded.line_ending,
-                                stamp,
-                            },
-                            Err(_) => return None,
+            let mut changes = Vec::new();
+            for (id, path, known, saved_hash) in targets {
+                let stamp = DiskStamp::of(&path);
+                if stamp == known {
+                    continue;
+                }
+                let change = match stamp {
+                    None if known.is_some() => DiskChange::Missing,
+                    None => continue,
+                    Some(_) => match document::load(&path) {
+                        Ok(loaded) if content_hash(&loaded.text) == saved_hash => {
+                            DiskChange::Touched(stamp)
+                        }
+                        Ok(loaded) => DiskChange::Changed {
+                            text: loaded.text,
+                            line_ending: loaded.line_ending,
+                            stamp,
                         },
-                    };
-                    Some((id, change))
-                })
-                .collect::<Vec<_>>()
+                        Err(_) => continue,
+                    },
+                };
+                changes.push((id, change));
+            }
+            for (id, watched, known) in recompilable {
+                let stamp = typst_preview::stamp_of(&watched);
+                if Some(stamp) == known {
+                    continue;
+                }
+                // Every path vanished: the document is gone. Saying so is the
+                // missing-file path's job, and the source is among the paths.
+                if stamp.modified.is_none() {
+                    continue;
+                }
+                changes.push((id, DiskChange::Recompiled));
+            }
+            changes
         });
         cx.spawn_in(window, async move |this, cx| {
             let changes = task.await;
@@ -1097,6 +1158,31 @@ impl Workspace {
         let name = doc.read(cx).name();
         match change {
             DiskChange::Touched(stamp) => doc.update(cx, |doc, _| doc.set_disk_stamp(stamp)),
+            DiskChange::Recompiled => {
+                if doc.read(cx).is_typst() {
+                    let entity = doc.clone();
+                    doc.update(cx, |view, cx| {
+                        if view.refresh_typst(cx) {
+                            // The stamp now on the files is what the next pass
+                            // compares against, so one change is one refresh.
+                            let stamp = view.watch_stamp();
+                            cx.defer(move |cx| {
+                                entity.update(cx, |view, _| view.accept_watch_stamp(stamp));
+                            });
+                        } else {
+                            // The source no longer compiles: the last good
+                            // pages stay on screen. Say so once rather than
+                            // leaving the reader guessing why nothing moved.
+                            window.push_notification(
+                                Notification::error(format!(
+                                    "“{name}” no longer compiles. The preview shows the last version that did."
+                                )),
+                                cx,
+                            );
+                        }
+                    });
+                }
+            }
             DiskChange::Missing => {
                 doc.update(cx, |doc, cx| doc.mark_missing(cx));
                 window.push_notification(
@@ -3506,7 +3592,13 @@ impl Workspace {
                         )
                     })
                     .child(item("Spaces: 2".to_string()))
-                    .child(item("Markdown".to_string())),
+                    // The language the document is, or the one its preview
+                    // came from: a Typst document's pages are Typst's, not
+                    // Markdown's, whatever the editor's own mode.
+                    .child(match doc.language_label().as_str() {
+                        "" => item("Markdown".to_string()),
+                        label => item(label.to_string()),
+                    }),
             )
     }
 }

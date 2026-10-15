@@ -29,7 +29,12 @@ application that starts, paints and responds.
 10. Opens the PDF fixture and switches the viewer's page thumbnails on and off
    from its toolbar, checking the strip takes the width it should and gives it
    back.
-11. Checks the process is still alive at the end (no crash from any step).
+11. Scrolls and zooms the PDF and the image viewer, checking the wheel does the
+   same thing over the editor and both viewers.
+
+12. Opens a `.typ` file, and rewrites it while it is open: the app compiles the
+   source itself and the pages follow the source as it changes on disk.
+13. Checks the process is still alive at the end (no crash from any step).
 
 A viewer has no text field for the keyboard to land in, so step 10 clicks the
 toolbar button rather than pressing a key — the one place in this script that

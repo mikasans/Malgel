@@ -33,6 +33,8 @@ pub fn file_icon(path: &Path) -> IconName {
         }
         Some("csv" | "tsv") => IconName::FileSpreadsheet,
         Some("pdf" | "doc" | "docx" | "odt" | "rtf" | "pages") => IconName::FileType,
+        // A Typst source shares the icon of what its preview compiles to.
+        Some("typ") => IconName::FileType,
         Some("txt" | "text" | "log") => IconName::FileText,
         _ => IconName::File,
     }
@@ -51,6 +53,7 @@ mod tests {
         assert_eq!(file_icon(Path::new("logo.png")), IconName::FileImage);
         assert_eq!(file_icon(Path::new("data.csv")), IconName::FileSpreadsheet);
         assert_eq!(file_icon(Path::new("paper.pdf")), IconName::FileType);
+        assert_eq!(file_icon(Path::new("paper.typ")), IconName::FileType);
     }
 
     #[test]

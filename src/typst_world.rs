@@ -20,7 +20,9 @@ use typst::{
 };
 use typst_layout::PagedDocument;
 
-static LIBRARY: LazyLock<LazyHash<Library>> = LazyLock::new(|| LazyHash::new(Library::default()));
+/// The Typst standard library, shared by every world in this app.
+pub static LIBRARY: LazyLock<LazyHash<Library>> =
+    LazyLock::new(|| LazyHash::new(Library::default()));
 
 /// A font the compiler can use, loaded on first use.
 enum FontSlot {
@@ -48,8 +50,17 @@ impl FontSlot {
 
 /// The fonts a world offers, with the book the compiler selects them from.
 pub struct FontSet {
-    book: LazyHash<FontBook>,
+    /// The metadata the compiler matches a font request against.
+    pub book: LazyHash<FontBook>,
     slots: Vec<FontSlot>,
+}
+
+impl FontSet {
+    /// The font at `index` in the book, or `None` when the index is out of
+    /// range. Reading a system font's data happens once, on first use.
+    pub fn font(&self, index: usize) -> Option<Font> {
+        self.slots.get(index)?.get()
+    }
 }
 
 fn bundled_fonts() -> (FontBook, Vec<FontSlot>) {

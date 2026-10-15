@@ -71,6 +71,15 @@ A fast, native Markdown editor and previewer written in pure Rust with
   of its toolbar); dragging a page moves around once it is zoomed in. Pages
   are drawn as vector sheets on demand and cached, so a long document opens
   and scrolls smoothly.
+- **Typst.** A `.typ` file opens as the document it compiles to: the same
+  Typst compiler that exports Malgel's PDFs runs on the source in-process —
+  no `typst` binary, no export step — and the pages are shown in the same
+  viewer a PDF uses. Files it names resolve next to it, so a document spread
+  over several files compiles as one. The preview is recompiled whenever the
+  source (or anything it names) changes on disk, so it follows an editor
+  that is not this one: a `typst watch` workflow, a terminal editor, another
+  window on the same file. A source that no longer compiles keeps the last
+  version on screen and says so, rather than going blank.
 - **Documents done right.** Atomic saves, UTF-8 with byte-order-mark
   handling, CRLF files stay CRLF (switch a document between LF and CRLF from
   the status bar), unsaved-changes prompts on new, open, close and quit,
@@ -295,6 +304,7 @@ dictionaries and on macOS those in `~/Library/Spelling` are found too.
 | `src/pdf.rs` | PDF export: Markdown → Typst markup → PDF |
 | `src/docx.rs` | Word export |
 | `src/typst_world.rs` | The sandboxed Typst environment shared by math and PDF export |
+| `src/typst_preview.rs` | A `.typ` file's preview: compiles the source in-process and recompiles when it changes |
 | `src/images.rs` | Resolving and loading image URLs relative to the document |
 | `src/preview_ext.rs` | Preview plugins: GitHub alerts, block and inline math, Mermaid diagrams |
 | `src/math.rs` | LaTeX → Typst → SVG/PNG formula rendering |

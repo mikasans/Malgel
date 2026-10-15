@@ -164,6 +164,14 @@ with open(sys.argv[1], "wb") as handle:
     handle.write(out)
 PY_EOF
 
+# A Typst document, compiled by the app itself: its preview is the pages the
+# compiler produces, so the check can change the source and watch them follow.
+cat >"$WS/paper.typ" <<'TYP_EOF'
+= A Typst document
+
+The first body of the document, before the change.
+TYP_EOF
+
 shot() { # shot <name>
   sleep "$SETTLE"
   import -display "$DISPLAY" -window root "$ART_DIR/$1.png" 2>/dev/null
@@ -502,7 +510,39 @@ after="$(font_size)"
   || fail "Ctrl+wheel over the editor did not zoom (font size stayed at ${before:-unset})"
 pass "Ctrl+wheel zooms the editor"
 
-# 16. Still alive at the end — no crash from any of the above.
+# 16. A Typst document's preview: opening one compiles it in-process and shows
+#     the pages the compiler produced — no typst CLI, no PDF export step, and
+#     the pages follow the source as it is edited. The app is single-instance,
+#     so the second launch hands the path to the running window.
+"$BIN" "$WS/paper.typ" >"$ART_DIR/app-typst.log" 2>&1 || true
+sleep 3
+shot 29-typst-open
+# The compiled page is a white sheet on the pane's background, and the tab bar
+# names the source. Assert the frame actually changed, so a silent failure to
+# compile (a pane left showing the previous document) fails this run.
+[[ "$(pixels_differ 28-editor-open 29-typst-open)" -gt 1000 ]] \
+  || fail "opening a .typ document did not change the frame"
+pass "a .typ document opens and compiles"
+
+# Now edit the source and let the preview follow: the preview is not an
+# editable buffer, so the edit comes from outside, the way another program's
+# save would. A heading added at the top of the document changes the page.
+cat >"$WS/paper.typ" <<'TYP_EOF'
+= A Typst document, revised
+
+The revised body of the document, after the change.
+TYP_EOF
+wait_for 10 grep -q revised "$WS/paper.typ" \
+  || fail "the test could not rewrite the Typst source"
+# The compile is re-run when the change lands, not on a clock: poll the frame
+# until it differs from the first compile rather than sleeping and hoping.
+sleep 3
+shot 30-typst-edited
+[[ "$(pixels_differ 29-typst-open 30-typst-edited)" -gt 500 ]] \
+  || fail "editing the Typst source did not refresh the preview"
+pass "editing the source refreshes the compiled pages"
+
+# 17. Still alive at the end — no crash from any of the above.
 kill -0 "$APP_PID" 2>/dev/null || fail "process died during the run"
 pass "process alive at exit"
 
