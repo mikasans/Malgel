@@ -343,21 +343,29 @@ pass "Quick Open opens and closes (Ctrl+P)"
 # 4b. One Escape closes a picker even with text in its filter, and the
 #     keyboard is back in the editor: the next key lands in the file.
 editor_has_focus() { # type a marker, save, find it, then take it back out
-  sleep 0.3
-  xdotool type --delay 30 'Q'
-  sleep 0.3
-  xdotool key --clearmodifiers ctrl+s
-  wait_for 5 grep -q 'Q' "$WS/README.md" || return 1
-  xdotool key --clearmodifiers BackSpace
-  sleep 0.3
-  xdotool key --clearmodifiers ctrl+s
-  wait_for 5 bash -c "! grep -q 'Q' '$WS/README.md'"
+  # Dialog close restores focus asynchronously; give it a beat, then retry.
+  for _try in 1 2 3; do
+    sleep 0.4
+    xdotool type --delay 30 'Q'
+    sleep 0.3
+    xdotool key --clearmodifiers ctrl+s
+    if wait_for 4 grep -q 'Q' "$WS/README.md"; then
+      xdotool key --clearmodifiers BackSpace
+      sleep 0.3
+      xdotool key --clearmodifiers ctrl+s
+      wait_for 4 bash -c "! grep -q 'Q' '$WS/README.md'"
+      return 0
+    fi
+    # No click here: that would hide a real focus regression.
+  done
+  return 1
 }
 xdotool key --clearmodifiers ctrl+shift+p
 sleep 0.5
 xdotool type --delay 40 'sav'
 shot 07a-palette-filtered
 xdotool key --clearmodifiers Escape
+sleep 0.4
 shot 07b-palette-one-escape
 [[ "$(pixels_differ 07a-palette-filtered 07b-palette-one-escape)" -gt 1000 ]] \
   || fail "one Escape did not close the filtered command palette"
