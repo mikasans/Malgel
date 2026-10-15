@@ -110,8 +110,21 @@ fn downscaled_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
         _ => return None,
     };
     let decoded = image::load_from_memory_with_format(bytes, fmt).ok()?;
-    let small = decoded.resize(4096, 4096, image::imageops::FilterType::Triangle);
-    drop(decoded);
+    // `thumbnail` samples in the image's own pixel type; `resize` would
+    // convert a 16-bit picture to floats first, several times its size.
+    let (w, h) = (decoded.width(), decoded.height());
+    let scale = (4096. / w.max(h) as f64).min(1.);
+    let (tw, th) = (
+        ((w as f64 * scale) as u32).max(1),
+        ((h as f64 * scale) as u32).max(1),
+    );
+    let small = image::DynamicImage::ImageRgba8(match decoded {
+        image::DynamicImage::ImageRgb8(rgb) => {
+            image::DynamicImage::ImageRgb8(image::imageops::thumbnail(&rgb, tw, th)).into_rgba8()
+        }
+        image::DynamicImage::ImageRgba8(rgba) => image::imageops::thumbnail(&rgba, tw, th),
+        other => other.thumbnail_exact(tw, th).into_rgba8(),
+    });
     let mut out = std::io::Cursor::new(Vec::new());
     small.write_to(&mut out, image::ImageFormat::Png).ok()?;
     Some(out.into_inner())
