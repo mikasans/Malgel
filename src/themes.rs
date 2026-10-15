@@ -175,6 +175,27 @@ mod dark_tuning_tests {
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
     }
 
+    fn hex(color: &str) -> u32 {
+        u32::from_str_radix(&color.trim_start_matches('#')[..6], 16).unwrap()
+    }
+
+    /// G5: the Tokyo themes' line numbers read at WCAG AA (4.5:1) against
+    /// their editor background.
+    #[test]
+    fn tokyo_line_numbers_meet_aa_contrast() {
+        let family: serde_json::Value =
+            serde_json::from_str(include_str!("../themes/tokyonight.json")).unwrap();
+        let themes = family["themes"].as_array().unwrap();
+        assert_eq!(themes.len(), 3);
+        for theme in themes {
+            let highlight = &theme["highlight"];
+            let numbers = hex(highlight["editor.line_number"].as_str().unwrap());
+            let background = hex(highlight["editor.background"].as_str().unwrap());
+            let ratio = contrast(numbers, background);
+            assert!(ratio >= 4.5, "{}: line numbers {ratio:.2}:1", theme["name"]);
+        }
+    }
+
     /// The default dark editor background is neutral-950 (#0A0A0A).
     #[test]
     fn default_dark_selection_and_current_line_stand_out() {
