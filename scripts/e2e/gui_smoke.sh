@@ -893,6 +893,55 @@ else:
 PY
 pass "gutter: 3-digit and 5-digit files open (growth when measurable)"
 
+# 21a. G3: a single click on the line number of a soft-wrap continuation row
+#      selects that whole logical line; Ctrl+C puts exactly it on the clipboard.
+python3 - "$WS" <<'PY'
+from pathlib import Path
+root = Path(__import__("sys").argv[1])
+(root / "notes" / "wrapsel.md").write_text(
+    "top\n" + " ".join(f"wrapword{i}" for i in range(80)) + "\nafter\n")
+PY
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'wrapsel.md'
+xdotool key --clearmodifiers Return
+sleep 1.0
+shot 43a-wrapsel
+# Find the ink rows of the text column; row 2 is the long line's first row and
+# row 3 its first wrap continuation. Click left of the text, in the gutter.
+read -r GX GY < <(python3 - "$ART_DIR/43a-wrapsel.png" <<'PY'
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("L")
+w, h = im.size
+bg = im.getpixel((int(w * 0.6), int(h * 0.85)))
+x0s, rows, prev = [], [], False
+for y in range(int(h * 0.16), int(h * 0.80)):  # below the tab bar
+    xs = [x for x in range(int(w * 0.30), int(w * 0.75)) if abs(im.getpixel((x, y)) - bg) > 60]
+    ink = len(xs) >= 2
+    if ink and not prev:
+        rows.append([y, y]); x0s.append(xs[0])
+    if ink:
+        rows[-1][1] = y
+        x0s[-1] = min(x0s[-1], xs[0])
+    prev = ink
+assert len(rows) >= 4, f"rows={rows}"
+cy = (rows[2][0] + rows[2][1]) // 2
+# x0s[1] is the left edge of the "2" digit: the line-number column.
+print(x0s[1] + 3, cy)
+PY
+) || fail "could not locate wrapped rows"
+printf '' | xclip -selection clipboard
+xdotool mousemove "$GX" "$GY" click 1
+sleep 0.4
+xdotool key --clearmodifiers ctrl+c
+sleep 0.4
+GOT="$(xclip -o -selection clipboard 2>/dev/null || true)"
+shot 43b-wrapsel-click
+[[ "$GOT" == "wrapword0 "*"wrapword79" ]] \
+  || fail "gutter click on wrap row copied '${GOT:0:80}' (at $GX,$GY)"
+pass "gutter click on a wrap continuation selects the logical line"
+
 # 21b. External edit while dirty: Ctrl+S must not clobber the on-disk line.
 #     The conflict alert must take keyboard focus: typing must not reach the
 #     file, and Esc must dismiss the dialog (Keep) without writing.

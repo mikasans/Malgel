@@ -45,7 +45,7 @@ jobs:
         run: |
           sudo apt-get install -y xvfb xdotool imagemagick libgl1-mesa-dri \
             libglx-mesa0 libegl1 libegl-mesa0 libgles2 libgbm1 fonts-dejavu-core \
-            python3-pil
+            python3-pil xclip
       - run: scripts/e2e/gui_smoke.sh
 
   windows:

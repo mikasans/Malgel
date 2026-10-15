@@ -183,6 +183,9 @@ pub struct DocumentView {
     shown_line: Option<f32>,
     /// The line(s) a press on the line numbers started on, while it drags.
     gutter_anchor: Option<Range<usize>>,
+    /// A press on the line numbers waiting for the editor to place the caret:
+    /// the selection before it and whether Shift was held.
+    gutter_press: Option<(Range<usize>, bool)>,
     /// A Typst source's live preview: its compiler thread and the pages.
     live: Option<TypstLive>,
     _subscriptions: Vec<Subscription>,
@@ -298,6 +301,7 @@ impl DocumentView {
             last_shape: None,
             shown_line: None,
             gutter_anchor: None,
+            gutter_press: None,
             live: None,
             pending_cursor: 0,
             _subscriptions: subscriptions,
@@ -474,6 +478,7 @@ impl DocumentView {
             last_shape: None,
             shown_line: None,
             gutter_anchor: None,
+            gutter_press: None,
             live: None,
             pending_cursor: 0,
             _subscriptions: Vec::new(),
@@ -533,6 +538,7 @@ impl DocumentView {
             last_shape: None,
             shown_line: None,
             gutter_anchor: None,
+            gutter_press: None,
             live: None,
             pending_cursor: 0,
             _subscriptions: Vec::new(),
@@ -1055,22 +1061,19 @@ impl DocumentView {
             && position.y < bounds.origin.y + bounds.size.height
     }
 
-    /// The logical line under `y` in the gutter, from the visible rows.
-    fn line_at_gutter_y(&self, y: Pixels, _window: &Window, cx: &App) -> Option<usize> {
-        let editor = self.editor.read(cx);
-        let bounds = editor.text_bounds()?;
-        let rows = editor.visible_row_range()?;
-        let line_height = editor.line_height()?;
-        if line_height <= px(0.) {
-            return None;
-        }
-        let row = ((y - bounds.origin.y) / line_height).floor() as isize;
-        if row < 0 {
-            return None;
-        }
-        let line = rows.start.saturating_add(row as usize);
-        let last = editor.text().lines_len().saturating_sub(1);
-        Some(line.min(last))
+    /// After the editor placed the caret for a press on the line numbers,
+    /// select the caret's whole logical line (Shift: through the previous
+    /// selection's lines).
+    fn start_gutter_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((previous, shift)) = self.gutter_press.take() else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            let text = editor.text().to_string();
+            let anchor = gutter_selection(&text, editor.cursor(), previous.clone(), shift);
+            editor.set_selected_range(anchor.clone(), cx);
+            self.gutter_anchor = Some(anchor);
+        });
     }
 
     /// Select from the line the gutter press started on to the caret's line.
@@ -1080,8 +1083,7 @@ impl DocumentView {
         };
         self.editor.update(cx, |editor, cx| {
             let text = editor.text().to_string();
-            let line = line_range_at(&text, editor.cursor());
-            let range = anchor.start.min(line.start)..anchor.end.max(line.end);
+            let range = extend_line_selection(&text, &anchor, editor.cursor());
             if editor.selected_range() != range {
                 editor.set_selected_range(range, cx);
             }
@@ -2362,39 +2364,38 @@ impl DocumentView {
             // the caret to the line first, then this widens it.
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.gutter_anchor = None;
+                this.gutter_press = None;
                 if event.button != MouseButton::Left
                     || !this.in_line_numbers(event.position, window, cx)
                 {
                     return;
                 }
-                // Resolve the line from the click's Y: waiting on the editor
-                // to move the caret first made plain clicks flaky (drag still
-                // worked because move events kept extending).
-                let editor = this.editor.read(cx);
-                let previous = editor.selected_range();
-                let shift = event.modifiers.shift;
-                let Some(line) = this.line_at_gutter_y(event.position.y, window, cx) else {
-                    return;
-                };
-                let text = editor.text().to_string();
-                let clicked = {
-                    let start = editor.text().line_start_offset(line);
-                    line_range_at(&text, start)
-                };
-                let anchor = if shift {
-                    let other = line_range_at(&text, previous.start);
-                    other.start.min(clicked.start)..other.end.max(clicked.end)
-                } else {
-                    clicked
-                };
-                this.gutter_anchor = Some(anchor.clone());
-                this.editor.update(cx, |editor, cx| {
-                    editor.set_selected_range(anchor, cx);
+                // Let the editor hit-test the press (it knows soft-wrap rows,
+                // folds and the scroll position), then widen its caret to the
+                // whole logical line once the press has been handled.
+                let previous = this.editor.read(cx).selected_range();
+                this.gutter_press = Some((previous, event.modifiers.shift));
+                let document = cx.entity();
+                window.defer(cx, move |_, cx| {
+                    document.update(cx, |this, cx| this.start_gutter_selection(cx));
                 });
-                cx.stop_propagation();
             }))
-            .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, _, _| {
-                this.gutter_anchor = None;
+            .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                if this.gutter_anchor.is_none() && this.gutter_press.is_none() {
+                    return;
+                }
+                // The editor's own click handling may collapse the selection
+                // on release; put the whole-line selection back after it.
+                let document = cx.entity();
+                window.defer(cx, move |_, cx| {
+                    document.update(cx, |this, cx| {
+                        if this.gutter_press.is_some() {
+                            this.start_gutter_selection(cx);
+                        }
+                        this.extend_gutter_selection(cx);
+                        this.gutter_anchor = None;
+                    });
+                });
             }))
             // A file dragged from the sidebar onto the text inserts a
             // Markdown link to it (VS Code's drop-into-editor); drops
@@ -3014,6 +3015,31 @@ fn line_range_at(text: &str, offset: usize) -> Range<usize> {
     start..end
 }
 
+/// What a press on the line numbers selects once the editor has put the
+/// caret at `caret` (its hit test maps wrapped rows and folds to an offset):
+/// the caret's whole logical line, or with Shift that line through the
+/// lines of the `previous` selection.
+fn gutter_selection(text: &str, caret: usize, previous: Range<usize>, shift: bool) -> Range<usize> {
+    let clicked = line_range_at(text, caret);
+    if shift {
+        let other = line_range_at(text, previous.start);
+        other.start.min(clicked.start)..other.end.max(clicked.end)
+    } else {
+        clicked
+    }
+}
+
+/// A gutter drag from the `anchor` lines to the caret at `caret`. A caret at
+/// `anchor.end` is the anchor's own selection end (the start of the line
+/// after it), not a move onto the next line.
+fn extend_line_selection(text: &str, anchor: &Range<usize>, caret: usize) -> Range<usize> {
+    if caret == anchor.end && anchor.end > anchor.start {
+        return anchor.clone();
+    }
+    let line = line_range_at(text, caret);
+    anchor.start.min(line.start)..anchor.end.max(line.end)
+}
+
 /// The first line to show when `rows` were on screen and the caret is on
 /// line `caret`: the caret keeps its distance from the top when visible.
 fn anchor_for(rows: Range<usize>, caret: usize) -> f32 {
@@ -3091,6 +3117,24 @@ mod tests {
         assert_eq!(&text[line_range_at(text, text.len())], "three");
         let crlf = "a\r\nb\r\n";
         assert_eq!(&crlf[line_range_at(crlf, 0)], "a\r\n");
+        // A press on a soft-wrap continuation row: the editor's hit test puts
+        // the caret mid-line, and the whole logical line is selected.
+        let wrapped = format!("head\n{}\ntail", "word ".repeat(60));
+        let caret = 5 + 140;
+        let line = super::gutter_selection(&wrapped, caret, 0..0, false);
+        assert_eq!(&wrapped[line.clone()], format!("{}\n", "word ".repeat(60)));
+        // Shift extends through the previous selection's lines.
+        let both = super::gutter_selection(&wrapped, caret, 0..0, true);
+        assert_eq!(both.start, 0);
+        assert_eq!(both.end, line.end);
+        // Releasing without a drag leaves the caret at the selection end:
+        // that must not pull in the following line.
+        assert_eq!(
+            super::extend_line_selection(&wrapped, &line, line.end),
+            line
+        );
+        let tail = super::extend_line_selection(&wrapped, &line, wrapped.len());
+        assert_eq!(tail, line.start..wrapped.len());
         assert_eq!(super::line_number_digits(9), 3);
         assert_eq!(super::line_number_digits(12_000), 5);
     }
