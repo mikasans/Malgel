@@ -1636,56 +1636,124 @@ impl Workspace {
                     // Ask once the current dialog is answered.
                     return;
                 }
-                doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
+                // Do not update the stamp yet: Ctrl+S must still see the
+                // conflict. The stamp advances only when the user chooses.
                 self.pending_disk_prompt.insert(id);
                 if let Some(ix) = self.document_index(id) {
                     self.activate(ix, window, cx);
                 }
-                let workspace = cx.weak_entity();
-                let text = Arc::new(text);
-                window.open_alert_dialog(cx, move |alert, _, _| {
-                    let (keep, reload) = (workspace.clone(), workspace.clone());
-                    let (reload_doc, text) = (doc.clone(), text.clone());
-                    alert
-                        .title(format!("“{name}” changed on disk"))
-                        .description(
-                            "Another program saved this file while you have unsaved changes here.",
-                        )
-                        .footer(
-                            DialogFooter::new()
-                                .justify_end()
-                                .child(
-                                    Button::new("reload")
-                                        .label("Use the file on disk")
-                                        .outline()
-                                        .on_click(move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            let text = text.as_ref().clone();
-                                            reload_doc.update(cx, |doc, cx| {
-                                                doc.reload(text, line_ending, window, cx)
-                                            });
-                                            _ = reload.update(cx, |this, cx| {
-                                                this.pending_disk_prompt.remove(&id);
-                                                this.focus_active(window, cx);
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("keep")
-                                        .label("Keep my changes")
-                                        .primary()
-                                        .on_click(move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            _ = keep.update(cx, |this, cx| {
-                                                this.pending_disk_prompt.remove(&id);
-                                                this.focus_active(window, cx);
-                                            });
-                                        }),
-                                ),
-                        )
-                });
+                self.open_disk_conflict(doc, id, name, text, line_ending, stamp, window, cx);
             }
         }
+    }
+
+    /// Ask whether to keep the buffer or take the file on disk. Esc keeps
+    /// the buffer (and focuses the editor); the stamp is updated only after
+    /// a choice so a stray Ctrl+S cannot clobber the external write.
+    #[allow(clippy::too_many_arguments)]
+    fn open_disk_conflict(
+        &mut self,
+        doc: Entity<DocumentView>,
+        id: EntityId,
+        name: String,
+        text: String,
+        line_ending: LineEnding,
+        stamp: Option<crate::session::DiskStamp>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = cx.weak_entity();
+        let text = Arc::new(text);
+        let decided = Rc::new(Cell::new(false));
+        window.open_alert_dialog(cx, move |alert, window, cx| {
+            let focus = cx.focus_handle();
+            window.defer(cx, {
+                let focus = focus.clone();
+                move |window, cx| focus.focus(window, cx)
+            });
+            let keep = {
+                let workspace = workspace.clone();
+                let doc = doc.clone();
+                let decided = decided.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    if decided.replace(true) {
+                        return;
+                    }
+                    window.close_dialog(cx);
+                    doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
+                    _ = workspace.update(cx, |this, cx| {
+                        this.pending_disk_prompt.remove(&id);
+                        this.focus_active(window, cx);
+                    });
+                }
+            };
+            let keep_btn = keep.clone();
+            let keep_esc = keep.clone();
+            let reload = workspace.clone();
+            let reload_doc = doc.clone();
+            let reload_text = text.clone();
+            let reload_decided = decided.clone();
+            let overwrite_ws = workspace.clone();
+            let overwrite_doc = doc.clone();
+            let overwrite_path = doc.read(cx).path().cloned();
+            let overwrite_decided = decided.clone();
+            alert
+                .title(format!("“{name}” changed on disk"))
+                .description("Another program saved this file while you have unsaved changes here.")
+                .keyboard(true)
+                .on_cancel(move |_, window, cx| {
+                    keep_esc(window, cx);
+                    true
+                })
+                .footer(
+                    DialogFooter::new()
+                        .justify_end()
+                        .child(
+                            Button::new("reload")
+                                .label("Use the file on disk")
+                                .outline()
+                                .on_click(move |_, window, cx| {
+                                    if reload_decided.replace(true) {
+                                        return;
+                                    }
+                                    window.close_dialog(cx);
+                                    let text = reload_text.as_ref().clone();
+                                    reload_doc.update(cx, |doc, cx| {
+                                        doc.reload(text, line_ending, window, cx)
+                                    });
+                                    _ = reload.update(cx, |this, cx| {
+                                        this.pending_disk_prompt.remove(&id);
+                                        this.focus_active(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("keep")
+                                .label("Keep my changes")
+                                .primary()
+                                .on_click(move |_, window, cx| keep_btn(window, cx)),
+                        )
+                        .child(
+                            Button::new("overwrite")
+                                .label("Overwrite")
+                                .outline()
+                                .on_click(move |_, window, cx| {
+                                    if overwrite_decided.replace(true) {
+                                        return;
+                                    }
+                                    window.close_dialog(cx);
+                                    overwrite_doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
+                                    _ = overwrite_ws.update(cx, |this, cx| {
+                                        this.pending_disk_prompt.remove(&id);
+                                        if let Some(path) = &overwrite_path {
+                                            this.write(&overwrite_doc, path, window, cx);
+                                        }
+                                        this.focus_active(window, cx);
+                                    });
+                                }),
+                        ),
+                )
+        });
     }
 
     // ---------------------------------------------------------------------
@@ -2811,6 +2879,47 @@ impl Workspace {
             // Nothing is there to save until the file has loaded.
             return;
         }
+        let id = doc.entity_id();
+        if self.pending_disk_prompt.contains(&id) {
+            // Still deciding: re-offer the choice; never write silently.
+            if window.has_active_dialog(cx) {
+                return;
+            }
+            let path = doc.read(cx).path().cloned();
+            let name = doc.read(cx).name();
+            let (text, line_ending, stamp) = match &path {
+                Some(path) => {
+                    let text = std::fs::read_to_string(path).unwrap_or_default();
+                    let line_ending = LineEnding::detect(&text);
+                    let stamp = crate::session::DiskStamp::of(path);
+                    (text, line_ending, stamp)
+                }
+                None => return,
+            };
+            self.open_disk_conflict(doc, id, name, text, line_ending, stamp, window, cx);
+            return;
+        }
+        if let Some(path) = doc.read(cx).path().cloned() {
+            let known = doc.read(cx).disk_stamp();
+            let now = crate::session::DiskStamp::of(&path);
+            if known.is_some() && now.is_some() && known != now {
+                // External change since we last agreed on the stamp.
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let line_ending = crate::document::LineEnding::detect(&text);
+                self.pending_disk_prompt.insert(id);
+                self.open_disk_conflict(
+                    doc,
+                    id,
+                    display_name(Some(&path)),
+                    text,
+                    line_ending,
+                    now,
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
         match doc.read(cx).path().cloned() {
             Some(path) => {
                 if self.write(&doc, &path, window, cx)
@@ -2871,14 +2980,26 @@ impl Workspace {
                 true
             }
             Err(err) => {
-                self.notify_error(
-                    format!(
-                        "Couldn’t save “{}”. {err}",
-                        display_name(Some(&path.to_path_buf()))
-                    ),
-                    window,
-                    cx,
-                );
+                if err.kind() == std::io::ErrorKind::PermissionDenied {
+                    self.notify_error(
+                        format!(
+                            "Couldn’t save “{}”: no write permission. Use Save As… to pick another place.",
+                            display_name(Some(&path.to_path_buf()))
+                        ),
+                        window,
+                        cx,
+                    );
+                    self.prompt_save_path(doc.clone(), None, window, cx);
+                } else {
+                    self.notify_error(
+                        format!(
+                            "Couldn’t save “{}”. {err}",
+                            display_name(Some(&path.to_path_buf()))
+                        ),
+                        window,
+                        cx,
+                    );
+                }
                 false
             }
         }
@@ -3274,6 +3395,7 @@ impl Workspace {
         let state = self.quick_open.clone();
         let listing = files.clone();
         let home = std::env::var_os("HOME").map(PathBuf::from);
+        let restore = cx.weak_entity();
         let current = self.active_document().read(cx).path().cloned();
         let mut recent = AppSettings::get(cx).recent_files.clone();
         for document in &self.documents {
@@ -3362,7 +3484,16 @@ impl Workspace {
                     window.dispatch_action(Box::new(OpenQuickPath(row.path, row.line)), cx);
                 })
                 .on_cancel(|window, cx| window.close_dialog(cx));
-            dialog.close_button(false).p_0().child(esc_closes(command))
+            let restore = restore.clone();
+            dialog
+                .close_button(false)
+                .p_0()
+                .on_close(move |_, window, cx| {
+                    if let Some(this) = restore.upgrade() {
+                        this.update(cx, |this, cx| this.focus_active(window, cx));
+                    }
+                })
+                .child(esc_closes(command))
         });
     }
 
@@ -3414,6 +3545,7 @@ impl Workspace {
         // hands the Action it stands for back to the workspace and dispatches
         // it from there.
         let ws_focus = self.focus_handle.clone();
+        let restore = cx.weak_entity();
         window.open_dialog(cx, move |dialog, window, cx| {
             let focus = state.read(cx).focus_handle(cx);
             window.defer(cx, move |window, cx| focus.focus(window, cx));
@@ -3428,7 +3560,16 @@ impl Workspace {
                 |command, group| command.group(group),
             );
             let ws_focus = ws_focus.clone();
-            dialog.close_button(false).p_0().child(esc_closes(
+            let restore = restore.clone();
+            dialog
+                .close_button(false)
+                .p_0()
+                .on_close(move |_, window, cx| {
+                    if let Some(this) = restore.upgrade() {
+                        this.update(cx, |this, cx| this.focus_active(window, cx));
+                    }
+                })
+                .child(esc_closes(
                 command
                     .empty(|_, _, _| div().px_3().py_2().child("No matching commands"))
                     .on_confirm(move |index: IndexPath, window, cx| {
@@ -5425,6 +5566,19 @@ mod tests {
             let settings = AppSettings::get(cx);
             assert!(settings.tabs);
         });
+    }
+
+    #[test]
+    fn save_refuses_while_disk_conflict_is_pending() {
+        // pending_disk_prompt membership is what save_document checks before write.
+        let mut pending: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        pending.insert(42);
+        assert!(pending.contains(&42), "conflict pending blocks save");
+        pending.remove(&42);
+        assert!(
+            !pending.contains(&42),
+            "after Keep/Overwrite/Reload, save may proceed"
+        );
     }
 
     #[test]

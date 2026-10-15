@@ -334,12 +334,13 @@ pass "Quick Open opens and closes (Ctrl+P)"
 # 4b. One Escape closes a picker even with text in its filter, and the
 #     keyboard is back in the editor: the next key lands in the file.
 editor_has_focus() { # type a marker, save, find it, then take it back out
+  sleep 0.3
   xdotool type --delay 30 'Q'
-  sleep 0.2
+  sleep 0.3
   xdotool key --clearmodifiers ctrl+s
   wait_for 5 grep -q 'Q' "$WS/README.md" || return 1
   xdotool key --clearmodifiers BackSpace
-  sleep 0.2
+  sleep 0.3
   xdotool key --clearmodifiers ctrl+s
   wait_for 5 bash -c "! grep -q 'Q' '$WS/README.md'"
 }
@@ -866,6 +867,26 @@ else:
     assert delta <= 150, f"text jumped too far ({delta}px)"
 PY
 pass "gutter: 3-digit and 5-digit files open (growth when measurable)"
+
+# 21b. External edit while dirty: Ctrl+S must not clobber the on-disk line.
+printf 'local\n' >"$WS/notes/conflict.md"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'conflict.md'
+xdotool key --clearmodifiers Return
+sleep 0.8
+xdotool type --delay 30 'BUF'
+sleep 0.3
+# External write while the buffer is dirty.
+printf 'X\n' >>"$WS/notes/conflict.md"
+sleep 0.8
+xdotool key --clearmodifiers ctrl+s
+sleep 0.5
+# Esc = Keep my changes (does not write); the X line must remain on disk.
+xdotool key --clearmodifiers Escape
+sleep 0.4
+grep -q '^X$' "$WS/notes/conflict.md" || fail "Ctrl+S during a disk conflict clobbered the external X line"
+pass "disk conflict: Ctrl+S does not clobber an external write (Esc keeps buffer)"
 
 # 22. Still alive at the end — no crash from any of the above.
 kill -0 "$APP_PID" 2>/dev/null || fail "process died during the run"
