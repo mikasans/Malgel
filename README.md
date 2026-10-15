@@ -75,11 +75,14 @@ A fast, native Markdown editor and previewer written in pure Rust with
   Typst compiler that exports Malgel's PDFs runs on the source in-process —
   no `typst` binary, no export step — and the pages are shown in the same
   viewer a PDF uses. Files it names resolve next to it, so a document spread
-  over several files compiles as one. The preview is recompiled whenever the
-  source (or anything it names) changes on disk, so it follows an editor
-  that is not this one: a `typst watch` workflow, a terminal editor, another
-  window on the same file. A source that no longer compiles keeps the last
-  version on screen and says so, rather than going blank.
+  over several files compiles as one, and the packages it imports come from
+  the same package folders the `typst` command reads them from, so a deck
+  built on `@preview/touying` previews as it would build. The preview is
+  recompiled whenever the source (or anything it names) changes on disk, so
+  it follows an editor that is not this one: a `typst watch` workflow, a
+  terminal editor, another window on the same file. A source that no longer
+  compiles keeps the last version on screen and says so, rather than going
+  blank.
 - **Documents done right.** Atomic saves, UTF-8 with byte-order-mark
   handling, CRLF files stay CRLF (switch a document between LF and CRLF from
   the status bar), unsaved-changes prompts on new, open, close and quit,

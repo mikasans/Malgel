@@ -1,6 +1,6 @@
 [package]
 name = "malgel"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 description = "Malgel — a fast, native Markdown editor and previewer built with GPUI Kit."
 license = "Apache-2.0"
@@ -75,6 +75,10 @@ resvg = { version = "0.46", default-features = false, features = ["text", "syste
 fontdb = "0.23"
 # Picks A4 or US Letter for exports from the system locale.
 sys-locale = "0.3"
+# The platform's data and cache folders. The Typst preview reads packages from
+# the folders the `typst` command keeps them in, which are these two; already
+# in the lockfile, since shellexpand pulls the same crate in.
+dirs = "6"
 # Word export. `image` converts pictures to PNG and `zip` finishes the
 # package; docx-rs already builds both.
 docx-rs = "0.4.22"

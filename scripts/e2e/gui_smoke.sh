@@ -166,10 +166,31 @@ PY_EOF
 
 # A Typst document, compiled by the app itself: its preview is the pages the
 # compiler produces, so the check can change the source and watch them follow.
+# The document imports a package, so opening it also proves the preview reads
+# packages from the folders the `typst` command keeps them in: an import that
+# cannot be resolved fails the compile, so the document never opens and the
+# frame below never changes.
+PKG_ROOT="$ART_DIR/packages"
+mkdir -p "$PKG_ROOT/preview/hello/0.1.0"
+cat >"$PKG_ROOT/preview/hello/0.1.0/typst.toml" <<'PKG_EOF'
+[package]
+name = "hello"
+version = "0.1.0"
+entrypoint = "lib.typ"
+PKG_EOF
+cat >"$PKG_ROOT/preview/hello/0.1.0/lib.typ" <<'PKG_EOF'
+#let hello = [From a package]
+PKG_EOF
+export TYPST_PACKAGE_CACHE_PATH="$PKG_ROOT"
+
 cat >"$WS/paper.typ" <<'TYP_EOF'
+#import "@preview/hello:0.1.0": hello
+
 = A Typst document
 
 The first body of the document, before the change.
+
+#hello
 TYP_EOF
 
 shot() { # shot <name>
@@ -534,9 +555,13 @@ pass "a .typ document opens and compiles"
 # editable buffer, so the edit comes from outside, the way another program's
 # save would. A heading added at the top of the document changes the page.
 cat >"$WS/paper.typ" <<'TYP_EOF'
+#import "@preview/hello:0.1.0": hello
+
 = A Typst document, revised
 
 The revised body of the document, after the change.
+
+#hello
 TYP_EOF
 wait_for 10 grep -q revised "$WS/paper.typ" \
   || fail "the test could not rewrite the Typst source"

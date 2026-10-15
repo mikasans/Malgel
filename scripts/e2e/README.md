@@ -43,7 +43,9 @@ application that starts, paints and responds.
     font size changed in the saved settings — a scrolled pane would change the
     frame too.
 17. Opens a `.typ` file, and rewrites it while it is open: the app compiles the
-    source itself and the pages follow the source as it changes on disk.
+    source itself and the pages follow the source as it changes on disk. The
+    source imports a package from a package folder the run sets up, so a
+    package the preview cannot resolve fails this step too.
 18. Double-clicks a row and checks it started nothing, then double-clicks the
     space the entries do not fill and checks the file it asked for landed in
     the folder's root, the way VS Code's Explorer makes one.

@@ -14,14 +14,19 @@
 //! following an editor that is not this one: a `typst watch` workflow, a
 //! terminal editor, another window on the same file.
 //!
-//! The compiler is given the document's folder and nothing else. A document
-//! names its files by paths relative to itself, so those are the files it
-//! reaches; the rest of the file system, the network and `sys.inputs` stay
-//! out of reach, and a document depending on them fails with the compiler's
-//! own message instead of showing a stale page. The files a compilation read
-//! are recorded, and those are exactly the paths the workspace watches.
+//! The compiler is given the document's folder and the folders the `typst`
+//! command keeps packages in. A document names its own files by paths
+//! relative to itself, so those are the files it reaches; a package it
+//! imports is read out of the package folders, the same way the command
+//! reads it, so a deck that imports `@preview/touying` previews the way it
+//! would compile. The rest of the file system, the network and `sys.inputs`
+//! stay out of reach, and a document depending on them fails with the
+//! compiler's own message instead of showing a stale page. The files a
+//! compilation read are recorded, and those are exactly the paths the
+//! workspace watches.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -30,7 +35,7 @@ use typst::{
     World,
     diag::{FileError, FileResult},
     foundations::{Bytes, Datetime, Duration},
-    syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot},
+    syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot, package::PackageSpec},
     text::Font,
 };
 
@@ -122,6 +127,16 @@ pub fn stamp_of(paths: &[PathBuf]) -> DiskStamp {
 /// Compile the source at `source`, returning the paths the compilation read
 /// (the source first) and the resulting pages.
 fn compile(source: &Path) -> Result<(Vec<PathBuf>, PdfDocument), String> {
+    compile_in(source, package_folders())
+}
+
+/// Compile the source at `source` with `packages` as the folders a package
+/// can come from, returning the paths the compilation read (the source
+/// first) and the resulting pages.
+fn compile_in(
+    source: &Path,
+    packages: Vec<PathBuf>,
+) -> Result<(Vec<PathBuf>, PdfDocument), String> {
     let text = std::fs::read_to_string(source)
         .map_err(|err| format!("couldn’t read “{}”: {err}", source.display()))?;
     let mut read = vec![source.to_path_buf()];
@@ -129,6 +144,8 @@ fn compile(source: &Path) -> Result<(Vec<PathBuf>, PdfDocument), String> {
         root: source.parent().map(Path::to_path_buf).unwrap_or_default(),
         source: Source::new(file_id_for(source), text),
         read: Mutex::new(Vec::new()),
+        packages,
+        package_roots: Mutex::new(HashMap::new()),
     };
     let document = typst::compile(&world)
         .output
@@ -155,18 +172,95 @@ fn first_diagnostic(errors: &[typst::diag::SourceDiagnostic]) -> String {
         .unwrap_or_else(|| "the document could not be compiled".to_string())
 }
 
-/// A world that serves the document's own folder.
+/// A world that serves the document's own folder and the packages it imports.
 ///
-/// The document's path decides the folder, and the paths the document names
+/// The document's path decides its folder, and the paths the document names
 /// are joined onto it, so nothing outside that folder is reachable — Typst
 /// normalizes `..` away when it builds the path it asks for, so a document
-/// cannot climb out of its own directory either.
+/// cannot climb out of its own directory either. A path in a package is
+/// joined onto that package's folder instead, which is where the `typst`
+/// command reads it from too.
 struct DocumentWorld {
     root: PathBuf,
     source: Source,
     /// The files this compilation read, for the watcher. `World`'s methods
     /// borrow, so the recording needs a lock rather than a field.
     read: Mutex<Vec<PathBuf>>,
+    /// The folders a package can be found in, in the order they are tried.
+    packages: Vec<PathBuf>,
+    /// The folder each imported package was found in. `None` records a
+    /// package that was looked for and is not there, so a document whose
+    /// import is missing does not search the folders again for every path
+    /// the failed import names.
+    package_roots: Mutex<HashMap<PackageSpec, Option<PathBuf>>>,
+}
+
+impl DocumentWorld {
+    /// The folder a package's files are read from, looked up once per
+    /// package.
+    fn package_root(&self, spec: &PackageSpec) -> FileResult<PathBuf> {
+        let mut found = self
+            .package_roots
+            .lock()
+            .expect("a compile reads files on one thread");
+        if let Some(folder) = found.get(spec) {
+            return folder.clone().ok_or_else(|| missing_package(spec));
+        }
+        let folder = package_folder(&self.packages, spec);
+        found.insert(spec.clone(), folder.clone());
+        folder.ok_or_else(|| missing_package(spec))
+    }
+
+    /// The file `id` names, under the root it belongs to: the document's
+    /// folder for the project, the package's folder for a package.
+    fn path_of(&self, id: FileId) -> FileResult<PathBuf> {
+        let folder = match id.root() {
+            VirtualRoot::Project => self.root.clone(),
+            VirtualRoot::Package(spec) => self.package_root(spec)?,
+        };
+        Ok(folder.join(id.vpath().get_without_slash()))
+    }
+}
+
+/// The folders a package can come from, in the order the `typst` command
+/// tries them: the data folder, where a person installs a package, then the
+/// cache the command downloads into. `TYPST_PACKAGE_PATH` and
+/// `TYPST_PACKAGE_CACHE_PATH` stand in for the two, the same variables the
+/// command reads.
+fn package_folders() -> Vec<PathBuf> {
+    let mut folders = Vec::new();
+    match std::env::var_os("TYPST_PACKAGE_PATH") {
+        Some(path) => folders.push(PathBuf::from(path)),
+        None => folders.extend(dirs::data_dir().map(|dir| dir.join("typst/packages"))),
+    }
+    match std::env::var_os("TYPST_PACKAGE_CACHE_PATH") {
+        Some(path) => folders.push(PathBuf::from(path)),
+        None => folders.extend(dirs::cache_dir().map(|dir| dir.join("typst/packages"))),
+    }
+    folders
+}
+
+/// The folder a package's files live in: `namespace/name/version` under the
+/// first folder that holds it, which is the layout the command writes.
+fn package_folder(folders: &[PathBuf], spec: &PackageSpec) -> Option<PathBuf> {
+    let relative = format!("{}/{}/{}", spec.namespace, spec.name, spec.version);
+    folders
+        .iter()
+        .map(|folder| folder.join(&relative))
+        .find(|folder| folder.is_dir())
+}
+
+/// A package the folders do not hold. Malgel compiles offline, so a package
+/// has to be there already; saying which one and how to get it is more use
+/// than a path next to the document that nothing will ever be at.
+fn missing_package(spec: &PackageSpec) -> FileError {
+    FileError::Other(Some(
+        format!(
+            "{spec} is not in the local Typst package folders — \
+             compiling the document once with the Typst CLI downloads it"
+        )
+        .into(),
+    ))
 }
 
 impl World for DocumentWorld {
@@ -194,7 +288,7 @@ impl World for DocumentWorld {
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
-        let path = self.root.join(id.vpath().get_without_slash());
+        let path = self.path_of(id)?;
         let metadata = std::fs::metadata(&path).map_err(|err| FileError::from_io(err, &path))?;
         if metadata.len() > MAX_NAMED_FILE_BYTES {
             let name = path
@@ -371,6 +465,75 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(dir.join("part.typ"), "= Part, revised\n").unwrap();
         assert_ne!(before, preview.stamp(), "a change to an import was missed");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A document that imports a package compiles to the package's own entry
+    /// point: the package's files come from the package folders, the way the
+    /// `typst` command reads them, and the folder the document sits in is not
+    /// consulted for them.
+    #[test]
+    fn imports_a_package_from_the_package_folders() {
+        let dir = workspace("package");
+        let folder = dir.join("packages/preview/greeting/0.1.0");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("typst.toml"),
+            "[package]\nname = \"greeting\"\nversion = \"0.1.0\"\nentrypoint = \"lib.typ\"\n",
+        )
+        .unwrap();
+        std::fs::write(folder.join("lib.typ"), "#let greeting = [A package page]\n").unwrap();
+
+        let main = dir.join("main.typ");
+        std::fs::write(
+            &main,
+            "#import \"@preview/greeting:0.1.0\": greeting\n#greeting\n",
+        )
+        .unwrap();
+
+        let (read, document) =
+            compile_in(&main, vec![dir.join("packages")]).expect("compile the package import");
+        assert_eq!(document.pages().len(), 1);
+        assert!(
+            read.iter().any(|path| path.ends_with("lib.typ")),
+            "the package's entry point was not read: {read:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A package that is not installed is reported by its name, not by a path
+    /// in the document's folder that nothing could ever be at — which is what
+    /// a package import used to turn into.
+    #[test]
+    fn a_missing_package_names_the_package() {
+        let dir = workspace("no-package");
+        let main = dir.join("main.typ");
+        std::fs::write(&main, "#import \"@preview/nowhere:1.2.3\"\n").unwrap();
+
+        let Err(error) = compile_in(&main, Vec::new()) else {
+            panic!("the package is not installed");
+        };
+        assert!(error.contains("@preview/nowhere:1.2.3"), "got: {error}");
+        assert!(!error.contains("searched at"), "got: {error}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The folders are tried in order, so a package a person installed wins
+    /// over a copy the command cached.
+    #[test]
+    fn the_first_package_folder_that_has_the_package_wins() {
+        let dir = workspace("precedence");
+        let spec: PackageSpec = "@preview/greeting:0.1.0".parse().unwrap();
+        let data = dir.join("data");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(data.join("preview/greeting/0.1.0")).unwrap();
+        std::fs::create_dir_all(cache.join("preview/greeting/0.1.0")).unwrap();
+
+        let found = package_folder(&[data.clone(), cache], &spec).expect("the package is there");
+        assert!(found.starts_with(&data), "got: {found:?}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
