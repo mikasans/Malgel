@@ -1083,6 +1083,36 @@ grep -q '^X$' "$WS/notes/conflict.md"   || fail "Ctrl+S during a disk conflict c
 ! grep -q 'LEAK' "$WS/notes/conflict.md"   || fail "Esc/Keep wrote leaked keystrokes to disk"
 pass "disk conflict: dialog holds focus; Esc keeps buffer and dismisses"
 
+# 21c. Quit with unsaved changes: Ctrl+Q asks first, the dialog holds the
+#      keyboard (typed keys never reach a file) and Esc cancels the quit.
+printf 'quit\n' >"$WS/notes/quit.md"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'quit.md'
+xdotool key --clearmodifiers Return
+sleep 0.8
+xdotool type --delay 30 'DIRTY'
+sleep 0.3
+shot 46-quit-dirty
+xdotool key --clearmodifiers ctrl+q
+sleep 1.0
+shot 47-quit-confirm
+kill -0 "$APP_PID" 2>/dev/null || fail "Ctrl+Q with unsaved changes quit without asking"
+[[ "$(pixels_differ 46-quit-dirty 47-quit-confirm)" -gt 1000 ]] \
+  || fail "Ctrl+Q with unsaved changes showed no dialog"
+xdotool type --delay 30 'LEAK'
+sleep 0.3
+xdotool key --clearmodifiers Escape
+sleep 0.8
+shot 48-quit-cancelled
+kill -0 "$APP_PID" 2>/dev/null || fail "Esc in the quit dialog quit the app"
+[[ "$(pixels_differ 47-quit-confirm 48-quit-cancelled)" -gt 1000 ]] \
+  || fail "Esc did not dismiss the quit dialog"
+[[ "$(cat "$WS/notes/quit.md")" == "quit" ]] \
+  || fail "the quit dialog changed quit.md on disk: $(head -c 80 "$WS/notes/quit.md")"
+! grep -rq 'LEAK' "$WS/notes" || fail "keys typed into the quit dialog reached a file"
+pass "Ctrl+Q with unsaved changes: dialog holds keys, Esc cancels, file unchanged"
+
 # 22. Still alive at the end — no crash from any of the above.
 kill -0 "$APP_PID" 2>/dev/null || fail "process died during the run"
 pass "process alive at exit"
