@@ -318,6 +318,12 @@ impl Workspace {
                     FileTreeEvent::Deleted { paths } => {
                         this.close_deleted_documents(paths, window, cx);
                     }
+                    // The empty space below the entries: a new file in the
+                    // folder the tree is showing, as VS Code makes one.
+                    FileTreeEvent::NewFileInRoot => {
+                        let root = this.file_tree.read(cx).root().map(Path::to_path_buf);
+                        this.prompt_tree_name(TreePromptKind::NewFile, root, "", window, cx);
+                    }
                 },
             ),
             cx.observe_global_in::<AppSettings>(window, |this, window, cx| {
@@ -1584,7 +1590,7 @@ impl Workspace {
     /// New File (the Explorer's, not the editor's): ask for a name, then
     /// create it in the folder the tree's selection points at.
     fn tree_new_file(&mut self, _: &NewFileInTree, window: &mut Window, cx: &mut Context<Self>) {
-        self.prompt_tree_name(TreePromptKind::NewFile, "", window, cx);
+        self.prompt_tree_name(TreePromptKind::NewFile, None, "", window, cx);
     }
 
     fn tree_new_folder(
@@ -1593,7 +1599,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.prompt_tree_name(TreePromptKind::NewFolder, "", window, cx);
+        self.prompt_tree_name(TreePromptKind::NewFolder, None, "", window, cx);
     }
 
     fn tree_rename(&mut self, _: &RenameInTree, window: &mut Window, cx: &mut Context<Self>) {
@@ -1608,7 +1614,7 @@ impl Workspace {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.prompt_tree_name(TreePromptKind::Rename, &name, window, cx);
+        self.prompt_tree_name(TreePromptKind::Rename, None, &name, window, cx);
     }
 
     fn tree_delete(&mut self, _: &DeleteInTree, window: &mut Window, cx: &mut Context<Self>) {
@@ -1706,10 +1712,13 @@ impl Workspace {
         });
     }
 
-    /// Ask for the name of a new file, folder or rename.
+    /// Ask for the name of a new file, folder or rename. `target` is the
+    /// folder the new entry goes in; `None` lets the tree choose (the picked
+    /// entry's folder, or the root), the way VS Code's Explorer does.
     fn prompt_tree_name(
         &mut self,
         kind: TreePromptKind,
+        target: Option<PathBuf>,
         initial: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1726,7 +1735,9 @@ impl Workspace {
             initial,
             window,
             cx,
-            move |this, name, window, cx| this.apply_tree_name(kind, name, window, cx),
+            move |this, name, window, cx| {
+                this.apply_tree_name(kind, target.clone(), name, window, cx)
+            },
         );
     }
 
@@ -1854,17 +1865,20 @@ impl Workspace {
         self.load_path(path, Placement::Default, Target::Line(hit.line), window, cx);
     }
 
-    /// Carry out the name a tree prompt collected.
+    /// Carry out the name a tree prompt collected. `target` names the folder
+    /// the new entry goes in, when the gesture knew one.
     fn apply_tree_name(
         &mut self,
         kind: TreePromptKind,
+        target: Option<PathBuf>,
         name: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match kind {
             TreePromptKind::NewFile | TreePromptKind::NewFolder => {
-                let Some(folder) = self.file_tree.read(cx).target_folder() else {
+                let folder = target.or_else(|| self.file_tree.read(cx).target_folder());
+                let Some(folder) = folder else {
                     window.push_notification(Notification::info("Open a folder first."), cx);
                     return;
                 };
@@ -2977,6 +2991,22 @@ impl Workspace {
                     .flex_shrink_0()
                     .gap_2()
                     .pr_2()
+                    .child(
+                        // VS Code keeps Toggle Side Bar in its title bar
+                        // beside the layout controls. Without a button here, a
+                        // folded-away Explorer leaves the sidebar's only way
+                        // back inside a menu.
+                        Button::new("toggle-sidebar")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .icon(Icon::new(IconName::PanelLeft))
+                            .tooltip("Toggle side bar")
+                            .selected(settings.file_sidebar)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(ToggleFileSidebar), cx)
+                            }),
+                    )
                     .child(
                         ButtonGroup::new("layout")
                             .ghost()

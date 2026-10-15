@@ -14,10 +14,10 @@ use std::{
 };
 
 use gpui_kit::{
-    AppContext as _, Context, DragMoveEvent, EventEmitter, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, InteractiveElement as _, IntoElement, Modifiers, MouseButton, MouseDownEvent,
-    MouseUpEvent, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Task, UniformListScrollHandle, Window,
+    AppContext as _, ClickEvent, Context, DragMoveEvent, EventEmitter, ExternalPaths, FocusHandle,
+    Focusable, FontWeight, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
+    MouseDownEvent, MouseUpEvent, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Task, UniformListScrollHandle, Window,
     assets::IconName,
     component::{
         ActiveTheme as _, Icon, Sizable as _, WindowExt as _,
@@ -67,6 +67,9 @@ pub enum FileTreeEvent {
     Moved { from: PathBuf, to: PathBuf },
     /// Entries were deleted from disk (and everything below them).
     Deleted { paths: Vec<PathBuf> },
+    /// The space below the entries was double-clicked: VS Code's Explorer
+    /// makes a new file in the folder the tree is showing.
+    NewFileInRoot,
 }
 
 /// Files or folders cut or copied in the tree, waiting for a paste. `cut`
@@ -542,6 +545,21 @@ impl FileTree {
 
     // ---------------------------------------------------------------------
     // Editing files from the tree
+
+    /// Double-clicking the space the entries do not fill: VS Code's Explorer
+    /// starts a new file in the folder it is showing, whatever entry happens
+    /// to be picked. A click that landed on a row never reaches here — the row
+    /// handles its own click and stops it.
+    fn new_file_on_empty_space(
+        &mut self,
+        event: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.root.is_some() && event.click_count() == 2 {
+            cx.emit(FileTreeEvent::NewFileInRoot);
+        }
+    }
 
     /// Create `name` inside `dir` (a file, or a folder when `is_dir`), then
     /// pick it. Nested names like `notes/plan.md` create the folders on the
@@ -1265,6 +1283,11 @@ impl FileTree {
                         .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                                // The row's click stops here, so the space
+                                // around the entries (which starts a new file
+                                // on a double click) never sees one that
+                                // landed on a row.
+                                cx.stop_propagation();
                                 if cx.has_active_drag()
                                     || event.modifiers.shift
                                     || event.modifiers.secondary()
@@ -1493,16 +1516,24 @@ impl Render for FileTree {
                 .into_any_element()
         } else if self.rows.is_empty() && self.refresh_task.is_none() {
             div()
+                .id("file-tree-empty")
+                .flex_1()
+                .min_h_0()
                 .p_4()
                 .text_sm()
                 .text_color(theme.muted_foreground)
                 .child("No Markdown files here")
+                .on_click(cx.listener(Self::new_file_on_empty_space))
                 .into_any_element()
         } else {
             div()
+                .id("file-tree-body")
                 .flex_1()
                 .min_h_0()
                 .px_1()
+                // The space the entries do not fill is the folder itself, as
+                // in VS Code: double-clicking it starts a new file there.
+                .on_click(cx.listener(Self::new_file_on_empty_space))
                 .child(
                     uniform_list(
                         "file-tree-rows",

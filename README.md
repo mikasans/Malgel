@@ -123,6 +123,11 @@ Windows, the Malgel menu on macOS) or the View menu:
   between them. Without tabs, opening a file replaces the current one.
 - **File sidebar** (Ctrl+B). A folder's Markdown and text files as a
   tree that follows changes on disk; File → Open folder… picks the folder.
+  Entries are created, renamed, deleted, cut, copied and pasted from the
+  tree, and double-clicking the space below them starts a new file in the
+  folder itself, as VS Code's Explorer does. A button in the title bar —
+  beside the layout controls, lit while the sidebar is shown — folds the
+  tree away and brings it back.
 - **Outline** (Ctrl+Alt+O). The document's headings beside the editor, with
   the section you are in highlighted; click one to jump there.
 - **Spell check.** Unknown words are underlined in prose (code, math, URLs

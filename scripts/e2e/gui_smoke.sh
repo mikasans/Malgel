@@ -223,6 +223,12 @@ font_size() {
   sed -n 's/.*"font_size": *\([0-9.]*\).*/\1/p' \
     "$HOME/.config/malgel/settings.json" 2>/dev/null
 }
+# Whether the sidebar is shown, as the app recorded it. A frame can change for
+# many reasons; this is the setting the toggle is about.
+sidebar_on() {
+  sed -n 's/.*"file_sidebar": *\(true\|false\).*/\1/p' \
+    "$HOME/.config/malgel/settings.json" 2>/dev/null
+}
 
 echo "== malgel GUI smoke =="
 echo "binary:   $BIN"
@@ -542,7 +548,86 @@ shot 30-typst-edited
   || fail "editing the Typst source did not refresh the preview"
 pass "editing the source refreshes the compiled pages"
 
-# 17. Still alive at the end — no crash from any of the above.
+# 17. A row's own click stops at the row, so the space below the entries —
+#     where a double click starts a new file — never sees a click that landed
+#     on an entry. Pin that with a name that would appear at the tree's root
+#     if the row let its click through.
+xdotool key --clearmodifiers ctrl+shift+e
+shot 31-explorer-again
+xdotool mousemove $((win_x + 83)) $((win_y + 106))
+sleep 0.3
+xdotool click --repeat 2 --delay 120 1
+sleep 1.0
+shot 32-row-double-click
+[[ "$(pixels_differ 30-typst-edited 32-row-double-click)" -gt 1000 ]] \
+  || fail "double-clicking a row did nothing at all"
+xdotool type --delay 40 'zz-row-double.md'
+sleep 0.4
+xdotool key --clearmodifiers Return
+sleep 1.0
+shot 33-row-typed
+[[ ! -e "$WS/zz-row-double.md" ]] \
+  || fail "a double click on a row made a new file in the root"
+pass "a double click on a row does not start a new file"
+
+# 18. The space the entries do not fill is the folder the tree is showing, as
+#     in VS Code: double-clicking it asks for a name and makes the file there.
+#     The assertion is the file on disk, at the root and not in a subfolder.
+xdotool mousemove $((win_x + 83)) $((win_y + 600))
+sleep 0.3
+xdotool click --repeat 2 --delay 120 1
+sleep 1.0
+shot 34-empty-space-prompt
+[[ "$(pixels_differ 33-row-typed 34-empty-space-prompt)" -gt 1000 ]] \
+  || fail "double-clicking the empty space below the entries did not ask for a name"
+xdotool type --delay 40 'zz-empty-space.md'
+sleep 0.4
+shot 35-empty-space-typed
+[[ "$(pixels_differ 34-empty-space-prompt 35-empty-space-typed)" -gt 50 ]] \
+  || fail "the name did not reach the prompt"
+xdotool key --clearmodifiers Return
+wait_for 5 test -f "$WS/zz-empty-space.md" \
+  || fail "double-clicking the empty space did not create the file in the root"
+# The picked entry is a folder of this workspace when this runs, so a handler
+# that fell back to "the picked entry's folder" would put the file inside it.
+# Asserting the root alone would pass either way; this pins the root.
+[[ -z "$(find "$WS" -mindepth 2 -name 'zz-empty-space.md' -print -quit)" ]] \
+  || fail "the new file landed in a subfolder of the tree's root"
+sleep 0.8
+shot 36-empty-space-made
+pass "double-clicking the Explorer's empty space makes a file in the root"
+
+# 19. Toggle Side Bar in the title bar: without it, a sidebar folded away
+#     leaves its way back inside a menu. The button's place in the
+#     right-hand cluster follows the interface font size, which the zoom
+#     steps above changed, so it is found in the frame rather than at a
+#     fixed offset from the window's corner.
+read -r win_w _ <<<"$(xdotool getwindowgeometry "$WIN" |
+  awk '/Geometry/ { gsub("x", " "); print $2 }')"
+btn="$(python3 "$ROOT/scripts/e2e/title_bar_button.py" "$ART_DIR/36-empty-space-made.png" \
+  $((win_x + win_w * 3 / 4)) "$win_y" $((win_w / 4)) 40 || true)"
+[[ -n "$btn" ]] || fail "no Toggle Side Bar button in the title bar"
+read -r btn_x btn_y <<<"$btn"
+region="${win_w}x600+$((win_x + 2))+$((win_y + 60))"
+xdotool mousemove "$btn_x" "$btn_y"
+sleep 0.3
+xdotool click 1
+wait_for 5 test "$(sidebar_on)" = "false" \
+  || fail "the title bar's Toggle Side Bar button did not fold the sidebar away"
+sleep 0.8
+shot 37-sidebar-hidden
+[[ "$(region_differ 36-empty-space-made 37-sidebar-hidden "$region")" -gt 50000 ]] \
+  || fail "folding the sidebar away left the frame alone"
+xdotool click 1
+wait_for 5 test "$(sidebar_on)" = "true" \
+  || fail "the title bar's Toggle Side Bar button did not bring the sidebar back"
+sleep 0.8
+shot 38-sidebar-shown
+[[ "$(region_differ 37-sidebar-hidden 38-sidebar-shown "$region")" -gt 50000 ]] \
+  || fail "bringing the sidebar back left the frame alone"
+pass "the title bar's side bar button folds the Explorer away and back"
+
+# 20. Still alive at the end — no crash from any of the above.
 kill -0 "$APP_PID" 2>/dev/null || fail "process died during the run"
 pass "process alive at exit"
 
