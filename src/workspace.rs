@@ -1216,7 +1216,7 @@ impl Workspace {
                             cx,
                         );
                         if plain {
-                            doc.make_plain(cx);
+                            doc.reduce(cx);
                         }
                         doc
                     });
@@ -2666,8 +2666,6 @@ impl Workspace {
     /// Ask where to save, then render and write the export in the
     /// background.
     fn export(&mut self, format: ExportFormat, window: &mut Window, cx: &mut Context<Self>) {
-        self.active_document()
-            .update(cx, |doc, cx| _ = doc.refresh_source(cx));
         let doc = self.active_document().read(cx);
         let dir = default_dir(doc.dir());
         let title = doc
@@ -2684,7 +2682,7 @@ impl Workspace {
             ),
             None => suggested_file_name(doc.analysis(), extension),
         };
-        let source = doc.source().clone();
+        let source = doc.text_now(cx);
         let base_dir = doc.dir();
         let chosen = cx.prompt_for_new_path(&dir, Some(&name));
         cx.spawn_in(window, async move |_, cx| {
@@ -2719,15 +2717,13 @@ impl Workspace {
 
     /// Copy the selection, or the whole document, as formatted text.
     fn copy_rich_text(&mut self, _: &CopyRichText, window: &mut Window, cx: &mut Context<Self>) {
-        self.active_document()
-            .update(cx, |doc, cx| _ = doc.refresh_source(cx));
         let doc = self.active_document().read(cx);
         let editor = doc.editor().read(cx);
         let selection = editor.selected_range();
         let markdown = if selection.is_empty() || !AppSettings::get(cx).layout.shows_editor() {
-            doc.source().to_string()
+            doc.text_now(cx).to_string()
         } else {
-            editor.value()[selection].to_string()
+            editor.text().slice(selection).to_string()
         };
         let base_dir = doc.dir();
         let task = cx.background_executor().spawn({

@@ -59,12 +59,16 @@ pub fn load(path: &Path) -> io::Result<LoadedText> {
         };
         io::Error::new(io::ErrorKind::InvalidData, message)
     })?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let line_ending = LineEnding::detect(text);
-    let text = match line_ending {
-        LineEnding::CrLf => text.replace("\r\n", "\n"),
-        LineEnding::Lf => text.to_string(),
-    };
+    // Edit the string read from disk in place: copying it would briefly
+    // hold a large file twice.
+    let mut text = text;
+    if text.starts_with('\u{feff}') {
+        text.drain(..'\u{feff}'.len_utf8());
+    }
+    let line_ending = LineEnding::detect(&text);
+    if line_ending == LineEnding::CrLf {
+        text = text.replace("\r\n", "\n");
+    }
     Ok(LoadedText { text, line_ending })
 }
 
@@ -378,8 +382,10 @@ fn detect_indent_or(text: &str, fallback: Indent) -> Indent {
 }
 
 /// Past this size a text file is not read until the user says how to open
-/// it, the way VS Code asks before opening a very large file.
-pub const PROMPT_TEXT_BYTES: u64 = 16 * 1024 * 1024;
+/// it, as VS Code asks only for a file too big to hold comfortably. Smaller
+/// large files open straight away with costly features off (see
+/// `DocumentView::reduce`).
+pub const PROMPT_TEXT_BYTES: u64 = 512 * 1024 * 1024;
 /// Past this size a PDF or picture asks first too: it is read whole.
 pub const PROMPT_MEDIA_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -470,13 +476,23 @@ mod tests {
         let file = std::fs::File::create(&big).unwrap();
         file.set_len(PROMPT_TEXT_BYTES + 1).unwrap();
         assert_eq!(open_check(&big), OpenCheck::Large(PROMPT_TEXT_BYTES + 1));
-        // A sparse 17 MB PDF is under the media threshold.
+        // A sparse PDF under the media threshold opens without asking.
         let pdf = dir.join("d.pdf");
         std::fs::File::create(&pdf)
             .unwrap()
-            .set_len(PROMPT_TEXT_BYTES + 1)
+            .set_len(17 * 1024 * 1024)
             .unwrap();
         assert_eq!(open_check(&pdf), OpenCheck::Fine);
+        // Past the media threshold a PDF asks first too.
+        let huge_pdf = dir.join("e.pdf");
+        std::fs::File::create(&huge_pdf)
+            .unwrap()
+            .set_len(super::PROMPT_MEDIA_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            open_check(&huge_pdf),
+            OpenCheck::Large(super::PROMPT_MEDIA_BYTES + 1)
+        );
         assert_eq!(open_check(&dir.join("missing.md")), OpenCheck::Fine);
         let _ = std::fs::remove_dir_all(&dir);
     }

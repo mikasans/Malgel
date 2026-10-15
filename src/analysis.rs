@@ -29,36 +29,9 @@ impl Stats {
     /// every CJK, Hiragana, Katakana or Hangul syllable counts as one word,
     /// which matches how those languages are usually measured.
     pub fn of(source: &str) -> Self {
-        let mut words = 0;
-        let mut characters = 0;
-        let mut in_word = false;
-
-        for ch in source.chars() {
-            characters += 1;
-            if is_ideograph(ch) {
-                words += 1;
-                in_word = false;
-            } else if ch.is_alphanumeric() || (in_word && matches!(ch, '\'' | '’' | '_' | '-')) {
-                if !in_word {
-                    words += 1;
-                    in_word = true;
-                }
-            } else {
-                in_word = false;
-            }
-        }
-
-        let lines = if source.is_empty() {
-            1
-        } else {
-            source.lines().count() + usize::from(source.ends_with('\n'))
-        };
-
-        Self {
-            words,
-            characters,
-            lines,
-        }
+        let mut counter = StatsCounter::default();
+        counter.feed(source);
+        counter.finish()
     }
 
     /// Estimated reading time in whole minutes; at least one for any text.
@@ -67,6 +40,47 @@ impl Stats {
             0
         } else {
             self.words.div_ceil(READING_WORDS_PER_MINUTE)
+        }
+    }
+}
+
+/// Counts [`Stats`] over text fed in pieces.
+#[derive(Default)]
+struct StatsCounter {
+    words: usize,
+    characters: usize,
+    newlines: usize,
+    in_word: bool,
+}
+
+impl StatsCounter {
+    fn feed(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.characters += 1;
+            if ch == '\n' {
+                self.newlines += 1;
+            }
+            if is_ideograph(ch) {
+                self.words += 1;
+                self.in_word = false;
+            } else if ch.is_alphanumeric() || (self.in_word && matches!(ch, '\'' | '’' | '_' | '-'))
+            {
+                if !self.in_word {
+                    self.words += 1;
+                    self.in_word = true;
+                }
+            } else {
+                self.in_word = false;
+            }
+        }
+    }
+
+    /// Every line ends at a newline except the last, which may be empty.
+    fn finish(&self) -> Stats {
+        Stats {
+            words: self.words,
+            characters: self.characters,
+            lines: self.newlines + 1,
         }
     }
 }
@@ -214,43 +228,115 @@ impl Analysis {
 
 /// The `#` headings of `source`, outside fenced code, found line by line.
 fn scan_atx_headings(source: &str) -> Vec<Heading> {
-    let mut outline = Vec::new();
-    let mut fence: Option<&str> = None;
-    for (line_ix, line) in source.lines().enumerate() {
+    let mut scanner = HeadingScanner::default();
+    for line in source.lines() {
+        scanner.line(line);
+    }
+    scanner.outline
+}
+
+/// Finds `#` headings one line at a time, so a rope can be scanned chunk by
+/// chunk without being copied into one string.
+#[derive(Default)]
+struct HeadingScanner {
+    outline: Vec<Heading>,
+    fence: Option<&'static str>,
+    line_ix: usize,
+}
+
+impl HeadingScanner {
+    fn line(&mut self, line: &str) {
+        let line_ix = self.line_ix;
+        self.line_ix += 1;
         let trimmed = line.trim_start();
         if line.len() - trimmed.len() > 3 {
-            continue;
+            return;
         }
         for marker in ["```", "~~~"] {
             if trimmed.starts_with(marker) {
-                fence = match fence {
+                self.fence = match self.fence {
                     Some(open) if open == marker => None,
                     None => Some(marker),
                     other => other,
                 };
             }
         }
-        if fence.is_some() {
-            continue;
+        if self.fence.is_some() {
+            return;
         }
         let level = trimmed.bytes().take_while(|&b| b == b'#').count();
         if !(1..=6).contains(&level) {
-            continue;
+            return;
         }
         let rest = &trimmed[level..];
         if !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
-            continue;
+            return;
         }
         let text = rest.trim().trim_end_matches('#').trim().to_string();
         if !text.is_empty() {
-            outline.push(Heading {
+            self.outline.push(Heading {
                 level: level as u8,
                 text,
                 line: line_ix,
             });
         }
     }
-    outline
+}
+
+/// How much of one line the streamed heading scan keeps: a heading is never
+/// longer, and a file of one enormous line is not copied to look at it.
+const SCANNED_LINE_BYTES: usize = 1024;
+
+fn push_capped(line: &mut String, text: &str) {
+    let room = SCANNED_LINE_BYTES.saturating_sub(line.len());
+    if room == 0 {
+        return;
+    }
+    let mut end = text.len().min(room);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    line.push_str(&text[..end]);
+}
+
+impl Analysis {
+    /// The analysis of a large document read straight from its chunks (a
+    /// rope's), the way `of` treats any source past `FULL_PARSE_LIMIT`, but
+    /// without the document ever existing as one string. The outline is
+    /// only scanned when asked for.
+    pub fn of_chunks<'a>(chunks: impl IntoIterator<Item = &'a str>, outline: bool) -> Self {
+        let mut counter = StatsCounter::default();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut scanner = HeadingScanner::default();
+        let mut line = String::new();
+        for chunk in chunks {
+            // `str::hash` is the bytes then 0xff; SipHash does not depend on
+            // how the bytes are split between writes.
+            hasher.write(chunk.as_bytes());
+            counter.feed(chunk);
+            if outline {
+                let mut rest = chunk;
+                while let Some(newline) = rest.find('\n') {
+                    push_capped(&mut line, &rest[..newline]);
+                    scanner.line(&line);
+                    line.clear();
+                    rest = &rest[newline + 1..];
+                }
+                push_capped(&mut line, rest);
+            }
+        }
+        if !line.is_empty() {
+            scanner.line(&line);
+        }
+        hasher.write_u8(0xff);
+        let stats = counter.finish();
+        Self {
+            stats,
+            blocks: BlockIndex::new(Vec::new(), stats.lines),
+            outline: scanner.outline,
+            content_hash: hasher.finish(),
+        }
+    }
 }
 
 /// The parse options the preview uses, so block boundaries agree with the
@@ -290,6 +376,42 @@ fn plain_text(nodes: &[Node]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_chunks_agree_with_the_whole_source() {
+        let line = "# Title 标题\nsome words, don’t stop\n```\n# not a heading\n```\n## Two ##\n";
+        let source = line.repeat(FULL_PARSE_LIMIT / line.len() + 1) + "tail";
+        let whole = Analysis::of(&source);
+        // Split at awkward places: inside words, lines and characters' bytes.
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        let mut step = 7;
+        while start < source.len() {
+            let mut end = (start + step).min(source.len());
+            while !source.is_char_boundary(end) {
+                end += 1;
+            }
+            chunks.push(&source[start..end]);
+            start = end;
+            step = step * 3 % 1013 + 1;
+        }
+        let streamed = Analysis::of_chunks(chunks.iter().copied(), true);
+        assert_eq!(streamed.stats, whole.stats);
+        assert_eq!(streamed.content_hash, whole.content_hash);
+        assert_eq!(streamed.content_hash, content_hash(&source));
+        assert_eq!(streamed.outline.len(), whole.outline.len());
+        assert_eq!(streamed.outline[1].text, whole.outline[1].text);
+        assert_eq!(
+            streamed.outline.last().unwrap().line,
+            whole.outline.last().unwrap().line
+        );
+        assert!(
+            Analysis::of_chunks([source.as_str()], false)
+                .outline
+                .is_empty()
+        );
+        assert_eq!(Analysis::of_chunks([], false).stats, Stats::of(""));
+    }
 
     #[test]
     fn counts_words_across_scripts() {

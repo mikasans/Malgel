@@ -77,8 +77,44 @@ pub fn load_image(path: &Path, bytes: Vec<u8>) -> Result<(Arc<Image>, f32, f32),
         )
     })?;
     let (width, height) = probe_dimensions(&bytes, format).unwrap_or((1024., 768.));
+    // A photo of tens of megapixels would be decoded whole onto the GPU;
+    // past what any screen shows, keep a copy at display resolution instead.
+    // The layout still uses the full size, so zoom and fit are unchanged.
+    let bytes = if width * height > MAX_DECODED_PIXELS {
+        downscaled_png(&bytes, format).unwrap_or(bytes)
+    } else {
+        bytes
+    };
+    let format = if bytes.starts_with(b"\x89PNG") {
+        ImageFormat::Png
+    } else {
+        format
+    };
     let image = Arc::new(Image::from_bytes(format, bytes));
     Ok((image, width, height))
+}
+
+/// Pixels decoded for display at most: 4096 × 4096, 64 MB as RGBA.
+const MAX_DECODED_PIXELS: f32 = 4096. * 4096.;
+
+/// `bytes` decoded and scaled to fit 4096 × 4096, as PNG. The full-size
+/// bitmap exists only while this runs.
+fn downscaled_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
+    let fmt = match format {
+        ImageFormat::Png => image::ImageFormat::Png,
+        ImageFormat::Jpeg => image::ImageFormat::Jpeg,
+        ImageFormat::Webp => image::ImageFormat::WebP,
+        ImageFormat::Bmp => image::ImageFormat::Bmp,
+        ImageFormat::Tiff => image::ImageFormat::Tiff,
+        // An animated GIF would lose its frames.
+        _ => return None,
+    };
+    let decoded = image::load_from_memory_with_format(bytes, fmt).ok()?;
+    let small = decoded.resize(4096, 4096, image::imageops::FilterType::Triangle);
+    drop(decoded);
+    let mut out = std::io::Cursor::new(Vec::new());
+    small.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
 }
 
 /// Read an image's pixel dimensions without keeping the decoded bitmap.
@@ -509,6 +545,18 @@ impl Render for ImageView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_huge_picture_is_kept_at_display_resolution() {
+        let big = image::RgbImage::new(8192, 64);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(big)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let small = super::downscaled_png(png.get_ref(), gpui_kit::ImageFormat::Png).unwrap();
+        let decoded = image::load_from_memory(&small).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (4096, 32));
+    }
+
     #[test]
     fn a_wide_rgba_plot_reports_its_pixel_size() {
         // A matplotlib figure: 4050x1560 RGBA at 300 dpi. Its size must be
