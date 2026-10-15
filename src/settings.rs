@@ -89,6 +89,9 @@ pub struct Settings {
     pub confirm_drag_and_drop: bool,
     /// Show .git and the other entries VS Code hides by default.
     pub show_hidden_entries: bool,
+    /// Center the text column in a wide editor, line numbers with it (VS
+    /// Code's Centered Layout). Off: the line numbers sit at the left edge.
+    pub centered_layout: bool,
 
     /// Hide everything but the text, dimming all but the current paragraph.
     /// Lasts until turned off or Malgel quits.
@@ -110,6 +113,7 @@ impl Default for Settings {
             recent_files: Vec::new(),
             tabs: true,
             show_hidden_entries: false,
+            centered_layout: false,
             file_sidebar: false,
             outline_sidebar: false,
             spell_check: false,

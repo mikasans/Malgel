@@ -12,9 +12,9 @@ use std::{
 use gpui_kit::{
     Action, App, AppContext as _, Bounds, ClipboardEntry, ClipboardItem, Context, DispatchPhase,
     Entity, EventEmitter, FocusHandle, Focusable as _, HighlightStyle, Image,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseMoveEvent,
-    ParentElement as _, Pixels, Render, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-    Task, Window,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Render, ScrollWheelEvent,
+    SharedString, Styled as _, Subscription, Task, Window,
     base::{
         TextView, TextViewState,
         input::{Diagnostic, DiagnosticSeverity},
@@ -176,6 +176,8 @@ pub struct DocumentView {
     /// Where the caret goes once a loading tab's text arrives, reported as
     /// its cursor meanwhile so a session saved now keeps it.
     pending_cursor: usize,
+    /// The line(s) a press on the line numbers started on, while it drags.
+    gutter_anchor: Option<Range<usize>>,
     /// A Typst source's live preview: its compiler thread and the pages.
     live: Option<TypstLive>,
     _subscriptions: Vec<Subscription>,
@@ -196,7 +198,8 @@ impl DocumentView {
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language("markdown")
-                .line_number(settings.line_numbers)
+                .line_number(show_line_numbers(&settings))
+                .folding(shows_folding("markdown", settings.focus_mode))
                 .soft_wrap(settings.soft_wrap)
                 .tab_size(TabSize {
                     tab_size: 2,
@@ -276,6 +279,7 @@ impl DocumentView {
             editor_width: px(0.),
             preview_width: px(0.),
             loading: false,
+            gutter_anchor: None,
             live: None,
             pending_cursor: 0,
             _subscriptions: subscriptions,
@@ -449,6 +453,7 @@ impl DocumentView {
             editor_width: px(0.),
             preview_width: px(0.),
             loading: false,
+            gutter_anchor: None,
             live: None,
             pending_cursor: 0,
             _subscriptions: Vec::new(),
@@ -505,6 +510,7 @@ impl DocumentView {
             editor_width: px(0.),
             preview_width: px(0.),
             loading: false,
+            gutter_anchor: None,
             live: None,
             pending_cursor: 0,
             _subscriptions: Vec::new(),
@@ -769,8 +775,10 @@ impl DocumentView {
         };
         let indent = crate::document::detect_indent_for(&text, self.path.as_deref());
         self.indent = indent;
+        let focus_mode = AppSettings::get(cx).focus_mode;
         self.editor.update(cx, |editor, cx| {
             editor.set_highlighter(language, cx);
+            editor.set_folding(shows_folding(language, focus_mode), window, cx);
             editor.set_tab_size(
                 TabSize {
                     tab_size: indent.size,
@@ -965,6 +973,55 @@ impl DocumentView {
                 cx.notify();
             });
         }));
+    }
+
+    // ---------------------------------------------------------------------
+    // Line numbers
+
+    /// Whether `position` is over the line numbers (not the fold arrows).
+    fn in_line_numbers(
+        &self,
+        position: gpui_kit::Point<Pixels>,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        let settings = AppSettings::get(cx);
+        if !show_line_numbers(settings) {
+            return false;
+        }
+        let editor = self.editor.read(cx);
+        let Some(bounds) = editor.text_bounds() else {
+            return false;
+        };
+        let font_size = rems(0.875).to_pixels(window.rem_size());
+        let font = gpui_kit::font(cx.theme().mono_font_family.clone());
+        let system = window.text_system();
+        let digit = system
+            .advance(system.resolve_font(&font), font_size, '+')
+            .map(|size| size.width)
+            .unwrap_or(font_size * 0.6);
+        let digits = line_number_digits(editor.text().lines_len());
+        let right = bounds.origin.x + digit * digits as f32 + px(6.);
+        let left = bounds.origin.x - px(EDITOR_EDGE) - px(1.);
+        position.x >= left
+            && position.x < right
+            && position.y >= bounds.origin.y
+            && position.y < bounds.origin.y + bounds.size.height
+    }
+
+    /// Select from the line the gutter press started on to the caret's line.
+    fn extend_gutter_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(anchor) = self.gutter_anchor.clone() else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            let text = editor.text().to_string();
+            let line = line_range_at(&text, editor.cursor());
+            let range = anchor.start.min(line.start)..anchor.end.max(line.end);
+            if editor.selected_range() != range {
+                editor.set_selected_range(range, cx);
+            }
+        });
     }
 
     // ---------------------------------------------------------------------
@@ -1308,10 +1365,15 @@ impl DocumentView {
 
     fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let settings = AppSettings::get(cx).clone();
+        let language = if self.reduced {
+            "text"
+        } else {
+            self.highlight_language()
+        };
         self.editor.update(cx, |editor, cx| {
             editor.set_soft_wrap(settings.soft_wrap, window, cx);
-            editor.set_line_number(settings.line_numbers && !settings.focus_mode, window, cx);
-            editor.set_folding(!settings.focus_mode, window, cx);
+            editor.set_line_number(show_line_numbers(&settings), window, cx);
+            editor.set_folding(shows_folding(language, settings.focus_mode), window, cx);
         });
         self.schedule_spell_check(false, cx);
         self.focus_block = None;
@@ -2084,8 +2146,14 @@ impl DocumentView {
 
     fn render_editor(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let document = cx.weak_entity();
-        let inset = column_inset(self.pane_width(self.editor_width, window, cx), cx);
-        let focus_mode = AppSettings::get(cx).focus_mode;
+        let settings = AppSettings::get(cx);
+        let focus_mode = settings.focus_mode;
+        let (pad_left, pad_right) = editor_side_padding(
+            self.pane_width(self.editor_width, window, cx),
+            cx.theme().font_size,
+            focus_mode,
+            settings.centered_layout,
+        );
         let (menu_document, paste_document) = (document.clone(), document.clone());
         div()
             .id("editor-pane")
@@ -2097,8 +2165,49 @@ impl DocumentView {
             // The margins beside the text column belong to the editor too:
             // the editor handles the wheel over its text, this handles the
             // rest so the whole pane scrolls.
-            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, _| {
-                this.set_scroll_driver(ScrollDriver::Editor)
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                this.set_scroll_driver(ScrollDriver::Editor);
+                // Dragging down the line numbers selects whole lines.
+                if this.gutter_anchor.is_some() {
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        this.gutter_anchor = None;
+                        return;
+                    }
+                    let document = cx.entity();
+                    window.defer(cx, move |_, cx| {
+                        document.update(cx, |this, cx| this.extend_gutter_selection(cx));
+                    });
+                }
+            }))
+            // A click on a line number selects that line, as in VS Code;
+            // Shift extends the selection by whole lines. The editor moves
+            // the caret to the line first, then this widens it.
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.gutter_anchor = None;
+                if event.button != MouseButton::Left
+                    || !this.in_line_numbers(event.position, window, cx)
+                {
+                    return;
+                }
+                let editor = this.editor.read(cx);
+                let previous = editor.selected_range();
+                let shift = event.modifiers.shift;
+                let document = cx.entity();
+                window.defer(cx, move |_, cx| {
+                    document.update(cx, |this, cx| {
+                        let text = this.editor.read(cx).text().to_string();
+                        let anchor = if shift {
+                            line_range_at(&text, previous.start)
+                        } else {
+                            line_range_at(&text, this.editor.read(cx).cursor())
+                        };
+                        this.gutter_anchor = Some(anchor);
+                        this.extend_gutter_selection(cx);
+                    });
+                });
+            }))
+            .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, _, _| {
+                this.gutter_anchor = None;
             }))
             // A file dragged from the sidebar onto the text inserts a
             // Markdown link to it (VS Code's drop-into-editor); drops
@@ -2158,8 +2267,8 @@ impl DocumentView {
                     .line_height(rems(if focus_mode { 1.75 } else { 1.5 }))
                     .border_0()
                     .rounded_none()
-                    .pl(inset)
-                    .pr(inset)
+                    .pl(pad_left)
+                    .pr(pad_right)
                     .pt(if focus_mode { rems(4.) } else { rems(1.) })
                     .aria_label("Markdown source")
                     .context_menu(move |menu, _, cx| {
@@ -2656,6 +2765,55 @@ fn floor_char_boundary(text: &str, offset: usize) -> usize {
 
 /// Horizontal inset that keeps text within a readable column, centered in a
 /// pane of `width`, but never tighter than the standard pane padding.
+/// Line numbers show unless turned off, and never in focus mode — the same
+/// rule for a document opened in focus mode as for one already open.
+fn show_line_numbers(settings: &crate::settings::Settings) -> bool {
+    settings.line_numbers && !settings.focus_mode
+}
+
+/// Folding arrows: not in focus mode, and not for plain text, which has no
+/// blocks to fold.
+fn shows_folding(language: &str, focus_mode: bool) -> bool {
+    !focus_mode && language != "text"
+}
+
+/// The editor's left and right padding in a pane `width` wide. Normally the
+/// line numbers sit at the pane's left edge and the text runs to the right
+/// edge, as in VS Code; focus mode and the centered layout center a
+/// readable column instead.
+fn editor_side_padding(
+    width: Pixels,
+    rem: Pixels,
+    focus_mode: bool,
+    centered: bool,
+) -> (Pixels, Pixels) {
+    if focus_mode || centered {
+        let inset = ((width - rem * READABLE_WIDTH_REMS) / 2.).max(rem * 1.5);
+        return (inset, inset);
+    }
+    (px(EDITOR_EDGE), px(EDITOR_EDGE))
+}
+
+/// The whole line holding byte `offset`, its line break included (`\r\n`
+/// too); the last line has none. What a click on a line number selects.
+fn line_range_at(text: &str, offset: usize) -> Range<usize> {
+    let offset = offset.min(text.len());
+    let start = text[..offset].rfind('\n').map_or(0, |at| at + 1);
+    let end = text[offset..]
+        .find('\n')
+        .map_or(text.len(), |at| offset + at + 1);
+    start..end
+}
+
+/// How many digits the gutter keeps room for: three at least, up to seven,
+/// as the editor lays it out.
+fn line_number_digits(lines: usize) -> usize {
+    (lines.max(1).ilog10() as usize + 1).clamp(3, 7)
+}
+
+/// Room between the pane's edges and the gutter / text, in pixels.
+const EDITOR_EDGE: f32 = 4.;
+
 fn column_inset(width: Pixels, cx: &App) -> Pixels {
     let rem = cx.theme().font_size;
     let min = rem * 1.5;
@@ -2665,6 +2823,52 @@ fn column_inset(width: Pixels, cx: &App) -> Pixels {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_gutter_sits_at_the_left_edge_whatever_the_width() {
+        use super::{editor_side_padding, px};
+        let rem = px(16.);
+        for width in [px(800.), px(2000.)] {
+            let (left, right) = editor_side_padding(width, rem, false, false);
+            assert!(left <= px(4.) && right <= px(4.), "{width:?}");
+        }
+        let (left, _) = editor_side_padding(px(2000.), rem, false, true);
+        assert!(left > px(200.), "centered layout centers");
+        let (left, _) = editor_side_padding(px(2000.), rem, true, false);
+        assert!(left > px(200.), "focus mode centers");
+    }
+
+    #[test]
+    fn a_line_number_click_selects_the_whole_line() {
+        use super::line_range_at;
+        let text = "one\ntwo\nthree";
+        assert_eq!(&text[line_range_at(text, 5)], "two\n");
+        assert_eq!(&text[line_range_at(text, 4)], "two\n");
+        assert_eq!(&text[line_range_at(text, text.len())], "three");
+        let crlf = "a\r\nb\r\n";
+        assert_eq!(&crlf[line_range_at(crlf, 0)], "a\r\n");
+        assert_eq!(super::line_number_digits(9), 3);
+        assert_eq!(super::line_number_digits(12_000), 5);
+    }
+
+    #[test]
+    fn line_numbers_and_folding_follow_the_settings() {
+        use super::{show_line_numbers, shows_folding};
+        let mut settings = crate::settings::Settings::default();
+        assert!(show_line_numbers(&settings));
+        settings.focus_mode = true;
+        assert!(!show_line_numbers(&settings));
+        settings.focus_mode = false;
+        settings.line_numbers = false;
+        assert!(!show_line_numbers(&settings));
+        assert!(shows_folding("markdown", false));
+        assert!(shows_folding("rust", false));
+        assert!(
+            !shows_folding("text", false),
+            "plain text has nothing to fold"
+        );
+        assert!(!shows_folding("markdown", true));
+    }
+
     #[test]
     fn the_large_file_bar_promises_only_what_it_turns_on() {
         use super::{LargeFileState::*, large_file_message};
