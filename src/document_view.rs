@@ -54,6 +54,15 @@ const READABLE_WIDTH_REMS: f32 = 46.;
 /// How long typing must pause before statistics and the outline refresh.
 const ANALYSIS_DEBOUNCE: Duration = Duration::from_millis(120);
 /// How long typing must pause before spelling is checked again.
+/// Past this size a Markdown document is "large": its preview shows only the
+/// beginning, follows edits once typing pauses rather than on every key,
+/// and spelling is not checked, so typing stays responsive.
+pub const LARGE_DOCUMENT_BYTES: usize = crate::analysis::FULL_PARSE_LIMIT;
+/// How much of a large document the preview renders.
+const LARGE_PREVIEW_BYTES: usize = 256 * 1024;
+/// The analysis debounce for a large document: a pass over megabytes of
+/// text should not run between every two keys.
+const LARGE_ANALYSIS_DEBOUNCE: Duration = Duration::from_millis(600);
 const SPELL_DEBOUNCE: Duration = Duration::from_millis(400);
 /// How long typing must pause before unsaved changes are written aside.
 const RECOVERY_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -119,6 +128,10 @@ pub struct DocumentView {
     revision: usize,
     analysis: Arc<Analysis>,
     analysis_task: Option<Task<()>>,
+    /// The indentation detected when the text was loaded.
+    indent: crate::document::Indent,
+    /// Whether the preview shows only the start of a large document.
+    preview_limited: bool,
     /// A heading to show once the outline is known, from following a link.
     pending_anchor: Option<String>,
 
@@ -223,6 +236,8 @@ impl DocumentView {
             revision: 0,
             analysis: Arc::default(),
             analysis_task: None,
+            indent: crate::document::Indent::DEFAULT,
+            preview_limited: false,
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -369,6 +384,8 @@ impl DocumentView {
             revision: 0,
             analysis: Arc::new(Analysis::default()),
             analysis_task: None,
+            indent: crate::document::Indent::DEFAULT,
+            preview_limited: false,
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -417,6 +434,8 @@ impl DocumentView {
             revision: 0,
             analysis: Arc::new(Analysis::default()),
             analysis_task: None,
+            indent: crate::document::Indent::DEFAULT,
+            preview_limited: false,
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -475,6 +494,8 @@ impl DocumentView {
             revision: 0,
             analysis: Arc::new(Analysis::default()),
             analysis_task: None,
+            indent: crate::document::Indent::DEFAULT,
+            preview_limited: false,
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -535,10 +556,46 @@ impl DocumentView {
     /// document's pages are Typst's output, so saying "Markdown" beside them
     /// would name the wrong thing.
     pub fn language_label(&self) -> SharedString {
-        match self.path.as_deref().and_then(Path::extension) {
-            Some(extension) if extension.eq_ignore_ascii_case("typ") => "Typst".into(),
-            _ => "".into(),
+        crate::document::language_name(self.path.as_deref()).into()
+    }
+
+    /// The indentation the status bar names.
+    pub fn indent(&self) -> crate::document::Indent {
+        self.indent
+    }
+
+    /// Whether this text document gets the rendered preview beside it:
+    /// Markdown does, source code and other text open in the editor alone.
+    pub fn has_preview(&self) -> bool {
+        crate::document::has_markdown_preview(self.path.as_deref())
+    }
+
+    /// Whether the preview shows only the start of a large document.
+    pub fn preview_limited(&self) -> bool {
+        self.preview_limited
+    }
+
+    /// What the status bar says about a viewer instead of text statistics:
+    /// the page and zoom of a PDF, the size and zoom of an image.
+    pub fn media_status(&self, cx: &App) -> Vec<String> {
+        if let Some(pdf) = &self.pdf {
+            let pdf = pdf.read(cx);
+            let total = pdf.page_count();
+            let page = (pdf.current_page() + 1).min(total.max(1));
+            return vec![
+                format!("Page {page} of {total}"),
+                format!("{:.0}%", pdf.zoom() * 100.),
+            ];
         }
+        if let Some(image) = &self.image {
+            let image = image.read(cx);
+            let (width, height) = image.natural_size();
+            return vec![
+                format!("{width:.0} × {height:.0}"),
+                format!("{:.0}%", image.zoom() * 100.),
+            ];
+        }
+        Vec::new()
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -698,8 +755,27 @@ impl DocumentView {
         self.saved_line_ending = line_ending;
         self.dirty = false;
         self.synced_editor_scroll = None;
-        self.editor
-            .update(cx, |editor, cx| editor.set_value(text, window, cx));
+        // Like VS Code: the editor highlights the file's own language and
+        // indents the way the file already does.
+        let language = self
+            .path
+            .as_deref()
+            .filter(|path| !crate::document::is_markdown_path(path))
+            .and_then(crate::document::language_tag)
+            .unwrap_or("markdown");
+        let indent = crate::document::detect_indent(&text);
+        self.indent = indent;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_highlighter(language, cx);
+            editor.set_tab_size(
+                TabSize {
+                    tab_size: indent.size,
+                    hard_tabs: indent.hard_tabs,
+                },
+                cx,
+            );
+            editor.set_value(text, window, cx)
+        });
         // `set_value` does not emit a change event.
         self.on_text_changed(false, cx);
         self.dirty = false;
@@ -770,23 +846,22 @@ impl DocumentView {
         // Non-markdown text files render as one highlighted code block: the
         // extension picks the tree-sitter language for the preview's
         // highlighter. Markdown keeps its normal document rendering.
-        let is_markdown = self
-            .path
-            .as_deref()
-            .map(crate::document::is_markdown_path)
-            .unwrap_or(true);
-        let preview_source = if is_markdown {
-            crate::preview_ext::normalize_tab_containers(&source)
-        } else {
-            let lang = self
-                .path
-                .as_deref()
-                .and_then(crate::document::language_tag)
-                .unwrap_or("");
-            format!("````{lang}\n{source}\n````")
-        };
-        self.preview
-            .update(cx, |preview, cx| preview.set_text(&preview_source, cx));
+        // Source code and other text is not previewed at all, as in VS
+        // Code: the editor is the whole view.
+        if self.has_preview() {
+            let large = source.len() > LARGE_DOCUMENT_BYTES;
+            // A large document's preview is its beginning, refreshed once
+            // typing pauses (see `schedule_analysis`), not on every key.
+            if !(large && debounce) {
+                let preview_source = preview_source_for(&source);
+                self.preview
+                    .update(cx, |preview, cx| preview.set_text(&preview_source, cx));
+            }
+            self.preview_limited = large;
+        } else if !debounce {
+            self.preview
+                .update(cx, |preview, cx| preview.set_text("", cx));
+        }
         self.source = source;
         // Assume an edit until the analysis can tell the text matches disk.
         self.dirty = true;
@@ -802,9 +877,14 @@ impl DocumentView {
     fn schedule_analysis(&mut self, debounce: bool, cx: &mut Context<Self>) {
         let revision = self.revision;
         let source = self.source.clone();
+        let delay = if source.len() > LARGE_DOCUMENT_BYTES {
+            LARGE_ANALYSIS_DEBOUNCE
+        } else {
+            ANALYSIS_DEBOUNCE
+        };
         self.analysis_task = Some(cx.spawn(async move |this, cx| {
             if debounce {
-                cx.background_executor().timer(ANALYSIS_DEBOUNCE).await;
+                cx.background_executor().timer(delay).await;
             }
             let analysis = cx
                 .background_executor()
@@ -817,6 +897,11 @@ impl DocumentView {
                 this.dirty = analysis.content_hash != this.saved_hash;
                 this.analysis = Arc::new(analysis);
                 this.analysis_task = None;
+                if this.preview_limited && debounce {
+                    let preview_source = preview_source_for(&this.source);
+                    this.preview
+                        .update(cx, |preview, cx| preview.set_text(&preview_source, cx));
+                }
                 if this.dirty {
                     this.schedule_recovery(cx);
                 } else {
@@ -930,6 +1015,11 @@ impl DocumentView {
             }
             return;
         };
+        if self.source.len() > LARGE_DOCUMENT_BYTES {
+            // Checking megabytes on every pause would keep a core busy.
+            self.spell_task = None;
+            return;
+        }
         if self.spell_checked.as_ref() == Some(&(self.revision, language.clone())) {
             return;
         }
@@ -1435,7 +1525,11 @@ impl DocumentView {
 
     fn syncs_scrolling(&self, cx: &App) -> bool {
         let settings = AppSettings::get(cx);
-        settings.scroll_sync && settings.layout == Layout::Split && !settings.focus_mode
+        settings.scroll_sync
+            && settings.layout == Layout::Split
+            && !settings.focus_mode
+            && !self.preview_limited
+            && self.has_preview()
     }
 
     /// Scroll the preview to the block at the top of the editor.
@@ -1813,7 +1907,7 @@ impl Render for DocumentView {
             });
         }
         let settings = AppSettings::get(cx);
-        let layout = if settings.focus_mode {
+        let layout = if settings.focus_mode || !self.has_preview() {
             Layout::Editor
         } else {
             settings.layout
@@ -1835,6 +1929,26 @@ impl Render for DocumentView {
                 .into_any_element(),
         }
     }
+}
+
+/// The Markdown the preview renders for `source`: all of it, or for a large
+/// document its beginning (cut at a line) under a note saying so.
+fn preview_source_for(source: &str) -> String {
+    if source.len() <= LARGE_DOCUMENT_BYTES {
+        return crate::preview_ext::normalize_tab_containers(source);
+    }
+    let mut cut = floor_char_boundary(source, LARGE_PREVIEW_BYTES);
+    if let Some(newline) = source[..cut].rfind('\n') {
+        cut = newline + 1;
+    }
+    let megabytes = source.len() as f64 / (1024. * 1024.);
+    format!(
+        "> [!NOTE]\n> This document is {megabytes:.1} MB, too large to preview in full. \
+         The preview shows its first {} KB and follows your edits once typing pauses; \
+         the editor has all of it.\n\n{}",
+        LARGE_PREVIEW_BYTES / 1024,
+        crate::preview_ext::normalize_tab_containers(&source[..cut])
+    )
 }
 
 /// An image to add to the document.
@@ -2024,6 +2138,18 @@ fn column_inset(width: Pixels, cx: &App) -> Pixels {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_large_document_previews_its_beginning_under_a_note() {
+        let small = "# Title\n\nText.\n";
+        assert_eq!(super::preview_source_for(small), small);
+        let line = "word ".repeat(20) + "\n";
+        let big = line.repeat(super::LARGE_DOCUMENT_BYTES / line.len() + 10);
+        let preview = super::preview_source_for(&big);
+        assert!(preview.starts_with("> [!NOTE]"));
+        assert!(preview.len() < 300 * 1024, "{}", preview.len());
+        assert!(preview.ends_with('\n'), "cut at a line end");
+    }
+
     use super::*;
 
     #[test]

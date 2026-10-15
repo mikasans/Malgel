@@ -153,7 +153,7 @@ pub struct ViewDiagram(pub SharedString);
 /// no access to the workspace, so it hands the path back as an action.
 #[derive(Action, Clone, PartialEq, Deserialize)]
 #[action(namespace = malgel, no_json)]
-pub struct OpenQuickPath(pub PathBuf);
+pub struct OpenQuickPath(pub PathBuf, pub Option<usize>);
 
 /// Move the caret to the given 1-based line, the way VS Code's Go to Line
 /// (Ctrl+G) does. The palette has no access to the workspace, so it hands the

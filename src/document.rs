@@ -207,6 +207,137 @@ pub fn is_typst_path(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("typ"))
 }
 
+/// The language a file is shown as in the status bar, the way VS Code names
+/// the language mode: `Rust` for `main.rs`, `Plain Text` for a file it has
+/// no mode for. A document that has never been saved is Markdown, Malgel's
+/// own kind of document.
+pub fn language_name(path: Option<&Path>) -> &'static str {
+    let Some(path) = path else {
+        return "Markdown";
+    };
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return "Plain Text";
+    };
+    match ext.to_ascii_lowercase().as_str() {
+        "md" | "markdown" | "mdown" | "mkd" | "mkdn" => "Markdown",
+        "mdx" => "MDX",
+        "txt" => "Plain Text",
+        "typ" => "Typst",
+        "pdf" => "PDF",
+        "csv" => "CSV",
+        "tsv" => "TSV",
+        "xml" | "svg" => "XML",
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "ico" => "Image",
+        _ => match language_tag(path) {
+            Some("rust") => "Rust",
+            Some("python") => "Python",
+            Some("toml") => "TOML",
+            Some("javascript") => "JavaScript",
+            Some("typescript") => "TypeScript",
+            Some("tsx") => "TypeScript JSX",
+            Some("go") => "Go",
+            Some("c") => "C",
+            Some("cpp") => "C++",
+            Some("java") => "Java",
+            Some("ruby") => "Ruby",
+            Some("bash") => "Shell Script",
+            Some("yaml") => "YAML",
+            Some("json") => "JSON",
+            Some("html") => "HTML",
+            Some("css") => "CSS",
+            Some("kotlin") => "Kotlin",
+            Some("zig") => "Zig",
+            Some("lua") => "Lua",
+            Some("php") => "PHP",
+            Some("csharp") => "C#",
+            Some("scala") => "Scala",
+            Some("elixir") => "Elixir",
+            Some("swift") => "Swift",
+            Some("make") => "Makefile",
+            Some("cmake") => "CMake",
+            Some("proto") => "Protocol Buffers",
+            Some("diff") => "Diff",
+            _ => "Plain Text",
+        },
+    }
+}
+
+/// Whether a document at `path` gets the rendered preview beside it.
+/// Markdown does (and a document never saved, which is Markdown); source
+/// code and other text does not, the way VS Code opens a `.rs` file in an
+/// editor alone.
+pub fn has_markdown_preview(path: Option<&Path>) -> bool {
+    path.is_none_or(is_markdown_path)
+}
+
+/// How a text is indented, as VS Code's status bar reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Indent {
+    pub hard_tabs: bool,
+    pub size: usize,
+}
+
+impl Indent {
+    /// Malgel's editor default when a text gives nothing to go by.
+    pub const DEFAULT: Indent = Indent {
+        hard_tabs: false,
+        size: 2,
+    };
+
+    pub fn label(self) -> String {
+        if self.hard_tabs {
+            format!("Tab Size: {}", self.size)
+        } else {
+            format!("Spaces: {}", self.size)
+        }
+    }
+}
+
+/// Guess a text's indentation the way VS Code does: tabs if more lines open
+/// with a tab than with spaces, otherwise the most common step between the
+/// indentation of neighbouring lines. Only the first lines are read, so a
+/// huge file costs no more than a small one.
+pub fn detect_indent(text: &str) -> Indent {
+    const MAX_LINES: usize = 10_000;
+    let mut tab_lines = 0usize;
+    let mut space_lines = 0usize;
+    let mut steps = [0usize; 9];
+    let mut previous = 0usize;
+    for line in text.lines().take(MAX_LINES) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.starts_with('\t') {
+            tab_lines += 1;
+            continue;
+        }
+        let spaces = line.len() - line.trim_start_matches(' ').len();
+        if spaces > 0 {
+            space_lines += 1;
+        }
+        let step = spaces.abs_diff(previous);
+        if (2..=8).contains(&step) {
+            steps[step] += 1;
+        }
+        previous = spaces;
+    }
+    if tab_lines > space_lines {
+        return Indent {
+            hard_tabs: true,
+            size: 4,
+        };
+    }
+    // Ties go to the smaller step: 2 and 4 both explain a 4-space nest.
+    let best = (2..=8).max_by_key(|&step| (steps[step], std::cmp::Reverse(step)));
+    match best {
+        Some(size) if steps[size] > 0 => Indent {
+            hard_tabs: false,
+            size,
+        },
+        _ => Indent::DEFAULT,
+    }
+}
+
 /// The name shown for a document in the title bar and dialogs.
 pub fn display_name(path: Option<&PathBuf>) -> String {
     path.and_then(|path| path.file_name())
@@ -216,6 +347,66 @@ pub fn display_name(path: Option<&PathBuf>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn language_names_follow_the_extension() {
+        use std::path::Path;
+        assert_eq!(super::language_name(None), "Markdown");
+        assert_eq!(super::language_name(Some(Path::new("a/main.rs"))), "Rust");
+        assert_eq!(super::language_name(Some(Path::new("x.JSON"))), "JSON");
+        assert_eq!(
+            super::language_name(Some(Path::new("notes.md"))),
+            "Markdown"
+        );
+        assert_eq!(super::language_name(Some(Path::new("p.pdf"))), "PDF");
+        assert_eq!(super::language_name(Some(Path::new("p.typ"))), "Typst");
+        assert_eq!(
+            super::language_name(Some(Path::new("LICENSE"))),
+            "Plain Text"
+        );
+        assert_eq!(
+            super::language_name(Some(Path::new("a.weird"))),
+            "Plain Text"
+        );
+        assert!(super::has_markdown_preview(None));
+        assert!(super::has_markdown_preview(Some(Path::new("a.md"))));
+        assert!(!super::has_markdown_preview(Some(Path::new("a.rs"))));
+    }
+
+    #[test]
+    fn indentation_is_detected() {
+        use super::{Indent, detect_indent};
+        assert_eq!(detect_indent("a\n"), Indent::DEFAULT);
+        assert_eq!(
+            detect_indent("fn a() {\n    b();\n    if x {\n        c();\n    }\n}\n"),
+            Indent {
+                hard_tabs: false,
+                size: 4
+            }
+        );
+        assert_eq!(
+            detect_indent("- a\n  - b\n    - c\n"),
+            Indent {
+                hard_tabs: false,
+                size: 2
+            }
+        );
+        assert_eq!(
+            detect_indent("a:\n\tb\n\tc\n"),
+            Indent {
+                hard_tabs: true,
+                size: 4
+            }
+        );
+        assert_eq!(
+            Indent {
+                hard_tabs: true,
+                size: 4
+            }
+            .label(),
+            "Tab Size: 4"
+        );
+    }
+
     use super::*;
 
     #[test]

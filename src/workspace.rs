@@ -98,6 +98,90 @@ enum KeyboardTarget {
 /// the keyboard at an element that is not in the render tree — no key binding
 /// matches it and every shortcut stops working, which is what happened while a
 /// PDF was open.
+/// One row of the Quick Open picker.
+#[derive(Clone, Debug, PartialEq)]
+struct QuickOpenRow {
+    path: PathBuf,
+    label: String,
+    /// What the query has to match besides the label: the path as typed.
+    keyword: Option<String>,
+    line: Option<usize>,
+    is_dir: bool,
+}
+
+/// The picker's rows for `query`: a typed path's own file or folder entries
+/// first, then the listing (which the picker filters by itself).
+fn quick_open_rows(
+    query: &str,
+    root: &Path,
+    home: Option<&Path>,
+    listing: &[PathBuf],
+) -> Vec<QuickOpenRow> {
+    let shown = |path: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    let mut rows = Vec::new();
+    match quick_open::resolve_direct(query, root, home) {
+        Some(quick_open::Direct::File(found)) => rows.push(QuickOpenRow {
+            label: shown(&found.path),
+            keyword: Some(query.to_string()),
+            path: found.path,
+            line: found.line,
+            is_dir: false,
+        }),
+        Some(quick_open::Direct::Dir(_)) | None => {}
+    }
+    if let Some(dir) = quick_open::typed_dir(query, root, home) {
+        // What the user typed up to the folder, so `src/ma` matches
+        // `src/main.rs` however the folder was written (`~/`, absolute…).
+        let prefix = match query.rfind(['/', '\\']) {
+            Some(ix) if dir.ends_with(Path::new(&query[..ix])) || query.ends_with(['/', '\\']) => {
+                query[..=ix].to_string()
+            }
+            _ => format!("{query}/"),
+        };
+        for path in quick_open::dir_entries(&dir, quick_open::MAX_DIR_ENTRIES) {
+            if rows.iter().any(|row| row.path == path) {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            rows.push(QuickOpenRow {
+                label: shown(&path),
+                keyword: Some(format!("{prefix}{name}")),
+                is_dir: path.is_dir(),
+                path,
+                line: None,
+            });
+        }
+    }
+    rows.extend(
+        listing
+            .iter()
+            .filter(|path| !rows.iter().any(|row| &row.path == *path))
+            .map(|path| QuickOpenRow {
+                label: shown(path),
+                keyword: None,
+                path: path.clone(),
+                line: None,
+                is_dir: false,
+            })
+            .collect::<Vec<_>>(),
+    );
+    rows
+}
+
+/// Whether opening `path` reads it as text, rather than compiling it
+/// (Typst) or showing it in a viewer (PDF, image).
+fn reads_as_text(path: &std::path::Path) -> bool {
+    !document::is_typst_path(path) && !document::is_pdf_path(path) && !document::is_image_path(path)
+}
+
 fn keyboard_target(has_media: bool, shows_editor: bool, focus_mode: bool) -> KeyboardTarget {
     if has_media {
         KeyboardTarget::Media
@@ -775,6 +859,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let tabs = AppSettings::get(cx).tabs;
+        let files = paths.iter().filter(|path| !path.is_dir()).count();
+        if tabs && files > 1 && !matches!(placement, Placement::Preview) {
+            self.open_files_in_order(paths, placement, window, cx);
+            return;
+        }
         for path in paths {
             let path = path.canonicalize().unwrap_or(path);
             if path.is_dir() {
@@ -814,6 +903,90 @@ impl Workspace {
         }
     }
 
+    /// Open several files at once (`malgel a.md b.rs c.pdf`), the way VS Code
+    /// does: one tab each, in the order given, with the last one in front.
+    /// Text is read in the background first, so a quick PDF does not jump
+    /// ahead of a slower text file and steal the focus.
+    fn open_files_in_order(
+        &mut self,
+        paths: Vec<PathBuf>,
+        placement: Placement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .map(|path| path.canonicalize().unwrap_or(path))
+            .collect();
+        let task = cx.background_executor().spawn({
+            let paths = paths.clone();
+            async move {
+                paths
+                    .iter()
+                    .map(|path| reads_as_text(path).then(|| document::load(path)))
+                    .collect::<Vec<_>>()
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let loaded = task.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                let mut last = None;
+                for (path, loaded) in paths.into_iter().zip(loaded) {
+                    if path.is_dir() {
+                        this.open_paths(vec![path], placement, window, cx);
+                        continue;
+                    }
+                    if let Some(ix) = this
+                        .documents
+                        .iter()
+                        .position(|doc| doc.read(cx).path() == Some(&path))
+                    {
+                        last = Some(this.documents[ix].entity_id());
+                        continue;
+                    }
+                    match loaded {
+                        None => this.load_path(path.clone(), placement, Target::Top, window, cx),
+                        Some(Ok(loaded)) => {
+                            AppSettings::update(cx, |settings| settings.push_recent(&path));
+                            let doc = cx.new(|cx| {
+                                DocumentView::new(
+                                    loaded.text,
+                                    Some(path.clone()),
+                                    loaded.line_ending,
+                                    window,
+                                    cx,
+                                )
+                            });
+                            this.place_document(doc, placement, window, cx);
+                        }
+                        Some(Err(err)) => {
+                            AppSettings::update(cx, |settings| {
+                                settings.recent_files.retain(|recent| recent != &path)
+                            });
+                            this.notify_error(
+                                format!("Couldn’t open “{}”. {err}", display_name(Some(&path))),
+                                window,
+                                cx,
+                            );
+                            continue;
+                        }
+                    }
+                    if let Some(doc) = this
+                        .documents
+                        .iter()
+                        .find(|doc| doc.read(cx).path() == Some(&path))
+                    {
+                        last = Some(doc.entity_id());
+                    }
+                }
+                if let Some(ix) = last.and_then(|id| this.document_index(id)) {
+                    this.activate(ix, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Read `path` in the background and show it where `placement` says,
     /// landing where `target` says once it has loaded.
     fn load_path(
@@ -836,18 +1009,18 @@ impl Workspace {
                     return;
                 }
                 Err(err) => {
-                    AppSettings::update(cx, |settings| {
-                        settings.recent_files.retain(|recent| recent != &path)
-                    });
+                    // Show the source so the mistake can be fixed here, the
+                    // way VS Code opens a file whose preview fails; it stays
+                    // in the recent files, as it still exists.
                     self.notify_error(
                         format!(
-                            "Couldn’t compile “{}”. {err}",
+                            "Couldn’t compile “{}”. {err} Showing the source instead; reopen it once it compiles to see its pages.",
                             document::display_name(Some(&path))
                         ),
                         window,
                         cx,
                     );
-                    return;
+                    // Falls through to open the source as text.
                 }
             }
         }
@@ -1076,7 +1249,10 @@ impl Workspace {
         let targets: Vec<(EntityId, PathBuf, Option<DiskStamp>, u64)> = self
             .documents
             .iter()
-            .filter(|doc| !doc.read(cx).is_typst())
+            // A PDF or image is not text: reading it back as text would put
+            // its bytes into the hidden editor (and its word count into the
+            // status bar).
+            .filter(|doc| !doc.read(cx).is_typst() && !doc.read(cx).is_media())
             .filter_map(|doc| {
                 let id = doc.entity_id();
                 let doc = doc.read(cx);
@@ -2712,41 +2888,64 @@ impl Workspace {
             .update(cx, |state, cx| state.set_query("", window, cx));
         let state = self.quick_open.clone();
         let listing = files.clone();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
         window.open_dialog(cx, move |dialog, window, cx| {
             let focus = state.read(cx).focus_handle(cx);
             window.defer(cx, move |window, cx| focus.focus(window, cx));
-            let items = listing.iter().map(|path| {
-                let shown: SharedString = path
-                    .strip_prefix(&root)
-                    .unwrap_or(path.as_path())
-                    .to_string_lossy()
-                    .replace('\\', "/")
-                    .into();
-                let name: SharedString = path
+            // A query that is a path is checked directly, VS Code style: a
+            // file that exists is offered even when the listing left it out
+            // (ignored, too deep, outside the folder), and a folder lists its
+            // own entries. One `stat`, or one folder read, per keystroke.
+            let query = state.read(cx).query(cx).trim().to_string();
+            let rows = quick_open_rows(&query, &root, home.as_deref(), &listing);
+            let items = rows.iter().map(|row| {
+                let shown: SharedString = row.label.clone().into();
+                let name: SharedString = row
+                    .path
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_default()
                     .into();
-                let icon = file_icon(path);
+                let icon = if row.is_dir {
+                    IconName::Folder
+                } else {
+                    file_icon(&row.path)
+                };
+                let mut keywords = vec![shown.clone(), name];
+                if let Some(keyword) = &row.keyword {
+                    keywords.push(keyword.clone().into());
+                }
                 CommandItem::new()
-                    .label(shown.clone())
-                    .keywords([shown, name])
+                    .label(shown)
+                    .keywords(keywords)
                     .icon(Icon::new(icon))
             });
-            let picked = listing.clone();
+            let picked = rows.clone();
+            let navigate = state.clone();
             dialog.close_button(false).p_0().child(
                 Command::new(&state)
                     .bordered(false)
-                    .placeholder("Search files by name")
+                    .placeholder("Search files by name, or type a path")
                     .max_h(rems(24.))
                     .items(items)
                     .empty(|_, _, _| "No matching files")
+                    // The rows depend on the query when it is a path, so the
+                    // dialog is drawn again as it changes.
+                    .on_query(|_, window, _| window.refresh())
                     .on_confirm(move |index: IndexPath, window, cx| {
-                        window.close_dialog(cx);
-                        let Some(path) = picked.get(index.row).cloned() else {
+                        let Some(row) = picked.get(index.row).cloned() else {
                             return;
                         };
-                        window.dispatch_action(Box::new(OpenQuickPath(path)), cx);
+                        if row.is_dir {
+                            // Into the folder, as VS Code's picker does.
+                            let mut typed = row.label.clone();
+                            typed.push('/');
+                            navigate.update(cx, |state, cx| state.set_query(typed, window, cx));
+                            window.refresh();
+                            return;
+                        }
+                        window.close_dialog(cx);
+                        window.dispatch_action(Box::new(OpenQuickPath(row.path, row.line)), cx);
                     })
                     .on_cancel(|window, cx| window.close_dialog(cx)),
             )
@@ -2760,7 +2959,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_paths(vec![action.0.clone()], Placement::Default, window, cx);
+        let path = action.0.canonicalize().unwrap_or_else(|_| action.0.clone());
+        let Some(line) = action.1 else {
+            self.open_paths(vec![path], Placement::Default, window, cx);
+            return;
+        };
+        // `file:12` from Quick Open lands on the line, as in VS Code.
+        if let Some(ix) = self
+            .documents
+            .iter()
+            .position(|doc| doc.read(cx).path() == Some(&path))
+        {
+            self.activate(ix, window, cx);
+            let doc = self.documents[ix].clone();
+            doc.update(cx, |doc, cx| doc.go_to_line(line, window, cx));
+            return;
+        }
+        self.load_path(path, Placement::Default, Target::Line(line), window, cx);
     }
 
     /// Show every command in one searchable list, the way VS Code's Show All
@@ -3544,17 +3759,30 @@ impl Workspace {
             )
     }
 
-    fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_status_bar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let doc = self.active_document().read(cx);
+        let settings = AppSettings::get(cx);
+        let muted = cx.theme().muted_foreground;
+        let item = |text: String| div().text_color(muted).child(text);
+        let language = item(doc.language_label().to_string());
+
+        // A viewer has no text: no words, caret, line ending or indent to
+        // report. It says where you are in it instead, as VS Code's image
+        // preview names the picture's size and zoom.
+        if doc.is_media() {
+            let status = doc.media_status(cx);
+            return StatusBar::new()
+                .left(h_flex().gap_4().children(status.into_iter().map(item)))
+                .right(h_flex().gap_4().child(language))
+                .into_any_element();
+        }
+
         let stats = doc.analysis().stats;
         let editor = doc.editor().read(cx);
         let position = editor.cursor_position();
         let selection = editor.selected_range();
         let line_ending = doc.line_ending();
-        let settings = AppSettings::get(cx);
-        let muted = cx.theme().muted_foreground;
-        let item = |text: String| div().text_color(muted).child(text);
-
+        let shows_editor = settings.layout.shows_editor() || !doc.has_preview();
         StatusBar::new()
             .left(
                 h_flex()
@@ -3575,12 +3803,15 @@ impl Workspace {
                     )))
                     .when(stats.words > 0, |this| {
                         this.child(item(format!("{} min read", stats.reading_minutes())))
+                    })
+                    .when(doc.preview_limited(), |this| {
+                        this.child(item("Preview limited (large file)".to_string()))
                     }),
             )
             .right(
                 h_flex()
                     .gap_4()
-                    .when(settings.layout.shows_editor(), |this| {
+                    .when(shows_editor, |this| {
                         this.child(item(if selection.is_empty() {
                             format!("Ln {}, Col {}", position.line + 1, position.character + 1)
                         } else {
@@ -3601,35 +3832,26 @@ impl Workspace {
                                 .replace('_', "-"),
                         ))
                     })
+                    // The indentation the file uses, detected when it was
+                    // read, as VS Code reports it.
+                    .child(item(doc.indent().label()))
                     // VS Code's status bar switches the line ending when its
                     // EOL item is clicked; Malgel toggles LF and CRLF there
-                    // too. A media viewer has no text to re-save, so it keeps
-                    // a plain label.
-                    .when(doc.is_media(), |this| {
-                        this.child(item(line_ending.label().to_string()))
-                    })
-                    .when(!doc.is_media(), |this| {
-                        this.child(
-                            Button::new("line-ending")
-                                .ghost()
-                                .xsmall()
-                                .compact()
-                                .label(line_ending.label())
-                                .tooltip("Select End of Line Sequence")
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(ToggleLineEnding), cx)
-                                }),
-                        )
-                    })
-                    .child(item("Spaces: 2".to_string()))
-                    // The language the document is, or the one its preview
-                    // came from: a Typst document's pages are Typst's, not
-                    // Markdown's, whatever the editor's own mode.
-                    .child(match doc.language_label().as_str() {
-                        "" => item("Markdown".to_string()),
-                        label => item(label.to_string()),
-                    }),
+                    // too.
+                    .child(
+                        Button::new("line-ending")
+                            .ghost()
+                            .xsmall()
+                            .compact()
+                            .label(line_ending.label())
+                            .tooltip("Select End of Line Sequence")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(ToggleLineEnding), cx)
+                            }),
+                    )
+                    .child(language),
             )
+            .into_any_element()
     }
 }
 
@@ -4458,6 +4680,41 @@ pub fn restored_bounds(cx: &App) -> Option<WindowBounds> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn several_files_read_text_first_and_viewers_inline() {
+        use std::path::Path;
+        assert!(super::reads_as_text(Path::new("a.md")));
+        assert!(super::reads_as_text(Path::new("main.rs")));
+        assert!(!super::reads_as_text(Path::new("a.pdf")));
+        assert!(!super::reads_as_text(Path::new("a.png")));
+        assert!(!super::reads_as_text(Path::new("a.typ")));
+    }
+
+    #[test]
+    fn quick_open_offers_a_typed_path_the_listing_left_out() {
+        let root = std::env::temp_dir().join(format!("malgel-qo-rows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("build/out.txt"), "x").unwrap();
+        std::fs::write(root.join("secret.md"), "x").unwrap();
+        std::fs::write(root.join("notes.md"), "x").unwrap();
+        let listing = vec![root.join("notes.md")];
+
+        let rows = super::quick_open_rows("secret.md:4", &root, None, &listing);
+        assert_eq!(rows[0].path, root.join("secret.md"));
+        assert_eq!(rows[0].line, Some(4));
+        assert_eq!(rows.len(), 2, "the typed file, then the listing");
+
+        let rows = super::quick_open_rows("build/", &root, None, &listing);
+        assert_eq!(rows[0].path, root.join("build/out.txt"));
+        assert_eq!(rows[0].keyword.as_deref(), Some("build/out.txt"));
+
+        // A plain word only searches the listing.
+        let rows = super::quick_open_rows("note", &root, None, &listing);
+        assert_eq!(rows.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     #[test]
