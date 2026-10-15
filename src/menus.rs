@@ -145,6 +145,8 @@ pub fn build(cx: &App) -> Vec<Menu> {
         MenuItem::action("Paste", Paste),
         MenuItem::action("Select all", SelectAll),
         MenuItem::separator(),
+        MenuItem::action("Toggle line comment", ToggleLineComment),
+        MenuItem::separator(),
         MenuItem::action("Find…", Search),
         MenuItem::action("Find in files…", FindInFiles),
         MenuItem::action("Replace…", Replace),

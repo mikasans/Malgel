@@ -216,6 +216,152 @@ pub fn toggle_block(text: &str, selection: Range<usize>, style: Block) -> Edit {
     }
 }
 
+/// How a language comments out a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentStyle {
+    /// A marker that runs to the end of the line, such as `//` or `#`.
+    Line(&'static str),
+    /// A marker pair around the line, such as `<!--` and `-->`.
+    Wrap(&'static str, &'static str),
+}
+
+/// The comment style for a file with extension `ext` (lowercase), as VS Code
+/// would toggle it; `None` for plain text, which has no comments.
+pub fn comment_style(ext: Option<&str>) -> Option<CommentStyle> {
+    use CommentStyle::*;
+    Some(match ext? {
+        "md" | "markdown" | "mdown" | "mkd" | "html" | "htm" | "xml" | "svg" | "vue" => {
+            Wrap("<!--", "-->")
+        }
+        "css" | "scss" | "less" => Wrap("/*", "*/"),
+        "rs" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" | "go" | "c" | "h"
+        | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "java" | "kt" | "kts" | "zig" | "php" | "cs"
+        | "scala" | "swift" | "proto" | "typ" | "jsonc" | "dart" => Line("//"),
+        "py" | "rb" | "sh" | "bash" | "zsh" | "yml" | "yaml" | "toml" | "ex" | "exs" | "mk"
+        | "mak" | "cmake" | "r" | "pl" | "conf" | "ini" | "nix" | "tf" | "dockerfile" => Line("#"),
+        "lua" | "sql" | "hs" => Line("--"),
+        "tex" | "sty" | "bib" => Line("%"),
+        _ => return None,
+    })
+}
+
+/// Comment out the lines the selection touches, or uncomment them when every
+/// non-blank one already is (VS Code's Toggle Line Comment). The marker goes
+/// at the block's smallest indent; blank lines are left alone; the whole
+/// change is one edit, so one undo step.
+pub fn toggle_line_comment(
+    text: &str,
+    selection: Range<usize>,
+    style: CommentStyle,
+) -> Option<Edit> {
+    let len = text.len();
+    let start = selection.start.min(len);
+    let end = selection.end.min(len);
+    let block_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
+    // A selection that ends where a line begins does not reach into it.
+    let last_offset = if end > start && text[..end].ends_with('\n') {
+        end - 1
+    } else {
+        end
+    };
+    let block_end = text[last_offset.max(block_start)..]
+        .find('\n')
+        .map_or(len, |at| last_offset.max(block_start) + at);
+    let block = &text[block_start..block_end];
+    let lines: Vec<&str> = block.split('\n').collect();
+    let indent_of = |line: &str| line.len() - line.trim_start_matches([' ', '\t']).len();
+    let filled: Vec<&&str> = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if filled.is_empty() {
+        return None;
+    }
+    let commented = |line: &str| {
+        let body = line.trim_start_matches([' ', '\t']);
+        match style {
+            CommentStyle::Line(mark) => body.starts_with(mark),
+            CommentStyle::Wrap(open, close) => {
+                body.starts_with(open) && body.trim_end().ends_with(close)
+            }
+        }
+    };
+    let uncomment = filled.iter().all(|line| commented(line));
+    let column = filled.iter().map(|line| indent_of(line)).min().unwrap_or(0);
+    // Each line's new text, the column where it changed, and how many bytes
+    // that inserted (+) or removed (-) before the body.
+    let edited: Vec<(String, usize, isize)> = lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                return (line.to_string(), 0, 0);
+            }
+            if uncomment {
+                let at = indent_of(line);
+                let (indent, body) = line.split_at(at);
+                let (mark, close) = match style {
+                    CommentStyle::Line(mark) => (mark, ""),
+                    CommentStyle::Wrap(open, close) => (open, close),
+                };
+                let mut rest = &body[mark.len()..];
+                let mut removed = mark.len();
+                if let Some(stripped) = rest.strip_prefix(' ') {
+                    rest = stripped;
+                    removed += 1;
+                }
+                if !close.is_empty() {
+                    let inner = rest.trim_end();
+                    let inner = &inner[..inner.len() - close.len()];
+                    rest = inner.strip_suffix(' ').unwrap_or(inner);
+                }
+                (format!("{indent}{rest}"), at, -(removed as isize))
+            } else {
+                let (indent, body) = line.split_at(column.min(line.len()));
+                let (text, added) = match style {
+                    CommentStyle::Line(mark) => (format!("{indent}{mark} {body}"), mark.len() + 1),
+                    CommentStyle::Wrap(open, close) => {
+                        (format!("{indent}{open} {body} {close}"), open.len() + 1)
+                    }
+                };
+                (text, column, added as isize)
+            }
+        })
+        .collect();
+    let new_lines: Vec<&str> = edited.iter().map(|(line, _, _)| line.as_str()).collect();
+    let new_block = new_lines.join("\n");
+    let new_end = block_start + new_block.len();
+    let selection = if start == end {
+        // The caret stays on the same character of its line.
+        let line_ix = text[block_start..start].matches('\n').count();
+        let old_line_start = block_start
+            + lines[..line_ix]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum::<usize>();
+        let new_line_start = block_start
+            + new_lines[..line_ix]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum::<usize>();
+        let (line, at, delta) = &edited[line_ix];
+        let col = start - old_line_start;
+        let col = if col >= *at {
+            (col as isize + delta).max(*at as isize) as usize
+        } else {
+            col
+        };
+        let caret = new_line_start + col.min(line.len());
+        caret..caret
+    } else {
+        block_start..new_end
+    };
+    Some(Edit {
+        range: block_start..block_end,
+        text: new_block,
+        selection,
+    })
+}
+
 /// Which way a block of lines moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineMove {
@@ -379,6 +525,41 @@ fn clamp(text: &str, range: Range<usize>) -> Range<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn toggles_line_comments_at_the_smallest_indent() {
+        use super::{CommentStyle::*, toggle_line_comment};
+        let apply = |text: &str, sel: std::ops::Range<usize>, style| {
+            let edit = toggle_line_comment(text, sel, style).unwrap();
+            let mut out = text.to_string();
+            out.replace_range(edit.range.clone(), &edit.text);
+            (out, edit.selection)
+        };
+        // Multi-line, nested indent, blank line untouched; then back.
+        let text = "fn f() {\n    a();\n\n        b();\n}\n";
+        let sel = 9..text.find("b();").unwrap();
+        let (on, sel_on) = apply(text, sel, Line("//"));
+        assert_eq!(on, "fn f() {\n    // a();\n\n    //     b();\n}\n");
+        let (off, _) = apply(&on, sel_on, Line("//"));
+        assert_eq!(off, text);
+        // Mixed: one line commented, one not -> comment both.
+        let (mixed, _) = apply("# a\nb\n", 0..5, Line("#"));
+        assert_eq!(mixed, "# # a\n# b\n");
+        // A selection ending at column 0 leaves the next line alone.
+        let (col0, _) = apply("a\nb\nc\n", 0..4, Line("#"));
+        assert_eq!(col0, "# a\n# b\nc\n");
+        // Markdown wraps, and unwraps.
+        let (md, sel) = apply("text\n", 2..2, Wrap("<!--", "-->"));
+        assert_eq!(md, "<!-- text -->\n");
+        assert_eq!(sel, 7..7, "caret stays on the same character");
+        let (back, _) = apply(&md, 0..0, Wrap("<!--", "-->"));
+        assert_eq!(back, "text\n");
+        // Blank-only selections do nothing.
+        assert!(toggle_line_comment("\n\n", 0..1, Line("#")).is_none());
+        assert_eq!(super::comment_style(Some("txt")), None);
+        assert_eq!(super::comment_style(Some("typ")), Some(Line("//")));
+        assert_eq!(super::comment_style(Some("py")), Some(Line("#")));
+    }
+
     use super::*;
 
     fn apply(text: &str, edit: &Edit) -> String {
