@@ -1381,6 +1381,9 @@ impl Workspace {
             } => {
                 if !doc.read(cx).is_dirty() {
                     doc.update(cx, |doc, cx| doc.reload(text, line_ending, window, cx));
+                    // A Typst source fixed in another editor turns into its
+                    // pages, as `typst watch` would show them.
+                    self.promote_typst_source(id, window, cx);
                     return;
                 }
                 if window.has_active_dialog(cx) {
@@ -2472,6 +2475,43 @@ impl Workspace {
         .detach();
     }
 
+    /// A Typst source opened as text because it did not compile: once it
+    /// compiles (saved here or changed on disk) it becomes its pages, in the
+    /// same tab, without reopening. While it still fails it stays the source.
+    fn promote_typst_source(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.document_index(id) else {
+            return;
+        };
+        let doc = self.documents[ix].read(cx);
+        if !doc.is_typst_source() || doc.is_dirty() {
+            return;
+        }
+        let Some(path) = doc.path().cloned() else {
+            return;
+        };
+        match crate::typst_preview::TypstPreview::open(&path) {
+            Ok(compiled) => {
+                let doc = cx.new(|cx| DocumentView::new_typst(path.clone(), compiled, window, cx));
+                self.replace_document_at(ix, doc, window, cx);
+                window.push_notification(
+                    Notification::info(format!(
+                        "“{}” compiles now; showing its pages.",
+                        display_name(Some(&path))
+                    )),
+                    cx,
+                );
+            }
+            Err(err) => self.notify_error(
+                format!(
+                    "“{}” still doesn’t compile. {err}",
+                    display_name(Some(&path))
+                ),
+                window,
+                cx,
+            ),
+        }
+    }
+
     /// Write `doc` to `path`; reports failures to the user.
     fn write(
         &mut self,
@@ -2482,6 +2522,7 @@ impl Workspace {
     ) -> bool {
         match doc.update(cx, |doc, cx| doc.write_to(path, cx)) {
             Ok(()) => {
+                self.promote_typst_source(doc.entity_id(), window, cx);
                 self.save_session(window, cx);
                 true
             }
