@@ -34,7 +34,7 @@ application that starts, paints and responds.
 12. Flips the line ending from the palette and saves, checking the bytes on
     disk carry carriage returns.
 13. Opens the PDF fixture and switches the viewer's page thumbnails on and off
-    from its toolbar, checking the strip takes the width it should and gives it
+    from the command palette, checking the strip takes the width it should and gives it
     back.
 14. Zooms the PDF and drags it, checking the pane moved.
 15. Opens the image viewer: a bare wheel leaves it alone, `Ctrl` plus the

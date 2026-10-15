@@ -431,9 +431,7 @@ wait_for 5 grep -q $'\r' "$WS/renamed.md" \
   || fail "the EOL toggle did not save the file with CRLF"
 pass "changing the line ending saves the file with CRLF"
 # 12. The PDF viewer: open the fixture and switch its page thumbnails on and
-#     off from the toolbar. A viewer has no text field to focus, and keyboard
-#     shortcuts do not reach one in this harness (see scripts/e2e/README.md),
-#     so this step clicks, the way a reader would.
+#     off with the "PDF page thumbnails" command.
 xdotool key --clearmodifiers ctrl+p
 sleep 0.6
 xdotool type --delay 40 'page'
@@ -442,25 +440,32 @@ sleep 2.0
 shot 20-pdf-open
 [[ "$(pixels_differ 19-search-hit-open 20-pdf-open)" -gt 1000 ]] \
   || fail "Quick Open did not open the PDF"
-# The viewer's toolbar sits under its title; the thumbnails button is the
-# leftmost thing in it, at a fixed offset from the window's own corner.
+# Toggle them through the command palette rather than by clicking a pixel
+# position: the toolbar's layout moves between releases (and with the
+# window size and theme), while the command is part of the app's contract.
+# The palette is opened with the workspace's own shortcut, which reaches the
+# window even when the viewer holds the focus.
+toggle_thumbnails() {
+  xdotool key --clearmodifiers ctrl+shift+p
+  sleep 0.6
+  xdotool type --delay 40 'page thumbnails'
+  sleep 0.4
+  xdotool key --clearmodifiers Return
+  sleep 1.2
+}
 read -r win_x win_y <<<"$(xdotool getwindowgeometry "$WIN" |
   awk '/Position/ { gsub(",", " "); print $2, $3 }')"
-xdotool mousemove $((win_x + 757)) $((win_y + 86))
-sleep 0.3
-xdotool click 1
-sleep 1.2
+toggle_thumbnails
 shot 21-pdf-thumbnails
 [[ "$(pixels_differ 20-pdf-open 21-pdf-thumbnails)" -gt 2000 ]] \
   || fail "the page thumbnails did not appear"
-xdotool click 1
-sleep 1.2
+toggle_thumbnails
 shot 22-pdf-thumbnails-off
 # Back to within a scrollbar's worth of pixels of where it started: the two
 # frames are not identical to the last pixel, but the page is back.
 [[ "$(pixels_differ 20-pdf-open 22-pdf-thumbnails-off)" -lt 1500 ]] \
   || fail "hiding the thumbnails did not put the page back"
-pass "PDF page thumbnails toggle from the toolbar"
+pass "PDF page thumbnails toggle on and off"
 
 # 13. Zoom the page in and drag it: once it is bigger than the pane, a drag
 #     has to move it, the way the diagram window already moves.
