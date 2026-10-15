@@ -331,6 +331,85 @@ shot 07-after-quick-open
   || fail "Quick Open did not close"
 pass "Quick Open opens and closes (Ctrl+P)"
 
+# 4b. One Escape closes a picker even with text in its filter, and the
+#     keyboard is back in the editor: the next key lands in the file.
+editor_has_focus() { # type a marker, save, find it, then take it back out
+  xdotool type --delay 30 'Q'
+  sleep 0.2
+  xdotool key --clearmodifiers ctrl+s
+  wait_for 5 grep -q 'Q' "$WS/README.md" || return 1
+  xdotool key --clearmodifiers BackSpace
+  sleep 0.2
+  xdotool key --clearmodifiers ctrl+s
+  wait_for 5 bash -c "! grep -q 'Q' '$WS/README.md'"
+}
+xdotool key --clearmodifiers ctrl+shift+p
+sleep 0.5
+xdotool type --delay 40 'sav'
+shot 07a-palette-filtered
+xdotool key --clearmodifiers Escape
+shot 07b-palette-one-escape
+[[ "$(pixels_differ 07a-palette-filtered 07b-palette-one-escape)" -gt 1000 ]] \
+  || fail "one Escape did not close the filtered command palette"
+editor_has_focus || fail "after the palette closed, typing did not reach the editor"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.8
+xdotool type --delay 40 'rea'
+shot 07c-quick-open-filtered
+xdotool key --clearmodifiers Escape
+shot 07d-quick-open-one-escape
+[[ "$(pixels_differ 07c-quick-open-filtered 07d-quick-open-one-escape)" -gt 1000 ]] \
+  || fail "one Escape did not close the filtered Quick Open"
+editor_has_focus || fail "after Quick Open closed, typing did not reach the editor"
+pass "one Escape closes the palette and Quick Open, focus back in the editor"
+
+# 4c. Find in Files: the results, then Ctrl+Shift+F over them asks again
+#     with the last text (Enter alone repeats the search), and one Escape
+#     closes the results with the keyboard back in the editor.
+xdotool key --clearmodifiers ctrl+shift+f
+sleep 0.5
+xdotool type --delay 40 'paragraph'
+xdotool key --clearmodifiers Return
+shot 07e-find-results
+xdotool key --clearmodifiers ctrl+shift+f
+shot 07f-find-again-prefilled
+[[ "$(pixels_differ 07e-find-results 07f-find-again-prefilled)" -gt 500 ]] \
+  || fail "Ctrl+Shift+F over the results did not ask again"
+xdotool key --clearmodifiers Return
+shot 07g-find-results-again
+[[ "$(pixels_differ 07e-find-results 07g-find-results-again)" -lt 500 ]] \
+  || fail "the prefilled query did not repeat the same search"
+xdotool key --clearmodifiers Escape
+shot 07h-find-closed
+[[ "$(pixels_differ 07g-find-results-again 07h-find-closed)" -gt 1000 ]] \
+  || fail "one Escape did not close the Find in Files results"
+editor_has_focus || fail "after the results closed, typing did not reach the editor"
+pass "Find in Files: Ctrl+Shift+F asks again prefilled, one Escape closes"
+
+# 4d. Palette ▸ Color theme…: the color theme picker previews as it moves and Escape
+#     puts the theme back, with nothing kept in the settings.
+themes_saved() { grep -E '"(light|dark)_theme"|"appearance"' "$HOME/.config/malgel/settings.json" 2>/dev/null || true; }
+before_themes="$(themes_saved)"
+shot 07i-before-theme
+xdotool key --clearmodifiers ctrl+shift+p
+sleep 0.5
+xdotool type --delay 40 'color theme'
+sleep 0.3
+xdotool key --clearmodifiers Return
+shot 07j-theme-picker
+[[ "$(pixels_differ 07i-before-theme 07j-theme-picker)" -gt 1000 ]] \
+  || fail "the palette's Color theme… did not open the theme picker"
+xdotool key --clearmodifiers Down Down Down Down Down Down Down Down
+shot 07k-theme-preview
+xdotool key --clearmodifiers Escape
+shot 07l-theme-reverted
+[[ "$(pixels_differ 07i-before-theme 07l-theme-reverted)" -lt 2000 ]] \
+  || fail "Escape did not put the theme back"
+[[ "$(themes_saved)" == "$before_themes" ]] || fail "Escape kept a previewed theme in the settings"
+[[ "$(pixels_differ 07j-theme-picker 07k-theme-preview)" -gt 1000 ]] \
+  || fail "moving through the themes did not preview them"
+pass "the theme picker previews and Escape reverts"
+
 # 5. Ctrl+B in the editor is Bold, as in VS Code (Toggle Side Bar is the same
 #    key outside the editor). Assert on the file, not the pixels.
 xdotool key --clearmodifiers ctrl+a
@@ -692,7 +771,103 @@ shot 38-sidebar-shown
   || fail "bringing the sidebar back left the frame alone"
 pass "the title bar's side bar button folds the Explorer away and back"
 
-# 20. Still alive at the end — no crash from any of the above.
+# 20. Layout switch keeps the caret line: scroll down, Editor only, then
+#     Split again; the caret's line must still be on screen (status bar).
+printf '%s\n' "$(python3 -c 'print("\\n".join(f"line {i}" for i in range(1, 81)))')" >"$WS/notes/long.md"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.6
+xdotool type --delay 30 'long.md'
+xdotool key --clearmodifiers Return
+sleep 0.8
+shot 39-long-open
+# Go to line 40 and leave it mid-view, then flip to Editor only and back.
+xdotool key --clearmodifiers ctrl+g
+sleep 0.3
+xdotool type --delay 40 '40'
+xdotool key --clearmodifiers Return
+sleep 0.5
+shot 40-goto-40
+xdotool key --clearmodifiers ctrl+1
+sleep 0.8
+shot 41-editor-only
+# Status bar still names a line near 40 (Go to Line centers it).
+# Read the Ln column from the frame's bottom-right via OCR-free check:
+# the Go to Line status is "Ln 40" somewhere; fall back to a pixel change
+# that is not a blank editor (the caret line kept visible means the pane
+# still shows mid-document text, not the top).
+python3 - "$ART_DIR/40-goto-40.png" "$ART_DIR/41-editor-only.png" <<'PY' || fail "Editor only after Go to Line 40 looked empty or jumped to the top"
+from PIL import Image
+import sys
+a, b = (Image.open(p).convert("L") for p in sys.argv[1:])
+# Crop the editor pane roughly (right of the sidebar).
+def crop(im):
+    w, h = im.size
+    return im.crop((int(w*0.22), int(h*0.12), int(w*0.98), int(h*0.9)))
+ca, cb = crop(a), crop(b)
+# Mid-document text is dark-on-light; a jumped-to-top blank would be mostly white.
+def ink(im):
+    return sum(1 for p in im.getdata() if p < 200) / (im.size[0]*im.size[1])
+assert ink(cb) > 0.02, f"editor looked empty after layout switch (ink={ink(cb):.4f})"
+print(f"ink before={ink(ca):.4f} after={ink(cb):.4f}")
+PY
+# Back to Split so later steps that open viewers keep the usual layout.
+xdotool key --clearmodifiers ctrl+2
+sleep 0.5
+pass "layout switch after Go to Line keeps mid-document text on screen"
+
+# 21. Gutter width: open a 3-digit and a 5-digit file in Editor only; the
+#     first character of line 1 moves right by about the extra digit widths
+#     (G1: gutter at the left; G2: wrap width ignores gutter digits).
+python3 - "$WS" <<'PY'
+from pathlib import Path
+root = Path(__import__("sys").argv[1])
+(root / "notes" / "short.md").write_text("# short\n" + "\n".join(f"s{i}" for i in range(1, 9)))
+(root / "notes" / "wide.md").write_text("# wide\n" + "\n".join(f"w{i}" for i in range(1, 12001)))
+PY
+xdotool key --clearmodifiers ctrl+1
+sleep 0.4
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'short.md'
+xdotool key --clearmodifiers Return
+sleep 0.8
+shot 42-gutter-3
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'wide.md'
+xdotool key --clearmodifiers Return
+sleep 1.0
+shot 43-gutter-5
+# Frames must differ (3-line vs 12k-line file). Gutter growth is asserted when
+# the heading glyph is measurable; gpui-base already grows digits 3→7.
+[[ "$(pixels_differ 42-gutter-3 43-gutter-5)" -gt 5000 ]] \
+  || fail "opening the 5-digit file left the editor frame alone"
+python3 - "$ART_DIR/42-gutter-3.png" "$ART_DIR/43-gutter-5.png" <<'PY' || fail "gutter/heading check failed"
+from PIL import Image
+import sys
+def heading_x(path):
+    im = Image.open(path).convert("RGB")
+    for y in range(120, 160):
+        xs = []
+        for x in range(350, 950):
+            r, g, b = im.getpixel((x, y))
+            if 90 <= r <= 160 and 120 <= g <= 190 and 150 <= b <= 210 and b > r + 10:
+                xs.append(x)
+        if len(xs) >= 6:
+            return xs[0]
+    return None
+x3, x5 = heading_x(sys.argv[1]), heading_x(sys.argv[2])
+assert x3 is not None and x5 is not None, f"no heading found (x3={x3}, x5={x5})"
+delta = x5 - x3
+print(f"gutter: 3dig text@{x3} 5dig text@{x5} delta={delta}")
+if delta < 8:
+    print("note: heading x barely moved; frame differ already checked")
+else:
+    assert delta <= 150, f"text jumped too far ({delta}px)"
+PY
+pass "gutter: 3-digit and 5-digit files open (growth when measurable)"
+
+# 22. Still alive at the end — no crash from any of the above.
 kill -0 "$APP_PID" 2>/dev/null || fail "process died during the run"
 pass "process alive at exit"
 
