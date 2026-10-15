@@ -256,6 +256,20 @@ sidebar_on() {
 }
 
 echo "== malgel GUI smoke =="
+# The command line answers without a window: an unknown option and a
+# missing display both fail fast with a message.
+rc=0
+"$BIN" --bogus >"$ART_DIR/cli-bogus.log" 2>&1 || rc=$?
+[[ $rc -eq 2 ]] && grep -q "unknown option '--bogus'" "$ART_DIR/cli-bogus.log" \
+  || fail "an unknown option did not exit 2 with a message (rc $rc)"
+start=$(date +%s%N)
+rc=0
+env -u DISPLAY -u WAYLAND_DISPLAY timeout 5 "$BIN" >"$ART_DIR/cli-nodisplay.log" 2>&1 || rc=$?
+elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
+[[ $rc -ne 0 && $elapsed -lt 2000 ]] && grep -q "no display found" "$ART_DIR/cli-nodisplay.log" \
+  || fail "without a display it did not fail fast with a message (rc $rc, ${elapsed} ms)"
+pass "the command line refuses unknown options and a missing display"
+
 echo "binary:   $BIN"
 echo "display:  $DISPLAY ($(xdotool getdisplaygeometry))"
 

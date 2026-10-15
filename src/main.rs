@@ -58,12 +58,33 @@ struct MainWindow {
 
 impl Global for MainWindow {}
 
-struct StdErrLogger;
+/// Platform messages logged as errors on a normal run (an X server without
+/// a pointer device, a window already gone at exit); shown only when
+/// `RUST_LOG` asks for logs.
+const BENIGN_PLATFORM_ERRORS: &[&str] = &[
+    "Found no xinput mouse pointers",
+    "DestroyWindow",
+    "clipboard",
+];
+
+fn is_benign_platform_error(target: &str, message: &str) -> bool {
+    target.starts_with("gpui")
+        && BENIGN_PLATFORM_ERRORS
+            .iter()
+            .any(|benign| message.contains(benign))
+}
+
+struct StdErrLogger {
+    quiet: bool,
+}
 impl log::Log for StdErrLogger {
     fn enabled(&self, meta: &log::Metadata) -> bool {
         meta.level() <= log::Level::Trace
     }
     fn log(&self, record: &log::Record) {
+        if self.quiet && is_benign_platform_error(record.target(), &record.args().to_string()) {
+            return;
+        }
         eprintln!(
             "[{}::{}] {}",
             record.level(),
@@ -72,6 +93,39 @@ impl log::Log for StdErrLogger {
         );
     }
     fn flush(&self) {}
+}
+
+/// The command line, parsed.
+#[derive(Debug, Default, PartialEq)]
+struct Cli {
+    help: bool,
+    version: bool,
+    new_instance: bool,
+    paths: Vec<PathBuf>,
+}
+
+/// Parse the arguments after the program name. An unknown option is an
+/// error; after `--` everything is a path.
+fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Cli, String> {
+    let mut cli = Cli::default();
+    let mut options_done = false;
+    for arg in args {
+        let text = arg.to_string_lossy();
+        if options_done || !text.starts_with('-') || text == "-" {
+            cli.paths.push(PathBuf::from(arg));
+            continue;
+        }
+        match text.as_ref() {
+            "--" => options_done = true,
+            "-h" | "--help" => cli.help = true,
+            "-V" | "--version" => cli.version = true,
+            "--new-instance" | "--new-window" => cli.new_instance = true,
+            // macOS's launcher used to add a process serial number.
+            other if other.starts_with("-psn_") => {}
+            other => return Err(format!("unknown option '{other}'")),
+        }
+    }
+    Ok(cli)
 }
 
 /// The log level `RUST_LOG` asks for (`error` … `trace`, or `target=level`
@@ -92,32 +146,46 @@ fn log_level(value: Option<&str>) -> log::LevelFilter {
 }
 
 fn main() {
-    let _ = log::set_boxed_logger(Box::new(StdErrLogger));
+    let _ = log::set_boxed_logger(Box::new(StdErrLogger {
+        quiet: std::env::var_os("RUST_LOG").is_none(),
+    }));
     log::set_max_level(log_level(std::env::var("RUST_LOG").ok().as_deref()));
-    let flags: Vec<String> = std::env::args()
-        .skip(1)
-        .filter(|arg| arg.starts_with('-'))
-        .collect();
-    if flags.iter().any(|flag| flag == "--help" || flag == "-h") {
+    let cli = match parse_args(std::env::args_os().skip(1)) {
+        Ok(cli) => cli,
+        Err(message) => {
+            eprintln!("malgel: {message} (see --help)");
+            std::process::exit(2);
+        }
+    };
+    if cli.help {
         println!(
-            "Malgel {}\n\nUsage: malgel [OPTIONS] [FILE|FOLDER]...\n\n\
+            "Malgel {}\n\nUsage: malgel [OPTIONS] [--] [FILE|FOLDER]...\n\n\
              Options:\n  \
              --new-instance  Open a new window instead of handing the files to the running Malgel\n  \
              -h, --help      Show this help\n  \
-             -V, --version   Show the version",
+             -V, --version   Show the version\n  \
+             --              Treat every argument after it as a file, even one starting with '-'",
             env!("CARGO_PKG_VERSION")
         );
         return;
     }
-    if flags.iter().any(|flag| flag == "--version" || flag == "-V") {
+    if cli.version {
         println!("Malgel {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    let new_instance = flags.iter().any(|flag| flag == "--new-instance");
-    let paths: Vec<PathBuf> = std::env::args_os()
-        .skip(1)
-        .filter(|arg| !arg.to_string_lossy().starts_with('-'))
-        .map(PathBuf::from)
+    // Without a display the window can never appear; say so at once rather
+    // than failing deep in the platform layer.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISPLAY").is_none_or(|v| v.is_empty())
+        && std::env::var_os("WAYLAND_DISPLAY").is_none_or(|v| v.is_empty())
+    {
+        eprintln!("malgel: no display found (DISPLAY/WAYLAND_DISPLAY unset)");
+        std::process::exit(1);
+    }
+    let new_instance = cli.new_instance;
+    let paths: Vec<PathBuf> = cli
+        .paths
+        .into_iter()
         .map(|path| path.canonicalize().unwrap_or(path))
         .collect();
 
@@ -293,11 +361,39 @@ fn with_window(cx: &mut App, f: impl FnOnce(&mut gpui_kit::Window, &mut App)) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn options_are_known_or_refused() {
+        use super::parse_args;
+        let args = |list: &[&str]| parse_args(list.iter().map(std::ffi::OsString::from));
+        assert_eq!(args(&["--bogus"]).unwrap_err(), "unknown option '--bogus'");
+        let cli = args(&["--new-instance", "a.md", "--", "--weird.md", "-h"]).unwrap();
+        assert!(cli.new_instance && !cli.help);
+        assert_eq!(
+            cli.paths,
+            ["a.md", "--weird.md", "-h"].map(std::path::PathBuf::from)
+        );
+        assert!(args(&["-V"]).unwrap().version);
+        assert!(args(&["--help"]).unwrap().help);
+    }
+
+    #[test]
     fn rust_log_sets_the_level_it_names() {
         use log::LevelFilter::*;
         assert_eq!(super::log_level(None), Warn);
         assert_eq!(super::log_level(Some("info")), Info);
         assert_eq!(super::log_level(Some("malgel=debug,gpui=error")), Debug);
         assert_eq!(super::log_level(Some("nonsense")), Warn);
+    }
+
+    #[test]
+    fn known_platform_noise_is_recognised() {
+        assert!(super::is_benign_platform_error(
+            "gpui_linux::linux::x11::client",
+            "Found no xinput mouse pointers."
+        ));
+        assert!(!super::is_benign_platform_error(
+            "gpui_linux::linux::x11::client",
+            "failed to open display"
+        ));
+        assert!(!super::is_benign_platform_error("malgel", "clipboard"));
     }
 }
