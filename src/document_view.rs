@@ -619,10 +619,16 @@ impl DocumentView {
     /// outline come back for a large file.
     pub fn enable_anyway(&mut self, cx: &mut Context<Self>) {
         self.reduced = false;
-        let language = self.highlight_language();
-        self.editor
-            .update(cx, |editor, cx| editor.set_highlighter(language, cx));
+        // Highlighting parses the whole text on the UI thread, which froze
+        // the window for 15 s on a 20 MB file: past the large-file size it
+        // stays off, as VS Code keeps tokenization off past its limit.
+        if self.editor.read(cx).text().len() <= LARGE_DOCUMENT_BYTES {
+            let language = self.highlight_language();
+            self.editor
+                .update(cx, |editor, cx| editor.set_highlighter(language, cx));
+        }
         self.on_text_changed(false, cx);
+        self.schedule_analysis(false, cx);
     }
 
     /// The tree-sitter language the editor highlights this file with.
@@ -1051,19 +1057,22 @@ impl DocumentView {
         let revision = self.revision;
         self.recovery_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RECOVERY_DEBOUNCE).await;
-            let Ok(Some((id, recovery))) = this.read_with(cx, |this, cx| {
+            // A large document lends a clone of its rope (shared nodes, no
+            // copy); the snapshot is streamed from its chunks to the file.
+            let Ok(Some((id, recovery, rope))) = this.read_with(cx, |this, cx| {
                 (this.dirty && this.revision == revision).then(|| {
                     (
                         this.recovery_id.clone(),
                         Recovery {
                             path: this.path.clone(),
                             text: if this.large {
-                                this.editor.read(cx).text().to_string()
+                                String::new()
                             } else {
                                 this.source.to_string()
                             },
                             crlf: this.line_ending == LineEnding::CrLf,
                         },
+                        this.large.then(|| this.editor.read(cx).text().clone()),
                     )
                 })
             }) else {
@@ -1071,7 +1080,13 @@ impl DocumentView {
             };
             let written = cx
                 .background_executor()
-                .spawn(async move { session::write_recovery(&id, &recovery).is_ok() })
+                .spawn(async move {
+                    match rope {
+                        Some(rope) => session::write_recovery_chunks(&id, &recovery, rope.chunks()),
+                        None => session::write_recovery(&id, &recovery),
+                    }
+                    .is_ok()
+                })
                 .await;
             _ = this.update(cx, |this, _| {
                 this.recovery_written |= written;
@@ -1810,16 +1825,27 @@ impl DocumentView {
             .bg(cx.theme().secondary)
             .text_sm()
             .text_color(cx.theme().muted_foreground)
-            .child(div().flex_1().child(format!(
-                "Large file ({megabytes:.1} MB): highlighting, preview, outline and spell \
-                 checking are off to save memory."
-            )))
-            .child(
-                Button::new("enable-large-file-features")
-                    .label("Enable anyway")
-                    .ghost()
-                    .on_click(cx.listener(|this, _, _, cx| this.enable_anyway(cx))),
-            )
+            .child(div().flex_1().child(if self.reduced {
+                format!(
+                    "Large file ({megabytes:.1} MB): highlighting, preview, outline and spell \
+                     checking are off to save memory."
+                )
+            } else if self.analysis_task.is_some() {
+                format!("Large file ({megabytes:.1} MB): building the outline and preview…")
+            } else {
+                format!(
+                    "Large file ({megabytes:.1} MB): preview (of the beginning) and outline \
+                     are on; highlighting and spell checking stay off at this size."
+                )
+            }))
+            .when(self.reduced, |bar| {
+                bar.child(
+                    Button::new("enable-large-file-features")
+                        .label("Enable anyway")
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| this.enable_anyway(cx))),
+                )
+            })
     }
 
     fn render_editor(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2069,7 +2095,7 @@ impl Render for DocumentView {
                 )
                 .into_any_element(),
         };
-        if !(self.large && self.reduced) {
+        if !self.large {
             return body;
         }
         v_flex()
