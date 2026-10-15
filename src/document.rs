@@ -3,9 +3,11 @@
 use std::{
     fs,
     io::{self, Write as _},
-    os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 
 /// Line ending convention detected when a file is opened, restored on save.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -188,9 +190,20 @@ pub fn save_encoded(
     // Symlinks and hard links must be written through in place: a temp+rename
     // would replace the link with a new regular file.
     let meta = fs::symlink_metadata(path).ok();
-    let write_in_place = meta
-        .as_ref()
-        .is_some_and(|m| m.file_type().is_symlink() || m.nlink() > 1);
+    let write_in_place = meta.as_ref().is_some_and(|m| {
+        if m.file_type().is_symlink() {
+            return true;
+        }
+        // Hard links: rewrite in place so we do not break the other names.
+        #[cfg(unix)]
+        {
+            m.nlink() > 1
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    });
     if path.exists() {
         let perms = meta
             .as_ref()
