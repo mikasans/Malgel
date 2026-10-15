@@ -1435,7 +1435,18 @@ impl Render for FileTree {
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "Files".to_string());
 
+        let full_path: SharedString = self
+            .root
+            .as_ref()
+            .map(|root| root.display().to_string())
+            .unwrap_or_default()
+            .into();
+        // As in VS Code: the folder's name in small capitals, its full path
+        // on hover, and the header's actions only while the pointer is over
+        // it, so a narrow sidebar has room for the name.
         let header = h_flex()
+            .group("tree-header")
+            .gap_1()
             .h(px(32.))
             .pl_3()
             .pr_1()
@@ -1444,10 +1455,26 @@ impl Render for FileTree {
             .text_xs()
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.muted_foreground)
-            .child(div().truncate().child(name.to_uppercase()))
+            .child(
+                div()
+                    .id("tree-root-name")
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .child(name.to_uppercase())
+                    .when(!full_path.is_empty(), |name| {
+                        name.tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(full_path.clone())
+                                .build(window, cx)
+                        })
+                    }),
+            )
             .child(
                 h_flex()
+                    .flex_none()
                     .items_center()
+                    .invisible()
+                    .group_hover("tree-header", |style| style.visible())
                     .child(
                         Button::new("new-file")
                             .ghost()

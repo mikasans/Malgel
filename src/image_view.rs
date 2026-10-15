@@ -571,6 +571,18 @@ mod tests {
     }
 
     #[test]
+    fn a_huge_16_bit_picture_is_scaled_too() {
+        let big = image::ImageBuffer::<image::Rgb<u16>, _>::new(8192, 64);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb16(big)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let small = super::downscaled_png(png.get_ref(), gpui_kit::ImageFormat::Png).unwrap();
+        let decoded = image::load_from_memory(&small).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (4096, 32));
+    }
+
+    #[test]
     fn a_wide_rgba_plot_reports_its_pixel_size() {
         // A matplotlib figure: 4050x1560 RGBA at 300 dpi. Its size must be
         // read from the file, so Fit Page can scale it into the pane.
