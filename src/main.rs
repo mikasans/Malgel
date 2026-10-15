@@ -29,6 +29,7 @@ mod rich_copy;
 mod search;
 mod session;
 mod settings;
+mod single_instance;
 mod smart_edit;
 mod spell;
 mod themes;
@@ -37,9 +38,6 @@ mod typst_world;
 mod workspace;
 mod zoom;
 
-use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
 
 use futures::StreamExt as _;
@@ -76,13 +74,46 @@ impl log::Log for StdErrLogger {
     fn flush(&self) {}
 }
 
+/// The log level `RUST_LOG` asks for (`error` … `trace`, or `target=level`
+/// pairs, of which the most verbose counts); warnings by default.
+fn log_level(value: Option<&str>) -> log::LevelFilter {
+    value
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|part| {
+            part.rsplit('=')
+                .next()?
+                .trim()
+                .parse::<log::LevelFilter>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(log::LevelFilter::Warn)
+}
+
 fn main() {
     let _ = log::set_boxed_logger(Box::new(StdErrLogger));
-    let level = match std::env::var("RUST_LOG") {
-        Ok(_) => log::LevelFilter::Trace,
-        Err(_) => log::LevelFilter::Warn,
-    };
-    log::set_max_level(level);
+    log::set_max_level(log_level(std::env::var("RUST_LOG").ok().as_deref()));
+    let flags: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|arg| arg.starts_with('-'))
+        .collect();
+    if flags.iter().any(|flag| flag == "--help" || flag == "-h") {
+        println!(
+            "Malgel {}\n\nUsage: malgel [OPTIONS] [FILE|FOLDER]...\n\n\
+             Options:\n  \
+             --new-instance  Open a new window instead of handing the files to the running Malgel\n  \
+             -h, --help      Show this help\n  \
+             -V, --version   Show the version",
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
+    if flags.iter().any(|flag| flag == "--version" || flag == "-V") {
+        println!("Malgel {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    let new_instance = flags.iter().any(|flag| flag == "--new-instance");
     let paths: Vec<PathBuf> = std::env::args_os()
         .skip(1)
         .filter(|arg| !arg.to_string_lossy().starts_with('-'))
@@ -92,7 +123,11 @@ fn main() {
 
     // A second launch hands its arguments to the running instance and exits,
     // the way VS Code wakes the existing window.
-    if forward_to_running_instance(&paths) {
+    if !new_instance && single_instance::forward(&paths) {
+        eprintln!(
+            "malgel: handed over to the Malgel already running in this session; \
+             pass --new-instance to open another window"
+        );
         return;
     }
 
@@ -101,7 +136,8 @@ fn main() {
     let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<Vec<PathBuf>>();
     {
         let cli_tx = open_tx.clone();
-        std::thread::spawn(move || listen_for_cli(cli_tx));
+        // A new instance still takes later launches of this session.
+        std::thread::spawn(move || single_instance::listen(cli_tx));
     }
     let application = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
     application.on_open_urls(move |urls| {
@@ -254,71 +290,14 @@ fn with_window(cx: &mut App, f: impl FnOnce(&mut gpui_kit::Window, &mut App)) {
     _ = window.update(cx, |_, window, cx| f(window, cx));
 }
 
-/// Ports the first instance listens on; a second launch probes these.
-const CLI_PORTS: [u16; 10] = [
-    47615, 47616, 47617, 47618, 47619, 47620, 47621, 47622, 47623, 47624,
-];
-const CLI_MAGIC: &str = "malgel-cli-v1";
-
-/// Hand `paths` to the running instance; `true` when it acknowledged.
-fn forward_to_running_instance(paths: &[PathBuf]) -> bool {
-    for port in CLI_PORTS {
-        let Ok(mut stream) = TcpStream::connect_timeout(
-            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            Duration::from_millis(250),
-        ) else {
-            continue;
-        };
-        if stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .is_err()
-        {
-            continue;
-        }
-        let mut payload = String::from(CLI_MAGIC);
-        payload.push('\n');
-        for path in paths {
-            payload.push_str(&path.to_string_lossy());
-            payload.push('\n');
-        }
-        if stream.write_all(payload.as_bytes()).is_err() {
-            continue;
-        }
-        let _ = stream.shutdown(std::net::Shutdown::Write);
-        let mut reply = String::new();
-        if stream.read_to_string(&mut reply).is_ok() && reply.contains("malgel-cli-ok") {
-            return true;
-        }
-    }
-    false
-}
-
-/// Accept forwarded launches on the first free port in `CLI_PORTS`.
-fn listen_for_cli(open_tx: futures::channel::mpsc::UnboundedSender<Vec<PathBuf>>) {
-    for port in CLI_PORTS {
-        let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) else {
-            continue;
-        };
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else {
-                continue;
-            };
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            let mut payload = String::new();
-            if stream.read_to_string(&mut payload).is_err() {
-                continue;
-            }
-            let mut lines = payload.lines();
-            if lines.next() != Some(CLI_MAGIC) {
-                continue;
-            }
-            let paths: Vec<PathBuf> = lines
-                .filter(|line| !line.is_empty())
-                .map(PathBuf::from)
-                .map(|path| path.canonicalize().unwrap_or(path))
-                .collect();
-            let _ = open_tx.unbounded_send(paths);
-            let _ = stream.write_all(b"malgel-cli-ok\n");
-        }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rust_log_sets_the_level_it_names() {
+        use log::LevelFilter::*;
+        assert_eq!(super::log_level(None), Warn);
+        assert_eq!(super::log_level(Some("info")), Info);
+        assert_eq!(super::log_level(Some("malgel=debug,gpui=error")), Debug);
+        assert_eq!(super::log_level(Some("nonsense")), Warn);
     }
 }
