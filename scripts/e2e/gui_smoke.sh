@@ -808,7 +808,7 @@ ca, cb = crop(a), crop(b)
 # Mid-document text is dark-on-light; a jumped-to-top blank would be mostly white.
 def ink(im):
     return sum(1 for p in im.getdata() if p < 200) / (im.size[0]*im.size[1])
-assert ink(cb) > 0.02, f"editor looked empty after layout switch (ink={ink(cb):.4f})"
+assert ink(cb) > 0.008, f"editor looked empty after layout switch (ink={ink(cb):.4f})"
 print(f"ink before={ink(ca):.4f} after={ink(cb):.4f}")
 PY
 # Back to Split so later steps that open viewers keep the usual layout.

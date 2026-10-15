@@ -566,6 +566,29 @@ impl Workspace {
         this
     }
 
+    /// Whether opening `paths` should restore the previous session's tabs: either
+    /// nothing was asked for, or the only argument is the same folder the session
+    /// had open (re-launching from that directory). Any other path replaces.
+    fn restores_session_for(paths: &[PathBuf], folder: Option<&Path>) -> bool {
+        if paths.is_empty() {
+            return true;
+        }
+        let Some(folder) = folder else {
+            return false;
+        };
+        if paths.len() != 1 {
+            return false;
+        }
+        let asked = paths[0].canonicalize().unwrap_or_else(|_| paths[0].clone());
+        if !asked.is_dir() {
+            return false;
+        }
+        let folder = folder
+            .canonicalize()
+            .unwrap_or_else(|_| folder.to_path_buf());
+        asked == folder
+    }
+
     /// Reopen the last session's documents and anything recovered after a
     /// crash, then the files asked for.
     fn restore(
@@ -580,7 +603,16 @@ impl Workspace {
         let previous = previous.unwrap_or_default();
         let mut active = None;
         let mut referenced = HashSet::new();
-        let mut deferred_open = paths.clone();
+        // Opening the same folder again restores its tabs; any other path
+        // (or several) replaces the session with those files. Skip re-opening
+        // the folder path only when we are actually restoring that session.
+        let same_folder = Self::restores_session_for(&paths, previous.folder.as_deref());
+        let restoring_session = settings.restore_session && same_folder;
+        let mut deferred_open = if restoring_session {
+            Vec::new()
+        } else {
+            paths.clone()
+        };
         let mut restoring: Vec<(EntityId, PathBuf, usize)> = Vec::new();
 
         for (ix, entry) in previous.documents.iter().enumerate() {
@@ -590,9 +622,7 @@ impl Workspace {
             });
             // Unsaved changes always come back; saved documents only when
             // the session is restored (just the active one without tabs).
-            let wanted = settings.restore_session
-                && paths.is_empty()
-                && (settings.tabs || ix == previous.active);
+            let wanted = restoring_session && (settings.tabs || ix == previous.active);
             let doc = match recovery {
                 Some((id, recovery)) => Some(self.restored_document(id, recovery, window, cx)),
                 None if wanted => entry.path.as_ref().and_then(|path| {
@@ -3570,28 +3600,28 @@ impl Workspace {
                     }
                 })
                 .child(esc_closes(
-                command
-                    .empty(|_, _, _| div().px_3().py_2().child("No matching commands"))
-                    .on_confirm(move |index: IndexPath, window, cx| {
-                        window.close_dialog(cx);
-                        let Some(action) = actions
-                            .get(index.section)
-                            .and_then(|group| group.get(index.row))
-                            .map(|action| action.boxed_clone())
-                        else {
-                            return;
-                        };
-                        let ws_focus = ws_focus.clone();
-                        window.defer(cx, move |window, cx| {
-                            // Put the window back on its own focus path
-                            // before dispatching, so the action reaches the
-                            // workspace that handles it.
-                            ws_focus.focus(window, cx);
-                            window.dispatch_action(action, cx);
-                        });
-                    })
-                    .on_cancel(|window, cx| window.close_dialog(cx)),
-            ))
+                    command
+                        .empty(|_, _, _| div().px_3().py_2().child("No matching commands"))
+                        .on_confirm(move |index: IndexPath, window, cx| {
+                            window.close_dialog(cx);
+                            let Some(action) = actions
+                                .get(index.section)
+                                .and_then(|group| group.get(index.row))
+                                .map(|action| action.boxed_clone())
+                            else {
+                                return;
+                            };
+                            let ws_focus = ws_focus.clone();
+                            window.defer(cx, move |window, cx| {
+                                // Put the window back on its own focus path
+                                // before dispatching, so the action reaches the
+                                // workspace that handles it.
+                                ws_focus.focus(window, cx);
+                                window.dispatch_action(action, cx);
+                            });
+                        })
+                        .on_cancel(|window, cx| window.close_dialog(cx)),
+                ))
         });
     }
 
@@ -5579,6 +5609,34 @@ mod tests {
             !pending.contains(&42),
             "after Keep/Overwrite/Reload, save may proceed"
         );
+    }
+
+    #[test]
+    fn restores_session_when_cli_dir_matches_folder() {
+        let root = std::env::temp_dir().join(format!("malgel-sess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(Workspace::restores_session_for(&[], Some(&root)));
+        assert!(Workspace::restores_session_for(
+            std::slice::from_ref(&root),
+            Some(&root),
+        ));
+        assert!(!Workspace::restores_session_for(
+            std::slice::from_ref(&other),
+            Some(&root),
+        ));
+        let file = root.join("a.md");
+        assert!(!Workspace::restores_session_for(
+            std::slice::from_ref(&file),
+            Some(&root),
+        ));
+        assert!(!Workspace::restores_session_for(
+            &[root.clone(), other.clone()],
+            Some(&root),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
