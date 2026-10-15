@@ -791,14 +791,20 @@ pass "the title bar's side bar button folds the Explorer away and back"
 
 # 20. Layout switch keeps the caret line: scroll down, Editor only, then
 #     Split again; the caret's line must still be on screen (status bar).
-printf '%s\n' "$(python3 -c 'print("\\n".join(f"line {i}" for i in range(1, 81)))')" >"$WS/notes/long.md"
+# Lines 1-25 are short and 26-80 long, so a pane showing the middle of the
+# file has far more ink than one that jumped back to the top (or is blank).
+python3 - "$WS/notes/long.md" <<'PY'
+import sys
+lines = [f"s{i}" if i <= 25 else f"line {i} " + "#" * 50 for i in range(1, 81)]
+open(sys.argv[1], "w").write("\n".join(lines) + "\n")
+PY
 xdotool key --clearmodifiers ctrl+p
 sleep 0.6
 xdotool type --delay 30 'long.md'
 xdotool key --clearmodifiers Return
 sleep 0.8
 shot 39-long-open
-# Go to line 40 and leave it mid-view, then flip to Editor only and back.
+# Go to line 40 and leave it mid-view, then flip to Editor only.
 xdotool key --clearmodifiers ctrl+g
 sleep 0.3
 xdotool type --delay 40 '40'
@@ -806,31 +812,30 @@ xdotool key --clearmodifiers Return
 sleep 0.5
 shot 40-goto-40
 xdotool key --clearmodifiers ctrl+1
-sleep 0.8
-shot 41-editor-only
-# Status bar still names a line near 40 (Go to Line centers it).
-# Read the Ln column from the frame's bottom-right via OCR-free check:
-# the Go to Line status is "Ln 40" somewhere; fall back to a pixel change
-# that is not a blank editor (the caret line kept visible means the pane
-# still shows mid-document text, not the top).
-python3 - "$ART_DIR/40-goto-40.png" "$ART_DIR/41-editor-only.png" <<'PY' || echo "note: layout ink check skipped"
+# Hard check, polled: every 200 ms for up to 3 s the editor pane must show
+# the long mid-document lines (ink well above a top-of-file or blank pane).
+editor_ink() { # editor_ink <shot>: dark-pixel share of the editor pane
+  python3 - "$ART_DIR/$1.png" <<'PY'
 from PIL import Image
 import sys
-a, b = (Image.open(p).convert("L") for p in sys.argv[1:])
-# Crop the editor pane roughly (right of the sidebar).
-def crop(im):
-    w, h = im.size
-    return im.crop((int(w*0.22), int(h*0.12), int(w*0.98), int(h*0.9)))
-ca, cb = crop(a), crop(b)
-# Mid-document text is dark-on-light; a jumped-to-top blank would be mostly white.
-# Soft on CI: some runners screenshot before the pane paints (ink≈0).
-def ink(im):
-    return sum(1 for p in im.getdata() if p < 200) / (im.size[0]*im.size[1])
-ia, ib = ink(ca), ink(cb)
-print(f"ink before={ia:.4f} after={ib:.4f}")
-if ib <= 0.008:
-    print("note: editor ink low after layout switch; frame captured, continuing")
+im = Image.open(sys.argv[1]).convert("L")
+w, h = im.size
+# Upper part of the "####" column: empty at the top of the file
+# (short sN lines), full when the middle (line 40) is on screen.
+c = im.crop((int(w * 0.40), int(h * 0.19), int(w * 0.69), int(h * 0.48)))
+px = c.tobytes()
+print(f"{sum(1 for p in px if p < 200) / len(px):.4f}")
 PY
+}
+ok=0
+for _ in $(seq 1 15); do
+  sleep 0.2
+  import -display "$DISPLAY" -window root "$ART_DIR/41-editor-only.png" 2>/dev/null
+  ink=$(editor_ink 41-editor-only)
+  if python3 -c "import sys; sys.exit(0 if float('$ink') > 0.12 else 1)"; then ok=1; break; fi
+done
+echo "editor-only ink=$ink"
+[[ $ok -eq 1 ]] || fail "Editor only after Go to Line 40 looked empty or jumped to the top (ink=$ink, see 41-editor-only.png)"
 # Back to Split so later steps that open viewers keep the usual layout.
 xdotool key --clearmodifiers ctrl+2
 sleep 0.5
