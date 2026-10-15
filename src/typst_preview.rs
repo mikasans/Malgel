@@ -39,13 +39,16 @@ use typst::{
     text::Font,
 };
 
-use crate::{pdf_view::PdfDocument, session::DiskStamp, typst_world};
+#[cfg(test)]
+use crate::pdf_view::PdfDocument;
+use crate::{session::DiskStamp, typst_world};
 
 /// The most bytes read from one file the document names. Sources and images
 /// are small; the cap keeps a document pointing at something large from
 /// pulling it all into memory.
 const MAX_NAMED_FILE_BYTES: u64 = 32 * 1024 * 1024;
 
+#[cfg(test)]
 /// What a Typst document compiles from and to: the source file, the other
 /// files it named, and the drawn pages.
 pub struct TypstPreview {
@@ -58,6 +61,7 @@ pub struct TypstPreview {
     pdf: PdfDocument,
 }
 
+#[cfg(test)]
 impl TypstPreview {
     /// Compile the Typst source at `source` into pages.
     pub fn open(source: &Path) -> Result<Self, String> {
@@ -124,12 +128,14 @@ pub fn stamp_of(paths: &[PathBuf]) -> DiskStamp {
     }
 }
 
+#[cfg(test)]
 /// Compile the source at `source`, returning the paths the compilation read
 /// (the source first) and the resulting pages.
 fn compile(source: &Path) -> Result<(Vec<PathBuf>, PdfDocument), String> {
     compile_in(source, package_folders())
 }
 
+#[cfg(test)]
 /// Compile the source at `source` with `packages` as the folders a package
 /// can come from, returning the paths the compilation read (the source
 /// first) and the resulting pages.
@@ -163,6 +169,7 @@ fn compile_in(
     Ok((read, pdf))
 }
 
+#[cfg(test)]
 /// The first diagnostic's message: the compiler's wording is already written
 /// for the person who wrote the document.
 fn first_diagnostic(errors: &[typst::diag::SourceDiagnostic]) -> String {
@@ -180,7 +187,7 @@ fn first_diagnostic(errors: &[typst::diag::SourceDiagnostic]) -> String {
 /// cannot climb out of its own directory either. A path in a package is
 /// joined onto that package's folder instead, which is where the `typst`
 /// command reads it from too.
-struct DocumentWorld {
+pub(crate) struct DocumentWorld {
     root: PathBuf,
     source: Source,
     /// The files this compilation read, for the watcher. `World`'s methods
@@ -196,6 +203,36 @@ struct DocumentWorld {
 }
 
 impl DocumentWorld {
+    /// A world for the document at `path` whose text is `text`, reading
+    /// packages from the usual folders.
+    pub(crate) fn new(path: &Path, text: String) -> Self {
+        Self {
+            root: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            source: Source::new(file_id_for(path), text),
+            read: Mutex::new(Vec::new()),
+            packages: package_folders(),
+            package_roots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Give the document new text. The source is edited rather than built
+    /// anew, so the parser reuses what did not change, and the compiler's
+    /// memoized work for unchanged parts stays valid.
+    pub(crate) fn set_text(&mut self, text: &str) {
+        self.source.replace(text);
+        self.read.get_mut().expect("not poisoned").clear();
+    }
+
+    /// The document's source as the compiler sees it.
+    pub(crate) fn main_source(&self) -> &Source {
+        &self.source
+    }
+
+    /// The files the last compile read besides the source.
+    pub(crate) fn read_files(&self) -> Vec<PathBuf> {
+        self.read.lock().expect("not poisoned").clone()
+    }
+
     /// The folder a package's files are read from, looked up once per
     /// package.
     fn package_root(&self, spec: &PackageSpec) -> FileResult<PathBuf> {
@@ -313,6 +350,12 @@ impl World for DocumentWorld {
 
     fn today(&self, _: Option<Duration>) -> Option<Datetime> {
         None
+    }
+}
+
+impl typst_ide::IdeWorld for DocumentWorld {
+    fn upcast(&self) -> &dyn World {
+        self
     }
 }
 

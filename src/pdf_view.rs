@@ -23,6 +23,7 @@ use gpui_kit::{
     ScrollStrategy, ScrollWheelEvent, Size, Styled as _, Window,
     assets::IconName,
     base::Disableable as _,
+    canvas,
     component::{
         ActiveTheme as _, ElementExt as _, Icon, Sizable as _, VirtualListScrollHandle,
         button::{Button, ButtonVariants as _},
@@ -119,7 +120,9 @@ pub struct PdfPage {
 
 /// A parsed PDF: its pages' geometry, plus lazily rendered SVGs.
 pub struct PdfDocument {
-    pdf: Pdf,
+    /// The parsed file; `None` for pages drawn elsewhere and handed over
+    /// ready-made, the way a live Typst preview's are.
+    pdf: Option<Pdf>,
     pages: Vec<PdfPage>,
     rendered: HashMap<usize, Arc<Image>>,
     interpreter_settings: InterpreterSettings,
@@ -179,7 +182,7 @@ impl PdfDocument {
             })
             .collect();
         Ok(Self {
-            pdf,
+            pdf: Some(pdf),
             pages,
             rendered: HashMap::new(),
             interpreter_settings: default_interpreter_settings(),
@@ -187,6 +190,35 @@ impl PdfDocument {
                 bg_color: [255, 255, 255, 255],
             },
         })
+    }
+
+    /// Pages already drawn, as (width, height, sheet) in points: a live
+    /// Typst preview's, which its compiler renders off the UI thread and
+    /// reuses for every page a keystroke left unchanged.
+    pub fn from_rendered(pages: Vec<(f32, f32, Arc<Image>)>) -> Self {
+        let mut rendered = HashMap::new();
+        let pages = pages
+            .into_iter()
+            .enumerate()
+            .map(|(index, (width, height, image))| {
+                rendered.insert(index, image);
+                PdfPage {
+                    index,
+                    page_number: index + 1,
+                    width,
+                    height,
+                }
+            })
+            .collect();
+        Self {
+            pdf: None,
+            pages,
+            rendered,
+            interpreter_settings: default_interpreter_settings(),
+            render_settings: SvgRenderSettings {
+                bg_color: [255, 255, 255, 255],
+            },
+        }
     }
 
     /// The page geometry, in document order.
@@ -199,7 +231,16 @@ impl PdfDocument {
     /// shared; rendered sheets are not, so each copy draws its own and the
     /// cache is never the reason a page looks stale.
     pub fn clone_document(&self) -> Self {
-        let pdf = Pdf::new(self.pdf.data().clone())
+        let Some(pdf) = &self.pdf else {
+            return Self {
+                pdf: None,
+                pages: self.pages.clone(),
+                rendered: self.rendered.clone(),
+                interpreter_settings: self.interpreter_settings.clone(),
+                render_settings: self.render_settings.clone(),
+            };
+        };
+        let pdf = Pdf::new(pdf.data().clone())
             .expect("the bytes this document was parsed from still parse");
         let pages = pdf
             .pages()
@@ -216,7 +257,7 @@ impl PdfDocument {
             })
             .collect();
         Self {
-            pdf,
+            pdf: Some(pdf),
             pages,
             rendered: HashMap::new(),
             interpreter_settings: self.interpreter_settings.clone(),
@@ -235,7 +276,7 @@ impl PdfDocument {
         if let Some(image) = self.rendered.get(&index) {
             return Some(image.clone());
         }
-        let page = self.pdf.pages().get(index)?;
+        let page = self.pdf.as_ref()?.pages().get(index)?;
         let cache = RenderCache::new();
         let svg = convert(
             page,
@@ -315,7 +356,21 @@ pub struct PdfView {
     /// independently.
     thumb_scroll: VirtualListScrollHandle,
     focus_handle: FocusHandle,
+    /// Where each page drawn last frame sat on screen, so a click can be
+    /// told which page it landed on and where.
+    page_bounds: Rc<std::cell::RefCell<HashMap<usize, gpui_kit::Bounds<Pixels>>>>,
+    /// Where the left button went down, to tell a click from a drag.
+    press: Option<Point<Pixels>>,
 }
+
+/// What a page viewer reports to the document showing it.
+pub enum PdfViewEvent {
+    /// A click (not a drag) on page `page` (0-based) at `x`, `y` points
+    /// from its top left: a live Typst preview jumps to the source there.
+    Clicked { page: usize, x: f32, y: f32 },
+}
+
+impl gpui_kit::EventEmitter<PdfViewEvent> for PdfView {}
 
 impl PdfView {
     /// Create a `PdfView` from a parsed document.
@@ -340,6 +395,8 @@ impl PdfView {
             scroll: VirtualListScrollHandle::new(),
             thumb_scroll: VirtualListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
+            page_bounds: Rc::default(),
+            press: None,
         }
     }
 
@@ -511,8 +568,62 @@ impl PdfView {
             .set_offset(offset + (event.position - start));
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.drag = None;
+        let Some(press) = self.press.take() else {
+            return;
+        };
+        let moved = event.position - press;
+        if moved.x.abs() > px(4.) || moved.y.abs() > px(4.) {
+            return;
+        }
+        let zoom = self.zoom.max(0.01);
+        let hit = self
+            .page_bounds
+            .borrow()
+            .iter()
+            .find(|(_, bounds)| bounds.contains(&event.position))
+            .map(|(&page, bounds)| {
+                let local = event.position - bounds.origin;
+                (page, local.x.as_f32() / zoom, local.y.as_f32() / zoom)
+            });
+        if let Some((page, x, y)) = hit {
+            cx.emit(PdfViewEvent::Clicked { page, x, y });
+        }
+    }
+
+    /// Scroll so the point `y` points down page `page` is in view, leaving
+    /// the view alone when it already is: a live Typst preview follows the
+    /// caret in its source this way.
+    pub fn reveal(&mut self, page: usize, y: f32, cx: &mut Context<Self>) {
+        let Some(doc) = &self.doc else {
+            return;
+        };
+        if page >= doc.pages.len() {
+            return;
+        }
+        let zoom = self.zoom;
+        let rows = self.rows();
+        let row_of = page / self.per_row();
+        let above: f32 = rows
+            .iter()
+            .take(row_of)
+            .map(|row| {
+                row.iter()
+                    .map(|&ix| doc.pages[ix].height)
+                    .fold(0.0f32, f32::max)
+                    * zoom
+                    + PAGE_GAP
+            })
+            .sum();
+        let target = above + y * zoom;
+        let handle = self.scroll.base_handle();
+        let offset = handle.offset();
+        let height = self.scroll.bounds().size.height.as_f32();
+        if let Some(top) = reveal_offset(-offset.y.as_f32(), height, target) {
+            handle.set_offset(gpui_kit::point(offset.x, px(-top)));
+            cx.notify();
+        }
     }
 
     /// Double-clicking swaps between the fitted view and a closer look, the
@@ -522,10 +633,12 @@ impl PdfView {
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         // Only the left button gets here; the wiring asks for it.
         if event.click_count != 2 {
+            self.press = Some(event.position);
             self.drag = Some((event.position, self.scroll.base_handle().offset()));
             return;
         }
         self.drag = None;
+        self.press = None;
         if self.fit == FitMode::Custom {
             self.fit_page(cx);
         } else {
@@ -981,6 +1094,18 @@ impl PdfView {
                                         .w(width)
                                         .h(height)
                                         .flex_none()
+                                        .relative()
+                                        .child({
+                                            let bounds = this.page_bounds.clone();
+                                            canvas(
+                                                move |area, _, _| {
+                                                    bounds.borrow_mut().insert(page_ix, area);
+                                                },
+                                                |_, _, _, _| {},
+                                            )
+                                            .absolute()
+                                            .size_full()
+                                        })
                                         .bg(rgb(0xffffff))
                                         .border_1()
                                         .border_color(border)
@@ -1068,6 +1193,8 @@ impl Render for PdfView {
         // Name the current page before the toolbar, the pages and the
         // thumbnail strip are built, so all three agree within a frame.
         self.current_page = self.visible_page();
+        // Bounds are recorded again for the pages drawn this frame.
+        self.page_bounds.borrow_mut().clear();
         // The pages were laid out against last frame's viewport. When the
         // pane changes size under them (the thumbnail strip opening or
         // closing, a resized split) draw once more against the new one, or
@@ -1124,6 +1251,17 @@ impl Render for PdfView {
     }
 }
 
+/// The scroll position (distance from the top) that brings `target` into a
+/// viewport `height` tall now scrolled `top` down, putting it a third of the
+/// way down; `None` when it is already comfortably in view.
+fn reveal_offset(top: f32, height: f32, target: f32) -> Option<f32> {
+    let margin = (height * 0.1).min(48.);
+    if target >= top + margin && target <= top + height - margin {
+        return None;
+    }
+    Some((target - height / 3.).max(0.))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1131,6 +1269,23 @@ mod tests {
     /// The page named as current must follow the scroll position: at the top
     /// it is the first page, then the first page whose row reaches the top of
     /// the viewport, and the last page when scrolled past the end.
+    #[test]
+    fn reveal_moves_only_when_the_point_is_out_of_view() {
+        assert_eq!(reveal_offset(0., 600., 300.), None);
+        assert_eq!(reveal_offset(0., 600., 1200.), Some(1000.));
+        assert_eq!(reveal_offset(1000., 600., 100.), Some(0.));
+    }
+
+    #[test]
+    fn rendered_pages_keep_their_size_and_sheet() {
+        let image = Arc::new(Image::from_bytes(ImageFormat::Svg, b"<svg/>".to_vec()));
+        let mut doc = PdfDocument::from_rendered(vec![(100., 200., image.clone())]);
+        assert_eq!(doc.page_count(), 1);
+        assert_eq!(doc.pages()[0].height, 200.);
+        assert!(Arc::ptr_eq(&doc.image(0).unwrap(), &image));
+        assert_eq!(doc.clone_document().page_count(), 1);
+    }
+
     #[test]
     fn the_current_page_follows_the_scroll_offset() {
         let rows = vec![vec![0], vec![1], vec![2]];

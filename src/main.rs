@@ -33,6 +33,7 @@ mod single_instance;
 mod smart_edit;
 mod spell;
 mod themes;
+mod typst_live;
 mod typst_preview;
 mod typst_world;
 mod workspace;

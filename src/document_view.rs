@@ -107,10 +107,6 @@ pub struct DocumentView {
     preview: Entity<TextViewState>,
     pdf: Option<Entity<crate::pdf_view::PdfView>>,
     image: Option<Entity<crate::image_view::ImageView>>,
-    /// The Typst document a `.typ` file's preview is: its source and the
-    /// pages its last compile produced, so the preview follows the source as
-    /// it changes on disk.
-    typst: Option<crate::typst_preview::TypstPreview>,
     /// Parser configuration for the preview; built once so the preview can
     /// tell that it is unchanged between frames.
     markdown_extensions: gpui_kit::component::text::MarkdownExtensions,
@@ -180,6 +176,8 @@ pub struct DocumentView {
     /// Where the caret goes once a loading tab's text arrives, reported as
     /// its cursor meanwhile so a session saved now keeps it.
     pending_cursor: usize,
+    /// A Typst source's live preview: its compiler thread and the pages.
+    live: Option<TypstLive>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -219,6 +217,7 @@ impl DocumentView {
             // The editor notifies when it scrolls or its caret moves.
             cx.observe(&editor, |this, editor, cx| {
                 this.last_cursor = editor.read(cx).cursor();
+                this.schedule_live_reveal(cx);
                 this.sync_preview(false, cx);
                 this.update_focus_dimming(cx);
             }),
@@ -241,7 +240,6 @@ impl DocumentView {
             editor,
             pdf: None,
             image: None,
-            typst: None,
             markdown_extensions: preview_ext::markdown_extensions(&preview),
             preview,
             path: None,
@@ -278,6 +276,7 @@ impl DocumentView {
             editor_width: px(0.),
             preview_width: px(0.),
             loading: false,
+            live: None,
             pending_cursor: 0,
             _subscriptions: subscriptions,
         };
@@ -415,7 +414,6 @@ impl DocumentView {
             preview,
             pdf: None,
             image: Some(image),
-            typst: None,
             markdown_extensions,
             path: Some(path),
             line_ending: LineEnding::Lf,
@@ -451,6 +449,7 @@ impl DocumentView {
             editor_width: px(0.),
             preview_width: px(0.),
             loading: false,
+            live: None,
             pending_cursor: 0,
             _subscriptions: Vec::new(),
         }
@@ -472,7 +471,6 @@ impl DocumentView {
             markdown_extensions,
             pdf: Some(pdf),
             image: None,
-            typst: None,
             path: Some(path),
             line_ending: LineEnding::Lf,
             saved_line_ending: LineEnding::Lf,
@@ -507,109 +505,10 @@ impl DocumentView {
             editor_width: px(0.),
             preview_width: px(0.),
             loading: false,
+            live: None,
             pending_cursor: 0,
             _subscriptions: Vec::new(),
         }
-    }
-
-    /// A document whose preview is the Typst compiler's output for `source`.
-    ///
-    /// The pages are handed to the same PDF viewer a `.pdf` file uses, so a
-    /// Typst document reads exactly like a PDF one: same scrolling, same
-    /// zoom, same thumbnail strip, same toolbar.
-    pub fn new_typst(
-        source: PathBuf,
-        compiled: crate::typst_preview::TypstPreview,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let pdf = cx
-            .new(|cx| crate::pdf_view::PdfView::new(Some(source.clone()), compiled.document(), cx));
-        // The files as they are right now, so the first watcher pass has
-        // something to compare against instead of reporting every typst
-        // document as changed.
-        let disk = Some(compiled.stamp());
-        let editor = cx.new(|cx| EditorState::new(window, cx));
-        let preview = cx.new(|cx| TextViewState::markdown("", cx));
-        let markdown_extensions = preview_ext::markdown_extensions(&preview);
-        Self {
-            editor,
-            preview,
-            markdown_extensions,
-            pdf: Some(pdf),
-            image: None,
-            typst: Some(compiled),
-            path: Some(source),
-            line_ending: LineEnding::Lf,
-            saved_line_ending: LineEnding::Lf,
-            saved_hash: 0,
-            dirty: false,
-            disk,
-            source: "".into(),
-            revision: 0,
-            analysis: Arc::new(Analysis::default()),
-            analysis_task: None,
-            indent: crate::document::Indent::DEFAULT,
-            preview_limited: false,
-            large: false,
-            reduced: false,
-            bar_dismissed: false,
-            encoding: Default::default(),
-            pending_anchor: None,
-            recovery_id: session::new_recovery_id(),
-            recovery_written: false,
-            recovery_task: None,
-            misspellings: Arc::default(),
-            spell_task: None,
-            spell_checked: None,
-            last_cursor: 0,
-            focus_decorations: None,
-            focus_block: None,
-            scroll_driver: ScrollDriver::Editor,
-            synced_editor_scroll: None,
-            synced_preview_scroll: None,
-            editor_scroll_target: None,
-            synced_preview_rows: 0,
-            editor_width: px(0.),
-            preview_width: px(0.),
-            loading: false,
-            pending_cursor: 0,
-            _subscriptions: Vec::new(),
-        }
-    }
-
-    /// A document whose preview is a Typst source's compiled pages, so the
-    /// viewer the preview hands its work to.
-    pub fn is_typst(&self) -> bool {
-        self.typst.is_some()
-    }
-
-    /// Recompile the Typst source this document previews, showing the new
-    /// pages. A failed compile leaves the pages on screen and reports why.
-    /// Returns `false` when this document is not a Typst preview, or when the
-    /// source no longer compiles.
-    pub fn refresh_typst(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(compiled) = &mut self.typst else {
-            return false;
-        };
-        if compiled.refresh().is_err() {
-            return false;
-        }
-        // Keep the reader's place: the new pages replace the old in the
-        // viewer, which holds on to its zoom, spread, scroll and thumbnails.
-        if let Some(pdf) = &self.pdf {
-            pdf.update(cx, |pdf, cx| pdf.reload(compiled.document(), cx));
-        }
-        true
-    }
-
-    /// The paths whose changes should refresh a Typst preview: its source and
-    /// everything the source named.
-    pub fn watched_paths(&self) -> Vec<PathBuf> {
-        self.typst
-            .as_ref()
-            .map(|compiled| compiled.watched().to_vec())
-            .unwrap_or_default()
     }
 
     /// The language the status bar names: empty for a Markdown document, and
@@ -623,16 +522,6 @@ impl DocumentView {
         crate::document::language_name(self.path.as_deref()).into()
     }
 
-    /// A Typst source opened as text because it did not compile, which
-    /// turns into its pages once it does.
-    pub fn is_typst_source(&self) -> bool {
-        self.typst.is_none()
-            && self
-                .path
-                .as_deref()
-                .is_some_and(crate::document::is_typst_path)
-    }
-
     /// The indentation the status bar names.
     pub fn indent(&self) -> crate::document::Indent {
         self.indent
@@ -641,7 +530,8 @@ impl DocumentView {
     /// Whether this text document gets the rendered preview beside it:
     /// Markdown does, source code and other text open in the editor alone.
     pub fn has_preview(&self) -> bool {
-        !self.reduced && crate::document::has_markdown_preview(self.path.as_deref())
+        !self.reduced
+            && (crate::document::has_markdown_preview(self.path.as_deref()) || self.live.is_some())
     }
 
     /// Turn off what costs memory per byte, the way VS Code treats a large
@@ -786,31 +676,9 @@ impl DocumentView {
         cx.notify();
     }
 
-    /// The file as last read or written. A Typst preview's stamp covers its
-    /// source and every file that source named, so one comparison notices a
-    /// change to any of them; it is set when the preview is compiled and
-    /// updated when the watcher accepts the files as they are.
+    /// The file as last read or written.
     pub fn disk_stamp(&self) -> Option<DiskStamp> {
-        if self.typst.is_some() {
-            return Some(self.disk.unwrap_or_else(DiskStamp::of_nowhere));
-        }
         self.disk
-    }
-
-    /// The stamp a Typst preview's next watcher pass compares against.
-    pub fn watch_stamp(&self) -> DiskStamp {
-        self.typst
-            .as_ref()
-            .map(|compiled| compiled.stamp())
-            .unwrap_or(DiskStamp::of_nowhere())
-    }
-
-    /// Accept the stamp the watcher has just read, so the next pass does not
-    /// report the same change again.
-    pub fn accept_watch_stamp(&mut self, stamp: DiskStamp) {
-        if self.typst.is_some() {
-            self.disk = Some(stamp);
-        }
     }
 
     pub fn saved_hash(&self) -> u64 {
@@ -912,6 +780,7 @@ impl DocumentView {
             );
             editor.set_value(text, window, cx)
         });
+        self.start_typst_live(window, cx);
         // `set_value` does not emit a change event.
         self.on_text_changed(false, cx);
         self.dirty = false;
@@ -944,6 +813,7 @@ impl DocumentView {
         self.recovery_written = true;
         self.editor
             .update(cx, |editor, cx| editor.set_value(recovery.text, window, cx));
+        self.start_typst_live(window, cx);
         self.on_text_changed(false, cx);
     }
 
@@ -1006,6 +876,16 @@ impl DocumentView {
             return;
         }
         let source = self.editor.read(cx).value();
+        if self.live.is_some() {
+            self.source = source;
+            self.dirty = true;
+            self.revision += 1;
+            self.focus_block = None;
+            self.send_live_text(debounce, cx);
+            self.schedule_analysis(debounce, cx);
+            cx.notify();
+            return;
+        }
         // Non-markdown text files render as one highlighted code block: the
         // extension picks the tree-sitter language for the preview's
         // highlighter. Markdown keeps its normal document rendering.
@@ -1085,6 +965,266 @@ impl DocumentView {
                 cx.notify();
             });
         }));
+    }
+
+    // ---------------------------------------------------------------------
+    // Typst live preview
+
+    /// Give a Typst source its live preview: a compiler thread of its own
+    /// and a page viewer beside the editor. Clicking a page moves the caret
+    /// to the text it came from.
+    fn start_typst_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.live.is_some() || self.reduced {
+            return;
+        }
+        let Some(path) = self
+            .path
+            .clone()
+            .filter(|path| crate::document::is_typst_path(path))
+        else {
+            return;
+        };
+        let (worker, mut answers) = crate::typst_live::LiveWorker::spawn(path.clone());
+        let view = cx.new(|cx| {
+            let mut view = crate::pdf_view::PdfView::new(
+                Some(path),
+                crate::pdf_view::PdfDocument::from_rendered(Vec::new()),
+                cx,
+            );
+            view.fit_width(cx);
+            view
+        });
+        let clicks = cx.subscribe(
+            &view,
+            |this, _, event: &crate::pdf_view::PdfViewEvent, _| {
+                let crate::pdf_view::PdfViewEvent::Clicked { page, x, y } = *event;
+                if let Some(live) = &this.live {
+                    live.worker
+                        .send(crate::typst_live::Request::SourceAt { page, x, y });
+                }
+            },
+        );
+        let listen = cx.spawn_in(window, async move |this, cx| {
+            use futures::StreamExt as _;
+            while let Some(answer) = answers.next().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.on_live_answer(answer, window, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.live = Some(TypstLive {
+            worker,
+            view,
+            diagnostics: Vec::new(),
+            compiled_once: false,
+            highlights: None,
+            send_task: None,
+            reveal_task: None,
+            revealed_cursor: None,
+            typed: None,
+            latency: None,
+            _listen: listen,
+            _clicks: clicks,
+        });
+    }
+
+    /// Hand the text to the compiler once typing pauses briefly.
+    fn send_live_text(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        let revision = self.revision;
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        live.typed = Some((revision, std::time::Instant::now()));
+        live.send_task = Some(cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor().timer(LIVE_DEBOUNCE).await;
+            }
+            _ = this.update(cx, |this, cx| {
+                let text = this.editor.read(cx).value().to_string();
+                if let Some(live) = &this.live {
+                    live.worker
+                        .send(crate::typst_live::Request::Compile { text, revision });
+                }
+            });
+        }));
+    }
+
+    /// Show where the caret's text is on the pages, once the caret rests.
+    fn schedule_live_reveal(&mut self, cx: &mut Context<Self>) {
+        let cursor = self.last_cursor;
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        if live.revealed_cursor == Some(cursor) {
+            return;
+        }
+        live.revealed_cursor = Some(cursor);
+        live.reveal_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LIVE_REVEAL_DELAY).await;
+            _ = this.update(cx, |this, _| {
+                if let Some(live) = &this.live {
+                    live.worker
+                        .send(crate::typst_live::Request::PageAt { offset: cursor });
+                }
+            });
+        }));
+    }
+
+    fn on_live_answer(
+        &mut self,
+        answer: crate::typst_live::Response,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::typst_live::Response;
+        let current = self.revision;
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        match answer {
+            Response::Compiled(compiled) => {
+                if let Some((typed, since)) = live.typed
+                    && typed == compiled.revision
+                {
+                    live.typed = None;
+                    let latency = since.elapsed();
+                    live.latency = Some(latency);
+                    log::info!(
+                        "typst live: keystroke to preview {:.1} ms (compile {:.1} ms, {} of {} pages redrawn)",
+                        latency.as_secs_f64() * 1000.,
+                        compiled.elapsed.as_secs_f64() * 1000.,
+                        compiled.redrawn,
+                        compiled.pages.as_ref().map_or(0, Vec::len),
+                    );
+                }
+                if let Some(pages) = compiled.pages {
+                    let document = crate::pdf_view::PdfDocument::from_rendered(
+                        pages
+                            .into_iter()
+                            .map(|page| (page.width, page.height, page.image))
+                            .collect(),
+                    );
+                    live.view.update(cx, |view, cx| view.reload(document, cx));
+                    live.compiled_once = true;
+                }
+                live.diagnostics = compiled.diagnostics;
+                if compiled.revision == current {
+                    let theme = cx.theme().highlight_theme.clone();
+                    let decorations: Vec<TextDecoration> = compiled
+                        .highlights
+                        .into_iter()
+                        .filter_map(|(range, tag)| {
+                            Some(TextDecoration::new(range, typst_tag_style(tag, &theme)?))
+                        })
+                        .collect();
+                    match &live.highlights {
+                        Some(collection) => collection.set(decorations, cx),
+                        None => {
+                            let collection = self.editor.update(cx, |editor, cx| {
+                                editor.create_decorations_collection(decorations, cx)
+                            });
+                            if let Some(live) = &mut self.live {
+                                live.highlights = Some(collection);
+                            }
+                        }
+                    }
+                }
+                self.show_misspellings(cx);
+                cx.notify();
+            }
+            Response::SourceAt(offset) => {
+                self.set_cursor(offset, window, cx);
+                let focus = self.editor.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
+            Response::PageAt(page, _x, y) => {
+                live.view.update(cx, |view, cx| view.reveal(page, y, cx));
+            }
+        }
+    }
+
+    /// The preview pane: a live Typst preview's pages, under the compiler's
+    /// first error when the text does not compile (the pages stay the last
+    /// good ones), or the Markdown preview.
+    fn render_side(&self, window: &Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let Some(live) = &self.live else {
+            return self.render_preview(window, cx).into_any_element();
+        };
+        let theme = cx.theme();
+        let error = live
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.error)
+            .map(|diagnostic| {
+                let line = diagnostic.range.as_ref().map(|range| {
+                    let upto = range.start.min(self.source.len());
+                    self.source[..floor_char_boundary(&self.source, upto)]
+                        .matches('\n')
+                        .count()
+                        + 1
+                });
+                let first = diagnostic.message.lines().next().unwrap_or_default();
+                match line {
+                    Some(line) => format!("Line {line}: {first}"),
+                    None => first.to_string(),
+                }
+            });
+        let banner = error.map(|message| {
+            h_flex()
+                .id("typst-error")
+                .w_full()
+                .px_3()
+                .py_1()
+                .gap_2()
+                .text_sm()
+                .bg(theme.danger.opacity(0.12))
+                .text_color(theme.danger)
+                .child(div().flex_1().min_w_0().truncate().child(message))
+                .when(live.compiled_once, |this| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.muted_foreground)
+                            .child("showing the last version that compiled"),
+                    )
+                })
+        });
+        let body = if live.compiled_once {
+            live.view.clone().into_any_element()
+        } else {
+            h_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .gap_2()
+                .text_color(theme.muted_foreground)
+                .when(banner.is_none(), |this| {
+                    this.child(gpui_kit::component::spinner::Spinner::new())
+                        .child("Compiling\u{2026}")
+                })
+                .when(banner.is_some(), |this| {
+                    this.child("Fix the error to see the pages.")
+                })
+                .into_any_element()
+        };
+        v_flex()
+            .id("typst-live-pane")
+            .size_full()
+            .bg(theme.background)
+            .children(banner)
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
+    }
+
+    /// The last measured time from a keystroke to its pages being shown.
+    #[allow(dead_code)]
+    pub fn typst_latency(&self) -> Option<std::time::Duration> {
+        self.live.as_ref().and_then(|live| live.latency)
     }
 
     // ---------------------------------------------------------------------
@@ -1245,6 +1385,11 @@ impl DocumentView {
 
     fn show_misspellings(&mut self, cx: &mut Context<Self>) {
         let misspellings = self.misspellings.clone();
+        let typst = self
+            .live
+            .as_ref()
+            .map(|live| live.diagnostics.clone())
+            .unwrap_or_default();
         self.editor.update(cx, |editor, cx| {
             let text = editor.text().clone();
             let Some(diagnostics) = editor.diagnostics_mut() else {
@@ -1259,6 +1404,24 @@ impl DocumentView {
                 )
                 .with_severity(DiagnosticSeverity::Info)
                 .with_source("Spelling")
+            }));
+            let len = text.len();
+            diagnostics.extend(typst.iter().filter_map(|diagnostic| {
+                let range = diagnostic.range.clone()?;
+                let start = range.start.min(len);
+                let end = range.end.clamp(start, len);
+                Some(
+                    Diagnostic::new(
+                        text.offset_to_position(start)..text.offset_to_position(end),
+                        diagnostic.message.clone(),
+                    )
+                    .with_severity(if diagnostic.error {
+                        DiagnosticSeverity::Error
+                    } else {
+                        DiagnosticSeverity::Warning
+                    })
+                    .with_source("Typst"),
+                )
             }));
             cx.notify();
         });
@@ -1716,6 +1879,7 @@ impl DocumentView {
             && !settings.focus_mode
             && !self.preview_limited
             && self.has_preview()
+            && self.live.is_none()
     }
 
     /// Scroll the preview to the block at the top of the editor.
@@ -2162,7 +2326,7 @@ impl Render for DocumentView {
         };
         let body = match layout {
             Layout::Editor => self.render_editor(window, cx).into_any_element(),
-            Layout::Preview => self.render_preview(window, cx).into_any_element(),
+            Layout::Preview => self.render_side(window, cx),
             Layout::Split => h_resizable("document-split")
                 .child(
                     resizable_panel()
@@ -2172,7 +2336,7 @@ impl Render for DocumentView {
                 .child(
                     resizable_panel()
                         .size_range(rems(16.).to_pixels(window.rem_size())..Pixels::MAX)
-                        .child(self.render_preview(window, cx)),
+                        .child(self.render_side(window, cx)),
                 )
                 .into_any_element(),
         };
@@ -2185,6 +2349,74 @@ impl Render for DocumentView {
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }
+}
+
+/// How long typing pauses before a Typst source is compiled again. Short:
+/// a compile of a long document takes a few milliseconds once warm.
+const LIVE_DEBOUNCE: Duration = Duration::from_millis(40);
+/// How long the caret rests before the preview scrolls to show it.
+const LIVE_REVEAL_DELAY: Duration = Duration::from_millis(150);
+
+/// A Typst source's live preview.
+struct TypstLive {
+    worker: crate::typst_live::LiveWorker,
+    view: Entity<crate::pdf_view::PdfView>,
+    diagnostics: Vec<crate::typst_live::LiveDiagnostic>,
+    /// Whether any compile has succeeded, so there are pages to show.
+    compiled_once: bool,
+    highlights: Option<TextDecorationCollection>,
+    send_task: Option<Task<()>>,
+    reveal_task: Option<Task<()>>,
+    revealed_cursor: Option<usize>,
+    /// The newest edit sent to the compiler and when it was made, to
+    /// measure the time from a keystroke to its pages.
+    typed: Option<(usize, std::time::Instant)>,
+    latency: Option<Duration>,
+    _listen: Task<()>,
+    _clicks: Subscription,
+}
+
+/// How the editor colours a piece of Typst, from the theme's syntax colours
+/// (the names tree-sitter grammars use, so every theme covers them).
+fn typst_tag_style(
+    tag: typst::syntax::Tag,
+    theme: &gpui_kit::component::highlighter::HighlightTheme,
+) -> Option<HighlightStyle> {
+    use gpui_kit::base::input::HighlightStyleResolver as _;
+    use typst::syntax::Tag;
+    let (name, bold, italic) = match tag {
+        Tag::Comment => ("comment", false, false),
+        Tag::Punctuation => ("punctuation", false, false),
+        Tag::Escape => ("string.escape", false, false),
+        Tag::Strong => ("", true, false),
+        Tag::Emph => ("", false, true),
+        Tag::Link => ("link_uri", false, false),
+        Tag::Raw => ("text.literal", false, false),
+        Tag::Label | Tag::Ref => ("constant", false, false),
+        Tag::Heading => ("title", true, false),
+        Tag::ListMarker => ("punctuation.list_marker", false, false),
+        Tag::ListTerm => ("", true, false),
+        Tag::MathDelimiter | Tag::MathGroupingParens => ("punctuation.bracket", false, false),
+        Tag::MathOperator | Tag::Operator => ("operator", false, false),
+        Tag::Keyword => ("keyword", false, false),
+        Tag::Number => ("number", false, false),
+        Tag::String => ("string", false, false),
+        Tag::Function => ("function", false, false),
+        Tag::Interpolated => ("variable", false, false),
+        Tag::Error => return None,
+    };
+    let mut style = if name.is_empty() {
+        HighlightStyle::default()
+    } else {
+        theme.style(name).unwrap_or_default()
+    };
+    if bold {
+        style.font_weight = Some(gpui_kit::FontWeight::BOLD);
+    }
+    if italic {
+        style.font_style = Some(gpui_kit::FontStyle::Italic);
+    }
+    (style != HighlightStyle::default()).then_some(style)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

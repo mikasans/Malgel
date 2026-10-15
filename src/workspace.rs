@@ -65,7 +65,6 @@ use crate::{
     settings::{Appearance, Layout, LinkPlacement, clamp_font_size},
     spell,
     themes::{self, AppSettings},
-    typst_preview,
 };
 
 /// Shown when Malgel starts for the first time.
@@ -180,10 +179,10 @@ fn quick_open_rows(
     rows
 }
 
-/// Whether opening `path` reads it as text, rather than compiling it
-/// (Typst) or showing it in a viewer (PDF, image).
+/// Whether opening `path` reads it as text, rather than showing it in a
+/// viewer (PDF, image). A Typst source is text, with its pages beside it.
 fn reads_as_text(path: &std::path::Path) -> bool {
-    !document::is_typst_path(path) && !document::is_pdf_path(path) && !document::is_image_path(path)
+    !document::is_pdf_path(path) && !document::is_image_path(path)
 }
 
 fn keyboard_target(has_media: bool, shows_editor: bool, focus_mode: bool) -> KeyboardTarget {
@@ -297,9 +296,6 @@ enum DiskChange {
         stamp: Option<DiskStamp>,
     },
     Touched(Option<DiskStamp>),
-    /// A Typst preview whose source — or a file it named — changed, so
-    /// the pages are recompiled.
-    Recompiled,
 }
 
 /// A tab being dragged to a new position, the way tabs reorder in VS Code.
@@ -565,10 +561,9 @@ impl Workspace {
             let doc = match recovery {
                 Some((id, recovery)) => Some(self.restored_document(id, recovery, window, cx)),
                 None if wanted => entry.path.as_ref().and_then(|path| {
-                    // Typst and PDF files are not text documents; open them
+                    // PDF files and images are not text documents; open them
                     // after the window finishes building via their own path.
-                    if document::is_typst_path(path)
-                        || document::is_pdf_path(path)
+                    if document::is_pdf_path(path)
                         || document::is_image_path(path)
                         || document::open_check(path) != document::OpenCheck::Fine
                     {
@@ -1290,55 +1285,6 @@ impl Workspace {
         }
         let plain = mode == Some(OpenMode::PlainText);
 
-        // A Typst document's preview is its compiled pages, so it takes the
-        // same path a PDF does and is watched for changes to refresh.
-        // It compiles off the UI thread, a loading tab standing in meanwhile.
-        if document::is_typst_path(&path) && !plain {
-            let compile_path = path.clone();
-            let task = cx
-                .background_executor()
-                .spawn(async move { crate::typst_preview::TypstPreview::open(&compile_path) });
-            let placeholder = self.place_loading(&path, placement, window, cx);
-            cx.spawn_in(window, async move |this, cx| {
-                let result = task.await;
-                _ = this.update_in(cx, |this, window, cx| match result {
-                    Ok(compiled) => {
-                        let Some(slot) = this.loading_slot(placeholder) else {
-                            return;
-                        };
-                        AppSettings::update(cx, |settings| settings.push_recent(&path));
-                        let doc = cx
-                            .new(|cx| DocumentView::new_typst(path.clone(), compiled, window, cx));
-                        match slot {
-                            Some((id, ix)) => this.swap_in_loaded(id, ix, doc, window, cx),
-                            None => this.place_document(doc, placement, window, cx),
-                        }
-                    }
-                    Err(err) => {
-                        if this.loading_slot(placeholder).is_none() {
-                            return;
-                        }
-                        this.drop_loading(placeholder, &path, window, cx);
-                        // Show the source so the mistake can be fixed here,
-                        // the way VS Code opens a file whose preview fails;
-                        // it stays in the recent files, as it still exists.
-                        this.notify_error(
-                            format!(
-                                "Couldn\u{2019}t compile \u{201c}{}\u{201d}. {err} Showing the source instead; reopen it once it compiles to see its pages.",
-                                document::display_name(Some(&path))
-                            ),
-                            window,
-                            cx,
-                        );
-                        this.approved_opens.insert(path.clone(), OpenMode::PlainText);
-                        this.load_path(path, placement, target, window, cx);
-                    }
-                });
-            })
-            .detach();
-            return;
-        }
-
         // A PDF is parsed and a picture decoded off the UI thread, so a large
         // one never freezes the window while it loads.
         if document::is_pdf_path(&path) || document::is_image_path(&path) {
@@ -1571,7 +1517,7 @@ impl Workspace {
             // A PDF or image is not text: reading it back as text would put
             // its bytes into the hidden editor (and its word count into the
             // status bar).
-            .filter(|doc| !doc.read(cx).is_typst() && !doc.read(cx).is_media())
+            .filter(|doc| !doc.read(cx).is_media())
             .filter_map(|doc| {
                 let id = doc.entity_id();
                 let doc = doc.read(cx);
@@ -1580,21 +1526,7 @@ impl Workspace {
                     .then(|| (id, path, doc.disk_stamp(), doc.saved_hash()))
             })
             .collect();
-        // A Typst preview's file is not text: its pages come from compiling the
-        // source, so it is watched as a compilation instead. It watches its
-        // source and every file the source named, and one stamp over them is
-        // what a change has to move.
-        let recompilable: Vec<(EntityId, Vec<PathBuf>, Option<DiskStamp>)> = self
-            .documents
-            .iter()
-            .filter(|doc| doc.read(cx).is_typst())
-            .filter(|doc| !self.pending_disk_prompt.contains(&doc.entity_id()))
-            .map(|entity| {
-                let doc = entity.read(cx);
-                (entity.entity_id(), doc.watched_paths(), doc.disk_stamp())
-            })
-            .collect();
-        if targets.is_empty() && recompilable.is_empty() {
+        if targets.is_empty() {
             return;
         }
         let task = cx.background_executor().spawn(async move {
@@ -1620,18 +1552,6 @@ impl Workspace {
                     },
                 };
                 changes.push((id, change));
-            }
-            for (id, watched, known) in recompilable {
-                let stamp = typst_preview::stamp_of(&watched);
-                if Some(stamp) == known {
-                    continue;
-                }
-                // Every path vanished: the document is gone. Saying so is the
-                // missing-file path's job, and the source is among the paths.
-                if stamp.modified.is_none() {
-                    continue;
-                }
-                changes.push((id, DiskChange::Recompiled));
             }
             changes
         });
@@ -1659,31 +1579,6 @@ impl Workspace {
         let name = doc.read(cx).name();
         match change {
             DiskChange::Touched(stamp) => doc.update(cx, |doc, _| doc.set_disk_stamp(stamp)),
-            DiskChange::Recompiled => {
-                if doc.read(cx).is_typst() {
-                    let entity = doc.clone();
-                    doc.update(cx, |view, cx| {
-                        if view.refresh_typst(cx) {
-                            // The stamp now on the files is what the next pass
-                            // compares against, so one change is one refresh.
-                            let stamp = view.watch_stamp();
-                            cx.defer(move |cx| {
-                                entity.update(cx, |view, _| view.accept_watch_stamp(stamp));
-                            });
-                        } else {
-                            // The source no longer compiles: the last good
-                            // pages stay on screen. Say so once rather than
-                            // leaving the reader guessing why nothing moved.
-                            window.push_notification(
-                                Notification::error(format!(
-                                    "“{name}” no longer compiles. The preview shows the last version that did."
-                                )),
-                                cx,
-                            );
-                        }
-                    });
-                }
-            }
             DiskChange::Missing => {
                 doc.update(cx, |doc, cx| doc.mark_missing(cx));
                 window.push_notification(
@@ -1700,9 +1595,6 @@ impl Workspace {
             } => {
                 if !doc.read(cx).is_dirty() {
                     doc.update(cx, |doc, cx| doc.reload(text, line_ending, window, cx));
-                    // A Typst source fixed in another editor turns into its
-                    // pages, as `typst watch` would show them.
-                    self.promote_typst_source(id, window, cx);
                     return;
                 }
                 if window.has_active_dialog(cx) {
@@ -2873,43 +2765,6 @@ impl Workspace {
         .detach();
     }
 
-    /// A Typst source opened as text because it did not compile: once it
-    /// compiles (saved here or changed on disk) it becomes its pages, in the
-    /// same tab, without reopening. While it still fails it stays the source.
-    fn promote_typst_source(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ix) = self.document_index(id) else {
-            return;
-        };
-        let doc = self.documents[ix].read(cx);
-        if !doc.is_typst_source() || doc.is_dirty() {
-            return;
-        }
-        let Some(path) = doc.path().cloned() else {
-            return;
-        };
-        match crate::typst_preview::TypstPreview::open(&path) {
-            Ok(compiled) => {
-                let doc = cx.new(|cx| DocumentView::new_typst(path.clone(), compiled, window, cx));
-                self.replace_document_at(ix, doc, window, cx);
-                window.push_notification(
-                    Notification::info(format!(
-                        "“{}” compiles now; showing its pages.",
-                        display_name(Some(&path))
-                    )),
-                    cx,
-                );
-            }
-            Err(err) => self.notify_error(
-                format!(
-                    "“{}” still doesn’t compile. {err}",
-                    display_name(Some(&path))
-                ),
-                window,
-                cx,
-            ),
-        }
-    }
-
     /// Write `doc` to `path`; reports failures to the user.
     fn write(
         &mut self,
@@ -2920,7 +2775,6 @@ impl Workspace {
     ) -> bool {
         match doc.update(cx, |doc, cx| doc.write_to(path, cx)) {
             Ok(()) => {
-                self.promote_typst_source(doc.entity_id(), window, cx);
                 self.save_session(window, cx);
                 true
             }
@@ -5197,7 +5051,8 @@ mod tests {
         assert!(super::reads_as_text(Path::new("main.rs")));
         assert!(!super::reads_as_text(Path::new("a.pdf")));
         assert!(!super::reads_as_text(Path::new("a.png")));
-        assert!(!super::reads_as_text(Path::new("a.typ")));
+        // A Typst source is text, with its pages beside it.
+        assert!(super::reads_as_text(Path::new("a.typ")));
     }
 
     #[test]

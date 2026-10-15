@@ -262,6 +262,8 @@ pub fn language_tag(path: &Path) -> Option<&'static str> {
         "proto" => "proto",
         "diff" | "patch" => "diff",
         "md" | "markdown" => "markdown",
+        // Highlighted from typst's own syntax tree instead (typst_live).
+        "typ" => "text",
         _ => return None,
     })
 }
@@ -285,11 +287,8 @@ pub fn is_pdf_path(path: &Path) -> bool {
 
 /// Whether `path` is a Typst source file.
 ///
-/// A Typst document is not read as text: its preview is the PDF the Typst
-/// compiler makes of it, so opening one compiles the file and shows the
-/// result. Malgel does not ship the `typst` command, so the preview can only
-/// ever be as fresh as the last time Malgel compiled it — it is refreshed
-/// when the file is opened and whenever it changes on disk.
+/// A Typst source opens in the editor with a live preview of its pages
+/// beside it, compiled as it is typed (see `typst_live`).
 pub fn is_typst_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
