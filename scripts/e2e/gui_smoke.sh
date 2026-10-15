@@ -285,7 +285,9 @@ echo "display:  $DISPLAY ($(xdotool getdisplaygeometry))"
 
 # Open the folder so the file tree is exercised, and a file so the editor is.
 # --new-instance: never hand the files to a Malgel some other run left open.
-"$BIN" --new-instance "$WS" "$WS/README.md" >"$ART_DIR/app.log" 2>&1 &
+# No session bus: the xdg-desktop-portal file dialog cannot open (as on a
+# desktop without a portal), which step 21c2 checks is reported, not ignored.
+env -u DBUS_SESSION_BUS_ADDRESS "$BIN" --new-instance "$WS" "$WS/README.md" >"$ART_DIR/app.log" 2>&1 &
 APP_PID=$!
 
 # 1. The window comes up and the process survives.
@@ -1187,6 +1189,23 @@ kill -0 "$APP_PID" 2>/dev/null || fail "Esc in the quit dialog quit the app"
   || fail "the quit dialog changed quit.md on disk: $(head -c 80 "$WS/notes/quit.md")"
 ! grep -rq 'LEAK' "$WS/notes" || fail "keys typed into the quit dialog reached a file"
 pass "Ctrl+Q with unsaved changes: dialog holds keys, Esc cancels, file unchanged"
+
+# 21c2. No file dialog available (no portal / session bus): Ctrl+S on an
+#       Untitled document reports it instead of silently doing nothing.
+xdotool key --clearmodifiers ctrl+n
+sleep 0.6
+xdotool type --delay 30 'portal'
+sleep 0.3
+shot 48a-untitled
+xdotool key --clearmodifiers ctrl+s
+wait_for 6 grep -q "Couldn't open the file dialog" "$ART_DIR/app.log" \
+  || fail "Ctrl+S with no file dialog available reported nothing"
+sleep 0.5
+shot 48b-dialog-error
+[[ "$(pixels_differ 48a-untitled 48b-dialog-error)" -gt 1000 ]] \
+  || fail "no notification on screen for the file dialog failure"
+kill -0 "$APP_PID" 2>/dev/null || fail "the app died when the file dialog failed"
+pass "a file dialog that cannot open is reported (notification)"
 
 # 21d. G5: in Tokyo Moon the line numbers render at >= 4.5:1 (they are painted
 #      with muted.foreground; the old #6e738d was 3.28:1). Last, since the

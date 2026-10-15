@@ -1933,7 +1933,7 @@ impl Workspace {
             prompt: Some("Open folder".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
+            let Some(paths) = file_dialog(paths, cx).await else {
                 return;
             };
             let Some(folder) = paths.into_iter().next() else {
@@ -2933,7 +2933,7 @@ impl Workspace {
             prompt: Some("Open".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
+            let Some(paths) = file_dialog(paths, cx).await else {
                 return;
             };
             _ = this.update_in(cx, |this, window, cx| {
@@ -3042,7 +3042,7 @@ impl Workspace {
         };
         let chosen = cx.prompt_for_new_path(&dir, Some(&name));
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(path))) = chosen.await else {
+            let Some(path) = file_dialog(chosen, cx).await else {
                 return;
             };
             _ = this.update_in(cx, |this, window, cx| {
@@ -3132,7 +3132,7 @@ impl Workspace {
         let base_dir = doc.dir();
         let chosen = cx.prompt_for_new_path(&dir, Some(&name));
         cx.spawn_in(window, async move |_, cx| {
-            let Ok(Ok(Some(path))) = chosen.await else {
+            let Some(path) = file_dialog(chosen, cx).await else {
                 return;
             };
             let target = path.clone();
@@ -5511,6 +5511,40 @@ fn esc_closes(content: impl IntoElement) -> gpui_kit::Div {
         .child(content)
 }
 
+/// A file dialog's answer: `Ok(Some)` is a choice, `Ok(None)` a cancel, and
+/// `Err` the message to show — the dialog itself failed to open (on Linux,
+/// typically no xdg-desktop-portal), which must not look like a cancel.
+fn file_dialog_outcome<T, E: std::fmt::Display, C: std::fmt::Display>(
+    answer: Result<Result<Option<T>, E>, C>,
+) -> Result<Option<T>, String> {
+    let detail = match answer {
+        Ok(Ok(chosen)) => return Ok(chosen),
+        Ok(Err(err)) => err.to_string(),
+        Err(err) => err.to_string(),
+    };
+    Err(format!(
+        "Couldn't open the file dialog. {detail}\n\
+         On Linux this needs xdg-desktop-portal with a backend such as \
+         xdg-desktop-portal-gtk."
+    ))
+}
+
+/// Wait for a file dialog; a failure to show it becomes an error
+/// notification instead of a silent no-op.
+async fn file_dialog<T, E: std::fmt::Display, C: std::fmt::Display>(
+    answer: impl std::future::Future<Output = Result<Result<Option<T>, E>, C>>,
+    cx: &mut gpui_kit::AsyncWindowContext,
+) -> Option<T> {
+    match file_dialog_outcome(answer.await) {
+        Ok(chosen) => chosen,
+        Err(message) => {
+            eprintln!("malgel: {message}");
+            _ = cx.update(|window, cx| window.push_notification(Notification::error(message), cx));
+            None
+        }
+    }
+}
+
 /// Whether a loading tab may stand in for a file while it loads: only when
 /// it takes a new tab or a slot nobody is using (a blank document or the
 /// preview tab), never when it would replace a document being worked on.
@@ -5530,6 +5564,22 @@ fn tab_needs_reveal(revealed: Option<(usize, usize)>, now: (usize, usize)) -> bo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_file_dialog_that_cannot_open_is_an_error_not_a_cancel() {
+        use super::file_dialog_outcome;
+        let chosen: Result<Result<Option<u8>, String>, String> = Ok(Ok(Some(1)));
+        assert_eq!(file_dialog_outcome(chosen), Ok(Some(1)));
+        let cancelled: Result<Result<Option<u8>, String>, String> = Ok(Ok(None));
+        assert_eq!(file_dialog_outcome(cancelled), Ok(None));
+        let failed: Result<Result<Option<u8>, String>, String> =
+            Ok(Err("org.freedesktop.portal.Desktop not found".into()));
+        let message = file_dialog_outcome(failed).unwrap_err();
+        assert!(message.starts_with("Couldn't open the file dialog. org.freedesktop"));
+        assert!(message.contains("xdg-desktop-portal-gtk"));
+        let dropped: Result<Result<Option<u8>, String>, String> = Err("canceled".into());
+        assert!(file_dialog_outcome(dropped).is_err());
+    }
+
     #[test]
     fn a_binary_file_that_is_not_text_gets_no_way_to_open_it() {
         use super::{OpenChoice::*, open_choices};
