@@ -463,6 +463,20 @@ sleep 0.5
 [[ "$(cat "$WS/README.md")" == "$before_chord" ]] \
   || fail "Ctrl+K Ctrl+T in the editor changed the text (Insert Link ate the chord)"
 pass "Ctrl+K Ctrl+T in the editor opens the theme picker"
+# Ctrl+K followed by any other key is still Insert Link (the chord only
+# holds the first key back), and the other key is typed after it.
+xdotool key --clearmodifiers ctrl+End
+xdotool key --clearmodifiers ctrl+k
+sleep 0.15
+xdotool type --delay 30 'zq'
+sleep 0.4
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 grep -q '\](' "$WS/README.md" \
+  || fail "Ctrl+K then another key did not insert a link: $(tail -c 80 "$WS/README.md")"
+grep -q 'zq' "$WS/README.md" || fail "the key after Ctrl+K was lost"
+printf '%s' "$before_chord" >"$WS/README.md"
+sleep 1.0
+pass "Ctrl+K then another key inserts a link and keeps the key"
 
 # 5. Ctrl+B in the editor is Bold, as in VS Code (Toggle Side Bar is the same
 #    key outside the editor). Assert on the file, not the pixels.
