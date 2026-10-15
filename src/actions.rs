@@ -207,9 +207,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-w", CloseOtherTabs, workspace),
         // VS Code's Close All Editors and Reopen Closed Editor.
         KeyBinding::new("secondary-k secondary-w", CloseAllTabs, workspace),
-        // VS Code's chord, where Ctrl+K is not taken: outside the editor
-        // (there it is Link) and off macOS (see Open folder above). The
-        // palette's "Color theme…" reaches it from anywhere.
+        // VS Code's chord, off macOS (see Open folder above); the editor
+        // binds it again beside Link. The palette's "Color theme…" reaches
+        // it from anywhere.
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("secondary-k secondary-t", SelectColorTheme, workspace),
         KeyBinding::new("secondary-shift-t", ReopenClosedEditor, workspace),
@@ -284,6 +284,24 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-x", Strikethrough, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-e", InlineCode, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-k", InsertLink, Some(EDITOR_CONTEXT)),
+        // The workspace's Ctrl+K chords, again in the editor: its single-key
+        // Link sits deeper and would otherwise take the first Ctrl+K before
+        // the chord could complete. With both here, Ctrl+K waits for the
+        // second key, and anything else (or a pause) still inserts a link.
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new(
+            "secondary-k secondary-t",
+            SelectColorTheme,
+            Some(EDITOR_CONTEXT),
+        ),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("secondary-k secondary-o", OpenFolder, Some(EDITOR_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new(
+            "secondary-k secondary-w",
+            CloseAllTabs,
+            Some(EDITOR_CONTEXT),
+        ),
         KeyBinding::new("secondary-shift-c", CodeBlock, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-shift-.", Quote, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-shift-8", BulletList, Some(EDITOR_CONTEXT)),
