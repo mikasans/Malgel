@@ -357,6 +357,10 @@ pub struct Workspace {
     find_results: Entity<CommandState>,
     /// The running or finished Find in Files search its dialog shows.
     find_progress: Option<FindProgress>,
+    /// The text Find in Files last looked for, offered again next time.
+    last_find: String,
+    /// Focus for the "Searching…" dialog, so its keys reach it.
+    find_focus: FocusHandle,
     file_tree: Entity<FileTree>,
     app_menu_bar: Entity<AppMenuBar>,
 
@@ -506,6 +510,8 @@ impl Workspace {
             find_query,
             find_results,
             find_progress: None,
+            last_find: String::new(),
+            find_focus: cx.focus_handle(),
             file_tree,
             app_menu_bar,
             window_title: String::new(),
@@ -2085,7 +2091,7 @@ impl Workspace {
             let typed = state.clone();
             let workspace = workspace.clone();
             let apply = apply.clone();
-            dialog.close_button(false).p_0().child(
+            dialog.close_button(false).p_0().child(esc_closes(
                 Command::new(&state)
                     .bordered(false)
                     .filterable(false)
@@ -2098,7 +2104,7 @@ impl Workspace {
                         _ = workspace.update(cx, |this, cx| apply(this, text, window, cx));
                     })
                     .on_cancel(|window, cx| window.close_dialog(cx)),
-            )
+            ))
         });
     }
 
@@ -2141,15 +2147,39 @@ impl Workspace {
             window.push_notification(Notification::info("Open a folder to search its files."), cx);
             return;
         }
+        // Ctrl+Shift+F over the results (or while searching) starts over:
+        // the results give way to the question, asked again with the last
+        // text, selected so typing replaces it.
+        if window.has_active_dialog(cx) {
+            if self.find_progress.is_none() {
+                return;
+            }
+            if let Some(progress) = self.find_progress.take() {
+                progress.cancel.store(true, Ordering::Relaxed);
+            }
+            window.close_dialog(cx);
+        }
+        let last = self.last_find.clone();
         Self::prompt_line(
             &self.find_query.clone(),
             "Find in files".into(),
             "Text to find".into(),
-            "",
+            &last,
             window,
             cx,
             |this, query, window, cx| this.search_folder(query, window, cx),
         );
+        if !last.is_empty() {
+            cx.spawn_in(window, async move |_, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(60))
+                    .await;
+                _ = cx.update(|window, cx| {
+                    window.dispatch_action(Box::new(gpui_kit::component::input::SelectAll), cx)
+                });
+            })
+            .detach();
+        }
     }
 
     /// Walk the folder's files and search their text.
@@ -2160,6 +2190,7 @@ impl Workspace {
         if needle.is_empty() {
             return;
         }
+        self.last_find = needle.clone();
         // The walk and the reads are off the UI thread: a folder of notes
         // runs to thousands of files, and the window used to sit still while
         // Quick Open listed them for the same reason. The results dialog
@@ -2220,6 +2251,8 @@ impl Workspace {
         }
         let state = self.find_results.clone();
         let workspace = cx.weak_entity();
+        let find_focus = self.find_focus.clone();
+        window.focus(&find_focus, cx);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let Some(this) = workspace.upgrade() else {
                 return dialog;
@@ -2229,10 +2262,20 @@ impl Workspace {
             };
             let query = progress.query.clone();
             let stop = progress.cancel.clone();
-            let dialog = dialog.close_button(false).p_0().on_close({
-                let stop = stop.clone();
-                move |_, _, _| stop.store(true, Ordering::Relaxed)
-            });
+            let again = workspace.clone();
+            let dialog = dialog
+                .close_button(false)
+                .p_0()
+                .on_close({
+                    let stop = stop.clone();
+                    move |_, _, _| stop.store(true, Ordering::Relaxed)
+                })
+                .child(div().track_focus(&find_focus).on_action(
+                    move |_: &FindInFiles, window, cx| {
+                        _ = again
+                            .update(cx, |this, cx| this.find_in_files(&FindInFiles, window, cx));
+                    },
+                ));
             let Some(hits) = progress.hits.clone() else {
                 return dialog.child(
                     h_flex()
@@ -2292,13 +2335,13 @@ impl Workspace {
             });
             let picked = hits.clone();
             let workspace = workspace.clone();
-            dialog.child(
+            dialog.child(esc_closes(
                 Command::new(&state)
                     .bordered(false)
                     .placeholder("Filter the matches")
                     .max_h(rems(24.))
                     .items(items)
-                    .empty(|_, _, _| "No matching lines")
+                    .empty(|_, _, _| div().px_3().py_2().child("No matching lines"))
                     .on_confirm(move |index: IndexPath, window, cx| {
                         window.close_dialog(cx);
                         let Some(hit) = picked.get(index.row).cloned() else {
@@ -2307,7 +2350,7 @@ impl Workspace {
                         _ = workspace.update(cx, |this, cx| this.open_hit(&hit, window, cx));
                     })
                     .on_cancel(|window, cx| window.close_dialog(cx)),
-            )
+            ))
         });
     }
 
@@ -3122,7 +3165,7 @@ impl Workspace {
                     .icon(heading_icon(heading.level))
             });
             let confirm = doc.clone();
-            dialog.close_button(false).p_0().child(
+            dialog.close_button(false).p_0().child(esc_closes(
                 Command::new(&headings)
                     .bordered(false)
                     .placeholder("Go to heading")
@@ -3134,7 +3177,7 @@ impl Workspace {
                         confirm.update(cx, |doc, cx| doc.reveal_heading(index.row, window, cx));
                     })
                     .on_cancel(|window, cx| window.close_dialog(cx)),
-            )
+            ))
         });
     }
 
@@ -3215,7 +3258,7 @@ impl Workspace {
             });
             let picked = rows.clone();
             let navigate = state.clone();
-            dialog.close_button(false).p_0().child(
+            dialog.close_button(false).p_0().child(esc_closes(
                 Command::new(&state)
                     .bordered(false)
                     .placeholder("Search files by name, or type a path")
@@ -3241,7 +3284,7 @@ impl Workspace {
                         window.dispatch_action(Box::new(OpenQuickPath(row.path, row.line)), cx);
                     })
                     .on_cancel(|window, cx| window.close_dialog(cx)),
-            )
+            ))
         });
     }
 
@@ -3307,9 +3350,9 @@ impl Workspace {
                 |command, group| command.group(group),
             );
             let ws_focus = ws_focus.clone();
-            dialog.close_button(false).p_0().child(
+            dialog.close_button(false).p_0().child(esc_closes(
                 command
-                    .empty(|_, _, _| "No matching commands")
+                    .empty(|_, _, _| div().px_3().py_2().child("No matching commands"))
                     .on_confirm(move |index: IndexPath, window, cx| {
                         window.close_dialog(cx);
                         let Some(action) = actions
@@ -3329,7 +3372,7 @@ impl Workspace {
                         });
                     })
                     .on_cancel(|window, cx| window.close_dialog(cx)),
-            )
+            ))
         });
     }
 
@@ -3347,7 +3390,7 @@ impl Workspace {
             let focus = state.read(cx).focus_handle(cx);
             window.defer(cx, move |window, cx| focus.focus(window, cx));
             let typed = state.clone();
-            dialog.close_button(false).p_0().child(
+            dialog.close_button(false).p_0().child(esc_closes(
                 Command::new(&state)
                     .bordered(false)
                     .filterable(false)
@@ -3372,7 +3415,7 @@ impl Workspace {
                         }
                     })
                     .on_cancel(|window, cx| window.close_dialog(cx)),
-            )
+            ))
         });
     }
 
@@ -5004,6 +5047,26 @@ pub fn restored_bounds(cx: &App) -> Option<WindowBounds> {
         WindowBounds::Windowed(bounds)
     };
     visible.then_some(bounds)
+}
+
+/// A palette or picker that one Escape closes, whatever has been typed into
+/// it, as VS Code's quick input does (the list's own Escape clears the
+/// query first).
+fn esc_closes(content: impl IntoElement) -> gpui_kit::Div {
+    div()
+        .capture_action(|_: &gpui_kit::base::actions::Cancel, window, cx| {
+            window.close_dialog(cx);
+            cx.stop_propagation();
+        })
+        // Ctrl+Shift+F over a picker leaves it for Find in Files, rather
+        // than being typed into the picker's query.
+        .on_action(|_: &FindInFiles, window, cx| {
+            window.close_dialog(cx);
+            window.defer(cx, |window, cx| {
+                window.dispatch_action(Box::new(FindInFiles), cx)
+            });
+        })
+        .child(content)
 }
 
 /// Whether a loading tab may stand in for a file while it loads: only when
