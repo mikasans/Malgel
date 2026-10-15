@@ -88,6 +88,7 @@ actions!(
         TaskList,
         MoveLineUp,
         MoveLineDown,
+        ToggleLineComment,
     ]
 );
 
@@ -325,6 +326,8 @@ pub fn bind_keys(cx: &mut App) {
         // the editor library binds Ctrl+Alt+↑/↓ (and Shift+Alt+↑/↓) to adding
         // a cursor above and below, and Alt+←/→ to moving by word, so this
         // pair does not fight either.
+        // VS Code's Toggle Line Comment.
+        KeyBinding::new("secondary-/", ToggleLineComment, Some(EDITOR_CONTEXT)),
         KeyBinding::new("alt-up", MoveLineUp, Some(EDITOR_CONTEXT)),
         KeyBinding::new("alt-down", MoveLineDown, Some(EDITOR_CONTEXT)),
     ]);

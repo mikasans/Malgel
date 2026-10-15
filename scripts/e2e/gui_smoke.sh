@@ -501,6 +501,31 @@ sleep 0.2
 xdotool key --clearmodifiers ctrl+s
 wait_for 5 bash -c "! grep -q 'RDO' '$WS/README.md'" || fail "could not take RDO back out"
 pass "Ctrl+Shift+Z redoes"
+# Ctrl+/ toggles a line comment (Markdown: <!-- -->); one Ctrl+Z undoes it.
+xdotool key --clearmodifiers ctrl+s
+sleep 0.3
+before_comment="$(cat "$WS/README.md")"
+xdotool key --clearmodifiers ctrl+Home
+xdotool key --clearmodifiers ctrl+slash
+sleep 0.3
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 bash -c "head -1 '$WS/README.md' | grep -q '^<!-- .* -->$'" \
+  || fail "Ctrl+/ did not comment the line: $(head -1 "$WS/README.md")"
+xdotool key --clearmodifiers ctrl+z
+sleep 0.3
+xdotool key --clearmodifiers ctrl+s
+sleep 0.6
+[[ "$(cat "$WS/README.md")" == "$before_comment" ]] \
+  || fail "one Ctrl+Z did not undo the comment toggle: $(head -1 "$WS/README.md")"
+xdotool key --clearmodifiers ctrl+slash
+sleep 0.2
+xdotool key --clearmodifiers ctrl+slash
+sleep 0.2
+xdotool key --clearmodifiers ctrl+s
+sleep 0.6
+[[ "$(cat "$WS/README.md")" == "$before_comment" ]] \
+  || fail "Ctrl+/ twice did not give the line back: $(head -1 "$WS/README.md")"
+pass "Ctrl+/ toggles a line comment in one undo step"
 
 # 5. Ctrl+B in the editor is Bold, as in VS Code (Toggle Side Bar is the same
 #    key outside the editor). Assert on the file, not the pixels.

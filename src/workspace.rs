@@ -5325,6 +5325,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &TidyTable, window, cx| {
                 this.with_active(window, cx, |doc, window, cx| doc.tidy_table(window, cx))
             }))
+            .on_action(cx.listener(|this, _: &ToggleLineComment, window, cx| {
+                this.with_active(window, cx, |doc, window, cx| {
+                    doc.toggle_line_comment(window, cx)
+                })
+            }))
             .on_action(cx.listener(|this, _: &MoveLineUp, window, cx| {
                 this.with_active(window, cx, |doc, window, cx| {
                     doc.move_lines(format::LineMove::Up, window, cx)

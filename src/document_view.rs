@@ -1859,6 +1859,28 @@ impl DocumentView {
             .update(cx, |editor, cx| editor.focus(window, cx));
     }
 
+    /// Comment the selected lines out, or back in (Ctrl+/), in this file
+    /// type's comment syntax; Markdown and untitled documents use `<!-- -->`.
+    pub fn toggle_line_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ext = match self.path.as_deref() {
+            Some(path) => path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(str::to_ascii_lowercase),
+            None => Some("md".to_string()),
+        };
+        let Some(style) = format::comment_style(ext.as_deref()) else {
+            return;
+        };
+        let text = self.editor.read(cx).value().to_string();
+        let selection = self.editor.read(cx).selected_range();
+        if let Some(edit) = format::toggle_line_comment(&text, selection, style) {
+            self.apply(edit, window, cx);
+        }
+        self.editor
+            .update(cx, |editor, cx| editor.focus(window, cx));
+    }
+
     /// Show or hide the page thumbnails, when a PDF is open. Nothing happens
     /// for any other kind of document.
     pub fn toggle_pdf_thumbnails(&mut self, cx: &mut Context<Self>) {
