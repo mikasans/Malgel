@@ -1032,6 +1032,19 @@ impl Workspace {
     }
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_inner(ix, true, window, cx);
+    }
+
+    /// Switch the active tab. Pass `focus: false` when an alert is about to
+    /// open: `focus_active` defers editor focus and would steal the dialog's
+    /// focus trap (Esc/Tab dead, typed keys leak into the buffer).
+    fn activate_inner(
+        &mut self,
+        ix: usize,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.documents.is_empty() {
             return;
         }
@@ -1039,7 +1052,9 @@ impl Workspace {
         if let Some(path) = self.documents[self.active].read(cx).path().cloned() {
             self.record_navigation(path);
         }
-        self.focus_active(window, cx);
+        if focus {
+            self.focus_active(window, cx);
+        }
         self.sync_file_tree(cx);
         self.save_session(window, cx);
         cx.notify();
@@ -1236,6 +1251,11 @@ impl Workspace {
             alert
                 .title(title)
                 .description(description.clone())
+                .keyboard(true)
+                .on_cancel(|_, window, cx| {
+                    window.close_dialog(cx);
+                    true
+                })
                 .footer(footer)
         });
     }
@@ -1670,7 +1690,7 @@ impl Workspace {
                 // conflict. The stamp advances only when the user chooses.
                 self.pending_disk_prompt.insert(id);
                 if let Some(ix) = self.document_index(id) {
-                    self.activate(ix, window, cx);
+                    self.activate_inner(ix, false, window, cx);
                 }
                 self.open_disk_conflict(doc, id, name, text, line_ending, stamp, window, cx);
             }
@@ -1695,12 +1715,10 @@ impl Workspace {
         let workspace = cx.weak_entity();
         let text = Arc::new(text);
         let decided = Rc::new(Cell::new(false));
-        window.open_alert_dialog(cx, move |alert, window, cx| {
-            let focus = cx.focus_handle();
-            window.defer(cx, {
-                let focus = focus.clone();
-                move |window, cx| focus.focus(window, cx)
-            });
+        // Do not focus a fresh handle here: open_dialog already focuses the
+        // alert's own focus trap. A deferred cx.focus_handle() steals focus
+        // from the dialog, so Esc/Tab die and typed keys leak into the editor.
+        window.open_alert_dialog(cx, move |alert, _, cx| {
             let keep = {
                 let workspace = workspace.clone();
                 let doc = doc.clone();
@@ -1719,6 +1737,7 @@ impl Workspace {
             };
             let keep_btn = keep.clone();
             let keep_esc = keep.clone();
+            let keep_ok = keep.clone();
             let reload = workspace.clone();
             let reload_doc = doc.clone();
             let reload_text = text.clone();
@@ -1733,6 +1752,11 @@ impl Workspace {
                 .keyboard(true)
                 .on_cancel(move |_, window, cx| {
                     keep_esc(window, cx);
+                    true
+                })
+                .on_ok(move |_, window, cx| {
+                    // Enter activates the primary button (Keep my changes).
+                    keep_ok(window, cx);
                     true
                 })
                 .footer(
@@ -2577,7 +2601,7 @@ impl Workspace {
 
         match pending {
             Some((ix, doc)) => {
-                self.activate(ix, window, cx);
+                self.activate_inner(ix, false, window, cx);
                 self.confirm_unsaved(doc, AfterConfirm::CloseDocuments(valid_targets), window, cx);
             }
             None => {
@@ -2625,7 +2649,7 @@ impl Workspace {
         match pending.cloned() {
             Some(doc) => {
                 if let Some(ix) = self.document_index(doc.entity_id()) {
-                    self.activate(ix, window, cx);
+                    self.activate_inner(ix, false, window, cx);
                 }
                 self.confirm_unsaved(doc, next, window, cx);
             }
@@ -2656,9 +2680,34 @@ impl Workspace {
             let (save, discard, cancel) = (workspace.clone(), workspace.clone(), workspace.clone());
             let (save_next, discard_next) = (next.clone(), next.clone());
             let (save_doc, discard_doc) = (doc.clone(), doc.clone());
+            let cancel_esc = cancel.clone();
+            let save_ok = save.clone();
+            let save_ok_next = next.clone();
+            let save_ok_doc = doc.clone();
             alert
                 .title(format!("Save changes to “{name}”?"))
                 .description("Your changes will be lost if you don’t save them.")
+                .keyboard(true)
+                .on_cancel(move |_, window, cx| {
+                    // Esc = Cancel: leave the buffer dirty and restore focus.
+                    window.close_dialog(cx);
+                    _ = cancel_esc.update(cx, |this, cx| {
+                        this.discarded.clear();
+                        this.focus_active(window, cx);
+                    });
+                    true
+                })
+                .on_ok(move |_, window, cx| {
+                    // Enter = Save (primary).
+                    window.close_dialog(cx);
+                    let next = save_ok_next.clone();
+                    let doc = save_ok_doc.clone();
+                    _ = save_ok.update(cx, |this, cx| {
+                        this.focus_active(window, cx);
+                        this.save_document(doc, Some(next), window, cx)
+                    });
+                    true
+                })
                 .footer(
                     DialogFooter::new()
                         .justify_end()
@@ -5598,15 +5647,23 @@ mod tests {
         });
     }
 
+    /// The gate save_document uses: while an id is in pending_disk_prompt,
+    /// a save must re-open the conflict dialog instead of writing. Esc/Keep
+    /// and Overwrite/Reload clear the set (see open_disk_conflict).
     #[test]
     fn save_refuses_while_disk_conflict_is_pending() {
-        // pending_disk_prompt membership is what save_document checks before write.
         let mut pending: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        pending.insert(42);
-        assert!(pending.contains(&42), "conflict pending blocks save");
-        pending.remove(&42);
+        let id = 42u64;
+        assert!(!pending.contains(&id), "fresh document is free to save");
+        pending.insert(id);
         assert!(
-            !pending.contains(&42),
+            pending.contains(&id),
+            "conflict pending blocks silent overwrite"
+        );
+        // Esc = Keep (and Overwrite/Reload) clear the gate.
+        pending.remove(&id);
+        assert!(
+            !pending.contains(&id),
             "after Keep/Overwrite/Reload, save may proceed"
         );
     }

@@ -664,9 +664,21 @@ impl FileTree {
         let targets = paths.clone();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (tree_delete, delete_targets) = (tree.clone(), targets.clone());
+            let tree_ok = tree_delete.clone();
+            let delete_ok = delete_targets.clone();
             alert
                 .title(title.clone())
                 .description("They are removed from disk and can’t be recovered.")
+                .keyboard(true)
+                .on_cancel(|_, window, cx| {
+                    window.close_dialog(cx);
+                    true
+                })
+                .on_ok(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    _ = tree_ok.update(cx, |tree, cx| tree.apply_delete(delete_ok.clone(), cx));
+                    true
+                })
                 .footer(
                     DialogFooter::new()
                         .justify_end()
@@ -1055,6 +1067,12 @@ impl FileTree {
             let (checkbox, remember) = (dont_ask.clone(), dont_ask.clone());
             let (tree_move, target_move) = (tree.clone(), target_dir.clone());
             let (title, sources_move) = (title.clone(), sources.clone());
+            let (tree_ok, target_ok, sources_ok, remember_ok) = (
+                tree_move.clone(),
+                target_move.clone(),
+                sources_move.clone(),
+                remember.clone(),
+            );
             alert
                 .title(title)
                 .description(
@@ -1068,6 +1086,23 @@ impl FileTree {
                             }),
                     ),
                 )
+                .keyboard(true)
+                .on_cancel(|_, window, cx| {
+                    window.close_dialog(cx);
+                    true
+                })
+                .on_ok(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    if remember_ok.get() {
+                        crate::themes::AppSettings::update(cx, |settings| {
+                            settings.confirm_drag_and_drop = false
+                        });
+                    }
+                    _ = tree_ok.update(cx, |tree, cx| {
+                        tree.apply_moves(sources_ok.clone(), &target_ok, cx)
+                    });
+                    true
+                })
                 .footer(
                     DialogFooter::new()
                         .justify_end()

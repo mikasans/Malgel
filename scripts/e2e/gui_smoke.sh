@@ -322,7 +322,16 @@ pass "command palette opens, filters and closes (Ctrl+Shift+P)"
 
 # 4. Ctrl+P opens Quick Open over the workspace files.
 xdotool key --clearmodifiers ctrl+p
+sleep 0.6
 shot 06-quick-open
+if [[ "$(pixels_differ 05-after-palette 06-quick-open)" -le 1000 ]]; then
+  # Palette dismiss can race Quick Open on slow CI; try once more.
+  xdotool key --clearmodifiers Escape
+  sleep 0.3
+  xdotool key --clearmodifiers ctrl+p
+  sleep 0.8
+  shot 06-quick-open
+fi
 [[ "$(pixels_differ 05-after-palette 06-quick-open)" -gt 1000 ]] \
   || fail "Ctrl+P did not change the frame"
 dismiss
@@ -872,6 +881,8 @@ PY
 pass "gutter: 3-digit and 5-digit files open (growth when measurable)"
 
 # 21b. External edit while dirty: Ctrl+S must not clobber the on-disk line.
+#     The conflict alert must take keyboard focus: typing must not reach the
+#     file, and Esc must dismiss the dialog (Keep) without writing.
 printf 'local\n' >"$WS/notes/conflict.md"
 xdotool key --clearmodifiers ctrl+p
 sleep 0.5
@@ -884,12 +895,23 @@ sleep 0.3
 printf 'X\n' >>"$WS/notes/conflict.md"
 sleep 0.8
 xdotool key --clearmodifiers ctrl+s
-sleep 0.5
-# Esc = Keep my changes (does not write); the X line must remain on disk.
+sleep 1.0
+shot 44-conflict-open
+[[ "$(colours 44-conflict-open)" -gt 8 ]] || fail "conflict dialog frame is blank"
+# Keys must stay on the dialog, not leak into the buffer / file.
+xdotool type --delay 30 'LEAK'
+sleep 0.3
+xdotool key --clearmodifiers Tab
+sleep 0.2
+! grep -q 'LEAK' "$WS/notes/conflict.md"   || fail "typed keys while the conflict dialog was open reached the file on disk"
+# Esc = Keep my changes (does not write); dialog must close.
 xdotool key --clearmodifiers Escape
-sleep 0.4
-grep -q '^X$' "$WS/notes/conflict.md" || fail "Ctrl+S during a disk conflict clobbered the external X line"
-pass "disk conflict: Ctrl+S does not clobber an external write (Esc keeps buffer)"
+sleep 0.8
+shot 45-conflict-esc
+[[ "$(pixels_differ 44-conflict-open 45-conflict-esc)" -gt 1000 ]]   || fail "Esc did not dismiss the disk conflict dialog"
+grep -q '^X$' "$WS/notes/conflict.md"   || fail "Ctrl+S during a disk conflict clobbered the external X line"
+! grep -q 'LEAK' "$WS/notes/conflict.md"   || fail "Esc/Keep wrote leaked keystrokes to disk"
+pass "disk conflict: dialog holds focus; Esc keeps buffer and dismisses"
 
 # 22. Still alive at the end — no crash from any of the above.
 kill -0 "$APP_PID" 2>/dev/null || fail "process died during the run"
