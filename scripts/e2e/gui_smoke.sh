@@ -83,25 +83,25 @@ export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share"
 # a server by display number: another run (or a reviewer's) may own it, and
 # killing it mid-run is exactly the kind of "flake" that wastes a day.
 start_xvfb() {
-  local fdfile="$TMP_ROOT/xvfb-display"
-  : >"$fdfile"
-  if [[ -n "${E2E_DISPLAY:-}" ]]; then
-    Xvfb "$DISPLAY_NUM" -screen 0 1600x1000x24 +extension GLX +render -nolisten tcp \
-      >"$ART_DIR/xvfb.log" 2>&1 &
-  else
-    Xvfb -displayfd 3 -screen 0 1600x1000x24 +extension GLX +render -nolisten tcp \
-      3>"$fdfile" >"$ART_DIR/xvfb.log" 2>&1 &
+  local n
+  if [[ -z "${E2E_DISPLAY:-}" ]]; then
+    # First display from :99 up with neither a lock nor a socket.
+    for n in $(seq 99 160); do
+      [[ -e "/tmp/.X${n}-lock" || -e "/tmp/.X11-unix/X${n}" ]] || break
+    done
+    DISPLAY_NUM=":$n"
   fi
+  export DISPLAY="$DISPLAY_NUM"
+  Xvfb "$DISPLAY_NUM" -screen 0 1600x1000x24 +extension GLX +render -nolisten tcp \
+    >"$ART_DIR/xvfb.log" 2>&1 &
   XVFB_PID=$!
-  for _ in $(seq 1 50); do
-    if [[ -z "${E2E_DISPLAY:-}" && -s "$fdfile" ]]; then
-      DISPLAY_NUM=":$(tr -dc 0-9 <"$fdfile")"
-    fi
-    export DISPLAY="$DISPLAY_NUM"
-    [[ -n "$DISPLAY" && "$DISPLAY" != ":" ]] && xdotool getdisplaygeometry >/dev/null 2>&1 && return 0
+  for _ in $(seq 1 100); do
+    xdotool getdisplaygeometry >/dev/null 2>&1 && return 0
+    kill -0 "$XVFB_PID" 2>/dev/null || break # lost a race for that display
     sleep 0.1
   done
   kill "$XVFB_PID" 2>/dev/null || true
+  [[ -z "${E2E_DISPLAY:-}" ]] && DISPLAY_NUM=""
   return 1
 }
 start_xvfb || start_xvfb || { cat "$ART_DIR/xvfb.log" >&2; fail "Xvfb did not come up on $DISPLAY_NUM"; }
@@ -474,8 +474,15 @@ xdotool key --clearmodifiers ctrl+s
 wait_for 5 grep -q '\](' "$WS/README.md" \
   || fail "Ctrl+K then another key did not insert a link: $(tail -c 80 "$WS/README.md")"
 grep -q 'zq' "$WS/README.md" || fail "the key after Ctrl+K was lost"
-printf '%s' "$before_chord" >"$WS/README.md"
-sleep 1.0
+# Put it back from inside the editor (an external rewrite races the reload).
+for _ in 1 2 3 4 5 6; do
+  [[ "$(cat "$WS/README.md")" == "$before_chord" ]] && break
+  xdotool key --clearmodifiers ctrl+z
+  sleep 0.2
+  xdotool key --clearmodifiers ctrl+s
+  sleep 0.5
+done
+[[ "$(cat "$WS/README.md")" == "$before_chord" ]] || fail "undo did not take the link back out"
 pass "Ctrl+K then another key inserts a link and keeps the key"
 
 # 5. Ctrl+B in the editor is Bold, as in VS Code (Toggle Side Bar is the same
