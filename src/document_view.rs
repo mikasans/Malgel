@@ -559,6 +559,16 @@ impl DocumentView {
         crate::document::language_name(self.path.as_deref()).into()
     }
 
+    /// A Typst source opened as text because it did not compile, which
+    /// turns into its pages once it does.
+    pub fn is_typst_source(&self) -> bool {
+        self.typst.is_none()
+            && self
+                .path
+                .as_deref()
+                .is_some_and(crate::document::is_typst_path)
+    }
+
     /// The indentation the status bar names.
     pub fn indent(&self) -> crate::document::Indent {
         self.indent
@@ -763,7 +773,7 @@ impl DocumentView {
             .filter(|path| !crate::document::is_markdown_path(path))
             .and_then(crate::document::language_tag)
             .unwrap_or("markdown");
-        let indent = crate::document::detect_indent(&text);
+        let indent = crate::document::detect_indent_for(&text, self.path.as_deref());
         self.indent = indent;
         self.editor.update(cx, |editor, cx| {
             editor.set_highlighter(language, cx);

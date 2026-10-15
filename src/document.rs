@@ -132,7 +132,7 @@ pub fn is_markdown_path(path: &Path) -> bool {
         .is_some_and(|ext| {
             matches!(
                 ext.to_ascii_lowercase().as_str(),
-                "md" | "markdown" | "mdown" | "mkd" | "mkdn" | "mdx" | "txt"
+                "md" | "markdown" | "mdown" | "mkd" | "mkdn" | "mdx"
             )
         })
 }
@@ -297,7 +297,46 @@ impl Indent {
 /// with a tab than with spaces, otherwise the most common step between the
 /// indentation of neighbouring lines. Only the first lines are read, so a
 /// huge file costs no more than a small one.
+#[cfg(test)]
 pub fn detect_indent(text: &str) -> Indent {
+    detect_indent_or(text, Indent::DEFAULT)
+}
+
+/// The indentation a file of this kind uses when its text gives nothing to
+/// go by, after VS Code's per-language defaults: four spaces for the C
+/// family, Python and the like, tabs where the language wants them (Go,
+/// Makefiles), two spaces for Markdown, JSON, YAML and the web.
+pub fn default_indent(path: Option<&Path>) -> Indent {
+    let tabs = Indent {
+        hard_tabs: true,
+        size: 4,
+    };
+    let four = Indent {
+        hard_tabs: false,
+        size: 4,
+    };
+    if path
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("makefile") || name == "GNUmakefile")
+    {
+        return tabs;
+    }
+    match language_name(path) {
+        "Go" | "Makefile" => tabs,
+        "Rust" | "Python" | "Java" | "C" | "C++" | "C#" | "PHP" | "Kotlin" | "Swift" | "Scala"
+        | "Shell Script" | "Plain Text" | "Lua" | "Zig" | "CMake" => four,
+        _ => Indent::DEFAULT,
+    }
+}
+
+/// [`detect_indent`] with the language's own default for text that shows no
+/// indentation.
+pub fn detect_indent_for(text: &str, path: Option<&Path>) -> Indent {
+    detect_indent_or(text, default_indent(path))
+}
+
+fn detect_indent_or(text: &str, fallback: Indent) -> Indent {
     const MAX_LINES: usize = 10_000;
     let mut tab_lines = 0usize;
     let mut space_lines = 0usize;
@@ -324,7 +363,7 @@ pub fn detect_indent(text: &str) -> Indent {
     if tab_lines > space_lines {
         return Indent {
             hard_tabs: true,
-            size: 4,
+            size: if fallback.hard_tabs { fallback.size } else { 4 },
         };
     }
     // Ties go to the smaller step: 2 and 4 both explain a 4-space nest.
@@ -334,7 +373,7 @@ pub fn detect_indent(text: &str) -> Indent {
             hard_tabs: false,
             size,
         },
-        _ => Indent::DEFAULT,
+        _ => fallback,
     }
 }
 
@@ -370,6 +409,48 @@ mod tests {
         assert!(super::has_markdown_preview(None));
         assert!(super::has_markdown_preview(Some(Path::new("a.md"))));
         assert!(!super::has_markdown_preview(Some(Path::new("a.rs"))));
+    }
+
+    #[test]
+    fn indentation_falls_back_to_the_language_default() {
+        use super::{Indent, detect_indent_for};
+        use std::path::Path;
+        let four = Indent {
+            hard_tabs: false,
+            size: 4,
+        };
+        let tabs = Indent {
+            hard_tabs: true,
+            size: 4,
+        };
+        assert_eq!(
+            detect_indent_for("fn main() {}\n", Some(Path::new("a.rs"))),
+            four
+        );
+        assert_eq!(detect_indent_for("x = 1\n", Some(Path::new("a.py"))), four);
+        assert_eq!(
+            detect_indent_for("package a\n", Some(Path::new("a.go"))),
+            tabs
+        );
+        assert_eq!(
+            detect_indent_for("all:\n", Some(Path::new("Makefile"))),
+            tabs
+        );
+        assert_eq!(
+            detect_indent_for("{}\n", Some(Path::new("a.json"))),
+            Indent::DEFAULT
+        );
+        assert_eq!(detect_indent_for("# a\n", None), Indent::DEFAULT);
+        // Evidence in the text wins over the default.
+        assert_eq!(
+            detect_indent_for("fn a() {\n  b();\n}\n", Some(Path::new("a.rs"))),
+            Indent {
+                hard_tabs: false,
+                size: 2
+            }
+        );
+        assert!(!super::has_markdown_preview(Some(Path::new("notes.txt"))));
+        assert!(!super::is_markdown_path(Path::new("notes.txt")));
     }
 
     #[test]
