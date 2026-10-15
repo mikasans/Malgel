@@ -847,6 +847,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn saving_through_a_symlink_keeps_the_link() {
         let dir = std::env::temp_dir().join(format!("malgel-sym-{}", std::process::id()));
