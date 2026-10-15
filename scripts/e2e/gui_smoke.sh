@@ -942,6 +942,48 @@ shot 43b-wrapsel-click
   || fail "gutter click on wrap row copied '${GOT:0:80}' (at $GX,$GY)"
 pass "gutter click on a wrap continuation selects the logical line"
 
+# 21a2. After scrolling (Ctrl+End in the 12k-line file) a line-number click
+#       still selects: click the last line's number and copy it.
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'wide.md'
+xdotool key --clearmodifiers Return
+sleep 1.0
+xdotool key --clearmodifiers ctrl+End
+sleep 0.8
+shot 43c-scrolled
+read -r GX GY < <(python3 - "$ART_DIR/43c-scrolled.png" <<'PY'
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("L")
+w, h = im.size
+bg = im.getpixel((int(w * 0.6), int(h * 0.85)))
+rows, prev = [], False
+for y in range(int(h * 0.16), int(h * 0.875)):  # down to the status bar
+    xs = [x for x in range(int(w * 0.30), int(w * 0.75)) if abs(im.getpixel((x, y)) - bg) > 60]
+    ink = len(xs) >= 2
+    if ink and not prev:
+        rows.append([y, y, xs[0]])
+    if ink:
+        rows[-1][1] = y
+        rows[-1][2] = min(rows[-1][2], xs[0])
+    prev = ink
+assert rows, "no rows"
+y0, y1, x0 = rows[-1]
+print(x0 + 3, (y0 + y1) // 2)
+PY
+) || fail "could not locate the last line after Ctrl+End"
+printf '' | xclip -selection clipboard
+xdotool mousemove "$GX" "$GY" click 1
+sleep 0.4
+xdotool key --clearmodifiers ctrl+c
+sleep 0.4
+GOT="$(xclip -o -selection clipboard 2>/dev/null || true)"
+shot 43d-scrolled-click
+[[ "$GOT" == "w12000" ]] \
+  || fail "line-number click after Ctrl+End copied '${GOT:0:80}' (at $GX,$GY)"
+pass "line-number click after scrolling selects that line"
+
 # 21b. External edit while dirty: Ctrl+S must not clobber the on-disk line.
 #     The conflict alert must take keyboard focus: typing must not reach the
 #     file, and Esc must dismiss the dialog (Keep) without writing.

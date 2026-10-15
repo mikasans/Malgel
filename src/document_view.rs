@@ -1042,9 +1042,12 @@ impl DocumentView {
             return false;
         }
         let editor = self.editor.read(cx);
-        let Some(bounds) = editor.text_bounds() else {
+        // The viewport, not `text_bounds()`: those move with the scroll
+        // offset, so after scrolling the gutter test missed every click.
+        let bounds = editor.input_bounds();
+        if bounds.size.width <= px(0.) {
             return false;
-        };
+        }
         let font_size = rems(0.875).to_pixels(window.rem_size());
         let font = gpui_kit::font(cx.theme().mono_font_family.clone());
         let system = window.text_system();
