@@ -1426,7 +1426,8 @@ impl FileTree {
 }
 
 impl Render for FileTree {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.focus_handle.contains_focused(window, cx);
         let theme = cx.theme();
         let name = self
             .root
@@ -1469,12 +1470,23 @@ impl Render for FileTree {
                         })
                     }),
             )
+            .relative()
+            // The actions float over the end of the name instead of keeping
+            // their width while hidden, which cut a long name short.
             .child(
                 h_flex()
-                    .flex_none()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_1()
+                    .pl_1()
+                    .bg(theme.sidebar)
                     .items_center()
-                    .invisible()
-                    .group_hover("tree-header", |style| style.visible())
+                    .when(!focused, |actions| {
+                        actions
+                            .invisible()
+                            .group_hover("tree-header", |style| style.visible())
+                    })
                     .child(
                         Button::new("new-file")
                             .ghost()
