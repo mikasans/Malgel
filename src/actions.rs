@@ -58,6 +58,7 @@ actions!(
         ZoomReset,
         GoToHeading,
         GoToLine,
+        GoToDefinition,
         CommandPalette,
         QuickOpen,
         FindInFiles,
@@ -259,6 +260,8 @@ pub fn bind_keys(cx: &mut App) {
         // to "select all occurrences".
         KeyBinding::new("secondary-shift-o", GoToHeading, workspace),
         KeyBinding::new("secondary-g", GoToLine, workspace),
+        // Typst (and later other languages): jump to the definition under the caret.
+        KeyBinding::new("f12", GoToDefinition, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-shift-p", CommandPalette, workspace),
         KeyBinding::new("secondary-p", QuickOpen, workspace),
         // VS Code's Toggle Word Wrap.

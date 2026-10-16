@@ -101,6 +101,9 @@ struct EditorScrollTarget {
 pub enum DocumentEvent {
     /// A message for the user, such as a failed image paste.
     Notify(SharedString),
+    /// Show the editor pane (leave preview-only layout) so a jump to source
+    /// is visible — used after a Typst preview click or go-to-definition.
+    ShowEditor,
 }
 
 pub struct DocumentView {
@@ -157,6 +160,9 @@ pub struct DocumentView {
     /// the editor is busy (its context menu).
     last_cursor: usize,
     focus_decorations: Option<TextDecorationCollection>,
+    /// Brief highlight of a jumped-to range (preview click / go-to-definition).
+    jump_flash: Option<TextDecorationCollection>,
+    jump_flash_task: Option<Task<()>>,
     /// The paragraph left undimmed in focus mode.
     focus_block: Option<Range<usize>>,
 
@@ -289,6 +295,8 @@ impl DocumentView {
             spell_checked: None,
             last_cursor: 0,
             focus_decorations: None,
+            jump_flash: None,
+            jump_flash_task: None,
             focus_block: None,
             scroll_driver: ScrollDriver::Editor,
             synced_editor_scroll: None,
@@ -466,6 +474,8 @@ impl DocumentView {
             spell_checked: None,
             last_cursor: 0,
             focus_decorations: None,
+            jump_flash: None,
+            jump_flash_task: None,
             focus_block: None,
             scroll_driver: ScrollDriver::Editor,
             synced_editor_scroll: None,
@@ -526,6 +536,8 @@ impl DocumentView {
             spell_checked: None,
             last_cursor: 0,
             focus_decorations: None,
+            jump_flash: None,
+            jump_flash_task: None,
             focus_block: None,
             scroll_driver: ScrollDriver::Editor,
             synced_editor_scroll: None,
@@ -1268,14 +1280,105 @@ impl DocumentView {
                 cx.notify();
             }
             Response::SourceAt(offset) => {
-                self.set_cursor(offset, window, cx);
-                let focus = self.editor.read(cx).focus_handle(cx);
-                window.focus(&focus, cx);
+                log::debug!("typst live: preview click -> source offset {offset}");
+                self.reveal_typst_source(offset, "Preview click", window, cx);
             }
             Response::PageAt(page, _x, y) => {
+                log::debug!("typst live: caret reveal -> page {page}");
                 live.view.update(cx, |view, cx| view.reveal(page, y, cx));
             }
+            Response::DefinitionAt(offset) => {
+                log::debug!("typst live: go-to-definition -> offset {offset}");
+                self.reveal_typst_source(offset, "Go to Definition", window, cx);
+            }
         }
+    }
+
+    /// Make a Typst source jump obvious: leave preview-only layout if needed,
+    /// scroll the caret into view, flash the target line, and focus the editor.
+    fn reveal_typst_source(
+        &mut self,
+        offset: usize,
+        reason: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !Self::shows_editor(cx) {
+            cx.emit(DocumentEvent::ShowEditor);
+        }
+        let editor = self.editor.read(cx);
+        let rope = editor.text();
+        let len = rope.len();
+        let offset = offset.min(len);
+        let offset = floor_char_boundary(&editor.value(), offset);
+        let position = rope.offset_to_position(offset);
+        let row = position.line as usize;
+        let line_start = rope.line_start_offset(row);
+        let line_end = if row + 1 < rope.lines_len() {
+            rope.line_start_offset(row + 1)
+        } else {
+            len
+        };
+        let shown = editor.visible_row_range().map_or(0, |rows| rows.len());
+        let _ = editor;
+        self.set_cursor(offset, window, cx);
+        self.editor_scroll_target = Some(EditorScrollTarget {
+            line: centered_top(row, shown),
+            attempts: 0,
+        });
+        self.scroll_editor_to_target(cx);
+        self.flash_jump_range(line_start..line_end, cx);
+        let focus = self.editor.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        let line = row + 1;
+        cx.emit(DocumentEvent::Notify(
+            format!("{reason}: line {line}").into(),
+        ));
+        cx.notify();
+    }
+
+    /// Briefly highlight `range` so a jump is visible even when the caret is
+    /// already near the target.
+    fn flash_jump_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        if range.start >= range.end {
+            return;
+        }
+        let style = HighlightStyle {
+            background_color: Some(cx.theme().selection),
+            ..HighlightStyle::default()
+        };
+        let decorations = vec![TextDecoration::new(range, style)];
+        match &self.jump_flash {
+            Some(collection) => collection.set(decorations, cx),
+            None => {
+                let collection = self.editor.update(cx, |editor, cx| {
+                    editor.create_decorations_collection(decorations, cx)
+                });
+                self.jump_flash = Some(collection);
+            }
+        }
+        self.jump_flash_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(900))
+                .await;
+            _ = this.update(cx, |this, cx| {
+                if let Some(flash) = this.jump_flash.take() {
+                    flash.clear(cx);
+                }
+                this.jump_flash_task = None;
+            });
+        }));
+    }
+
+    /// Ask the Typst compiler for the definition under the caret (F12).
+    pub fn go_to_typst_definition(&mut self, cx: &mut Context<Self>) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        let offset = self.editor.read(cx).cursor();
+        log::debug!("typst live: request definition at {offset}");
+        live.worker
+            .send(crate::typst_live::Request::DefinitionAt { offset });
     }
 
     /// The preview pane: a live Typst preview's pages, under the compiler's
