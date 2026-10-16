@@ -342,6 +342,19 @@ impl DocumentView {
             .map(|image| image.read(cx).focus_handle(cx))
     }
 
+    /// Focus handle for the preview side that is actually on screen: a live
+    /// Typst `PdfView` when that pane is showing, otherwise the Markdown
+    /// `TextView`. Preview-only layout used to focus the Markdown preview even
+    /// for Typst, which left focus on an element not in the tree — title-bar
+    /// `dispatch_action` (SetLayout, sidebar toggle, …) then never reached the
+    /// workspace.
+    pub fn preview_pane_focus_handle(&self, cx: &App) -> FocusHandle {
+        if let Some(live) = &self.live {
+            return live.view.read(cx).focus_handle(cx);
+        }
+        self.preview().read(cx).focus_handle().clone()
+    }
+
     pub fn path(&self) -> Option<&PathBuf> {
         self.path.as_ref()
     }
@@ -778,6 +791,10 @@ impl DocumentView {
     /// typing too large a number still moves the caret rather than doing
     /// nothing.
     pub fn go_to_line(&mut self, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Error-banner / outline jumps from preview-only must surface the editor.
+        if !Self::shows_editor(cx) {
+            cx.emit(DocumentEvent::ShowEditor);
+        }
         let editor = self.editor.read(cx);
         let rope = editor.text();
         let len = rope.len();
@@ -1467,9 +1484,11 @@ impl DocumentView {
         v_flex()
             .id("typst-live-pane")
             .size_full()
+            .min_w_0()
+            .min_h_0()
             .bg(theme.background)
             .children(banner)
-            .child(div().flex_1().min_h_0().child(body))
+            .child(div().flex_1().min_h_0().min_w_0().child(body))
             .into_any_element()
     }
 
@@ -2867,22 +2886,57 @@ impl Render for DocumentView {
                 .child(
                     resizable_panel()
                         .size_range(rems(16.).to_pixels(window.rem_size())..Pixels::MAX)
-                        .child(self.render_editor(window, cx)),
+                        .child(
+                            div()
+                                .size_full()
+                                .min_w_0()
+                                .min_h_0()
+                                .child(self.render_editor(window, cx)),
+                        ),
                 )
                 .child(
                     resizable_panel()
                         .size_range(rems(16.).to_pixels(window.rem_size())..Pixels::MAX)
-                        .child(self.render_side(window, cx)),
+                        .child(
+                            div()
+                                .size_full()
+                                .min_w_0()
+                                .min_h_0()
+                                .child(self.render_side(window, cx)),
+                        ),
                 )
                 .into_any_element(),
         };
+        // min_w_0: flex parents default to min-width:auto, which lets the PDF
+        // toolbar/pages force the split pane past the window and clip the right edge.
+        let body = div()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .on_action(cx.listener(|_, action: &crate::actions::SetLayout, _, cx| {
+                log::info!("ui: DocumentView SetLayout -> {:?}", action.0);
+                AppSettings::update(cx, |settings| {
+                    settings.layout = action.0;
+                    settings.focus_mode = false;
+                });
+            }))
+            .on_action(
+                cx.listener(|_, _: &crate::actions::ToggleFileSidebar, _, cx| {
+                    AppSettings::update(cx, |settings| {
+                        settings.file_sidebar = !settings.file_sidebar;
+                    });
+                }),
+            )
+            .child(body)
+            .into_any_element();
         if !self.large || self.bar_dismissed {
             return body;
         }
         v_flex()
             .size_full()
+            .min_w_0()
             .child(self.render_large_file_bar(cx))
-            .child(div().flex_1().min_h_0().child(body))
+            .child(div().flex_1().min_h_0().min_w_0().child(body))
             .into_any_element()
     }
 }

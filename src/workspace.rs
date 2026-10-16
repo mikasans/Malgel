@@ -55,7 +55,10 @@ use crate::{
     document_view::{DocumentEvent, DocumentView},
     docx, export,
     file_icon::file_icon,
-    file_tree::{FileTree, FileTreeEvent, TreeDrag, invert_key_held},
+    file_tree::{
+        FileTree, FileTreeEvent, TreeDrag, absolute_paths_for_clipboard, invert_key_held,
+        relative_paths_for_clipboard,
+    },
     format,
     links::{self, LinkTarget},
     pdf::{self, Paper},
@@ -97,10 +100,10 @@ enum KeyboardTarget {
 }
 
 /// A PDF or an image is rendered *instead of* the editor and the preview, so
-/// the keyboard has to go to that viewer. Focusing the editor anyway points
-/// the keyboard at an element that is not in the render tree — no key binding
-/// matches it and every shortcut stops working, which is what happened while a
-/// PDF was open.
+/// the keyboard has to go to that viewer. Focusing a view that is not in the
+/// render tree leaves every shortcut and title-bar `dispatch_action` dead —
+/// the same class of bug as focusing the Markdown preview while a Typst live
+/// `PdfView` is what is actually drawn.
 /// One row of the Quick Open picker.
 #[derive(Clone, Debug, PartialEq)]
 struct QuickOpenRow {
@@ -298,6 +301,7 @@ struct FindProgress {
     hits: Option<Vec<Hit>>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum MediaLoad {
     Pdf(crate::pdf_view::PdfDocument),
     Image(Arc<gpui_kit::Image>, f32, f32),
@@ -1120,7 +1124,9 @@ impl Workspace {
                 .media_focus_handle(cx)
                 .unwrap_or_else(|| doc.editor().focus_handle(cx)),
             KeyboardTarget::Editor => doc.editor().focus_handle(cx),
-            KeyboardTarget::Preview => doc.preview().read(cx).focus_handle().clone(),
+            // Typst live preview is a PdfView, not the Markdown TextView —
+            // focusing an off-tree handle drops every workspace action.
+            KeyboardTarget::Preview => doc.preview_pane_focus_handle(cx),
         };
         window.defer(cx, move |window, cx| focus.focus(window, cx));
     }
@@ -2202,9 +2208,60 @@ impl Workspace {
             .update(cx, |tree, cx| tree.paste_selection(window, cx));
     }
 
-    fn tree_open(&mut self, _: &OpenInTree, _: &mut Window, cx: &mut Context<Self>) {
-        self.file_tree
-            .update(cx, |tree, cx| tree.open_selection(cx));
+    fn tree_open(&mut self, _: &OpenInTree, window: &mut Window, cx: &mut Context<Self>) {
+        // VS Code-ish: Enter on a file starts rename; on a folder, expand/collapse.
+        // Double-click still opens files from the tree row click handler.
+        let Some((_, is_dir)) = self.file_tree.read(cx).single_selection() else {
+            return;
+        };
+        if is_dir {
+            self.file_tree
+                .update(cx, |tree, cx| tree.open_selection(cx));
+        } else {
+            self.tree_rename(&RenameInTree, window, cx);
+        }
+    }
+
+    fn tree_copy_path(&mut self, _: &CopyPathInTree, _: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.file_tree.read(cx).selection();
+        if paths.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(absolute_paths_for_clipboard(
+            &paths,
+        )));
+    }
+
+    fn tree_copy_relative_path(
+        &mut self,
+        _: &CopyRelativePathInTree,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (paths, root) = {
+            let tree = self.file_tree.read(cx);
+            (tree.selection(), tree.root().map(Path::to_path_buf))
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let text = relative_paths_for_clipboard(&paths, root.as_deref());
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    fn tree_reveal_path(&mut self, _: &RevealPathInTree, _: &mut Window, cx: &mut Context<Self>) {
+        let path = {
+            let tree = self.file_tree.read(cx);
+            if let Some((path, _)) = tree.single_selection() {
+                path
+            } else {
+                match tree.selection().into_iter().next() {
+                    Some(path) => path,
+                    None => return,
+                }
+            }
+        };
+        cx.reveal_path(&path);
     }
 
     fn tree_select_up(&mut self, _: &TreeSelectUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -3525,6 +3582,9 @@ impl Workspace {
             settings.focus_mode = false;
         });
         self.focus_active(window, cx);
+        // Global observers usually refresh, but notify explicitly so leaving
+        // Preview-only cannot depend on focus-only side effects.
+        cx.notify();
         log::debug!(
             "ui: SetLayout handled in {:.1} ms",
             started.elapsed().as_secs_f64() * 1000.
@@ -3895,7 +3955,6 @@ impl Workspace {
         );
     }
 
-
     fn zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
         AppSettings::update(cx, |settings| {
             settings.font_size = if delta == 0. {
@@ -4133,9 +4192,14 @@ impl Workspace {
                             .icon(Icon::new(IconName::PanelLeft))
                             .tooltip("Toggle side bar")
                             .selected(settings.file_sidebar)
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(ToggleFileSidebar), cx)
-                            }),
+                            // Call the workspace directly: in preview-only the
+                            // focused pane may not bubble `dispatch_action`.
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle(
+                                    |settings| settings.file_sidebar = !settings.file_sidebar,
+                                    cx,
+                                );
+                            })),
                     )
                     .child(
                         ButtonGroup::new("layout")
@@ -4160,16 +4224,16 @@ impl Workspace {
                                 "Preview",
                                 Layout::Preview,
                             ))
-                            .on_click(cx.listener(|_, clicked: &Vec<usize>, window, cx| {
+                            .on_click(cx.listener(|this, clicked: &Vec<usize>, window, cx| {
                                 let layout = match clicked.first() {
                                     Some(0) => Layout::Editor,
                                     Some(2) => Layout::Preview,
                                     _ => Layout::Split,
                                 };
-                                log::info!(
-                                    "ui: title-bar layout button clicked -> {layout:?}"
-                                );
-                                window.dispatch_action(Box::new(SetLayout(layout)), cx);
+                                log::info!("ui: title-bar layout button clicked -> {layout:?}");
+                                // Direct call — do not rely on action dispatch
+                                // from a focused preview pane (see focus_active).
+                                this.set_layout(&SetLayout(layout), window, cx);
                             })),
                     )
                     .child(
@@ -4187,9 +4251,9 @@ impl Workspace {
                             } else {
                                 "Use dark appearance"
                             })
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(ToggleAppearance), cx)
-                            }),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_appearance(&ToggleAppearance, window, cx);
+                            })),
                     ),
             )
     }
@@ -5323,7 +5387,7 @@ impl Render for Workspace {
                     v_flex()
                         .size_full()
                         .when(self.shows_tabs(cx), |this| this.child(self.render_tabs(cx)))
-                        .child(div().flex_1().min_h_0().child(document)),
+                        .child(div().flex_1().min_h_0().min_w_0().child(document)),
                 ),
         );
         if show_outline {
@@ -5372,6 +5436,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::tree_cut))
             .on_action(cx.listener(Self::tree_copy))
             .on_action(cx.listener(Self::tree_paste))
+            .on_action(cx.listener(Self::tree_copy_path))
+            .on_action(cx.listener(Self::tree_copy_relative_path))
+            .on_action(cx.listener(Self::tree_reveal_path))
             .on_action(cx.listener(Self::tree_open))
             .on_action(cx.listener(Self::tree_select_up))
             .on_action(cx.listener(Self::tree_select_down))

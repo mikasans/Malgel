@@ -67,11 +67,14 @@ fn rasterize_svg_png(svg: &str, width_pt: f32, height_pt: f32) -> Option<Vec<u8>
     let width = ((width_pt * SHEET_SCALE).ceil() as u32).max(1);
     let height = ((height_pt * SHEET_SCALE).ceil() as u32).max(1);
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
-    let transform = resvg::tiny_skia::Transform::from_scale(SHEET_SCALE, SHEET_SCALE);
+    // Fit the SVG's own size into the pixmap. A plain SHEET_SCALE assumept=px
+    // clip when typst_svg's user space does not match page points 1:1.
+    let sx = width as f32 / tree.size().width().max(1.);
+    let sy = height as f32 / tree.size().height().max(1.);
+    let transform = resvg::tiny_skia::Transform::from_scale(sx, sy);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     pixmap.encode_png().ok()
 }
-
 
 /// A drawn page: its size in points and its sheet.
 #[derive(Clone)]
@@ -314,7 +317,8 @@ impl LiveCompiler {
             source,
             offset,
             Side::After,
-        ).or_else(|| {
+        )
+        .or_else(|| {
             typst_ide::definition(
                 &self.world,
                 self.document.as_ref(),
@@ -324,9 +328,7 @@ impl LiveCompiler {
             )
         })?;
         match definition {
-            typst_ide::Definition::Span(span)
-                if span.id() == Some(source.id()) =>
-            {
+            typst_ide::Definition::Span(span) if span.id() == Some(source.id()) => {
                 self.world.range(span).map(|range| range.start)
             }
             _ => None,
@@ -524,6 +526,26 @@ mod tests {
     }
 
     #[test]
+    fn heading_refs_need_numbering_to_produce_pages() {
+        let mut live = compiler("heading-ref");
+        // Same class of error as samples/nav-preview.typ without `#set heading`.
+        let broken = "= Title <sec>\n\nSee @sec.\n";
+        let failed = live.compile(broken, 1);
+        assert!(failed.pages.is_none(), "unnumbered heading ref must fail");
+        assert!(
+            failed.diagnostics.iter().any(|d| d.error),
+            "expected a compile error"
+        );
+        let ok = "#set heading(numbering: \"1.\")\n= Title <sec>\n\nSee @sec.\n";
+        let compiled = live.compile(ok, 2);
+        assert!(
+            compiled.pages.is_some(),
+            "numbered heading ref should compile"
+        );
+        assert!(!compiled.pages.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
     fn go_to_definition_finds_a_label_from_its_ref() {
         let mut live = compiler("def");
         let text = "#figure[Hi] <fig>\nSee @fig for details.\n";
@@ -534,7 +556,10 @@ mod tests {
             target < at,
             "definition {target} should be the label before the ref at {at}"
         );
-        assert!(text[target..].starts_with("#figure") || text[target..].contains("<fig>"), "{target}");
+        assert!(
+            text[target..].starts_with("#figure") || text[target..].contains("<fig>"),
+            "{target}"
+        );
     }
 
     /// Keystroke-to-pages time on a multi-page document, warm caches.

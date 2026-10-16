@@ -8,7 +8,8 @@
 //! pages fill in. The viewer is one continuous vertical scroll with
 //! fit-width / fit-page / custom zoom and page navigation, and the gestures
 //! `zoom` documents and the image viewer share: Command/Control with the wheel
-//! zooms, and a double click swaps between the fit and a closer look.
+//! zooms, and a double click swaps between the fit and a closer look. A
+//! single left-click (no modifier) on a live Typst page jumps to the source.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -48,7 +49,11 @@ use hayro_svg::{
     },
 };
 
-use crate::actions::{TogglePdfThumbnails, ZoomIn, ZoomOut, ZoomReset};
+use crate::actions::{
+    SetLayout, ToggleFileSidebar, TogglePdfThumbnails, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
+    ZoomReset,
+};
+use crate::themes::AppSettings;
 use crate::zoom;
 
 /// How a document is zoomed when it is opened: the whole first page, the way
@@ -179,8 +184,8 @@ impl PdfDocument {
     /// lazily, so a long document is cheap to open.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
         let shared = Arc::new(bytes);
-        let pdf = Pdf::new(shared.clone())
-            .map_err(|err| format!("Failed to parse PDF: {err:?}"))?;
+        let pdf =
+            Pdf::new(shared.clone()).map_err(|err| format!("Failed to parse PDF: {err:?}"))?;
         let pages = pdf
             .pages()
             .iter()
@@ -362,6 +367,14 @@ fn fit_zoom(
     }
 }
 
+/// Row list + per-row sizes for the page virtual list.
+struct ListLayoutCache {
+    /// Fingerprint: page count, spread, zoom bits, and page geometry.
+    key: u64,
+    rows: Rc<Vec<Vec<usize>>>,
+    sizes: Rc<Vec<Size<Pixels>>>,
+}
+
 /// A GPUI view displaying a scrollable PDF document.
 pub struct PdfView {
     path: Option<PathBuf>,
@@ -390,12 +403,16 @@ pub struct PdfView {
     page_bounds: Rc<std::cell::RefCell<HashMap<usize, gpui_kit::Bounds<Pixels>>>>,
     /// Where the left button went down, to tell a click from a drag.
     press: Option<Point<Pixels>>,
+    /// Cached virtual-list row geometry, invalidated when zoom/spread/pages change.
+    /// Avoids reallocating size vectors on every mouse-move paint while dragging.
+    list_cache: Option<ListLayoutCache>,
 }
 
 /// What a page viewer reports to the document showing it.
 pub enum PdfViewEvent {
-    /// A click (not a drag) on page `page` (0-based) at `x`, `y` points
-    /// from its top left: a live Typst preview jumps to the source there.
+    /// A single left-click (not a drag, not a double-click) on page `page`
+    /// (0-based) at `x`, `y` points from its top left. A live Typst preview
+    /// jumps to the source there — no modifier and no second click needed.
     Clicked { page: usize, x: f32, y: f32 },
 }
 
@@ -426,6 +443,7 @@ impl PdfView {
             focus_handle: cx.focus_handle(),
             page_bounds: Rc::default(),
             press: None,
+            list_cache: None,
         }
     }
 
@@ -451,6 +469,7 @@ impl PdfView {
         }
         // Clamped: a document that shrank leaves the reader on its last page.
         self.current_page = current_page.min(self.page_count().saturating_sub(1));
+        self.list_cache = None;
         cx.notify();
     }
 
@@ -458,16 +477,12 @@ impl PdfView {
     /// it is not yet ready. Returns `None` while conversion is in flight so
     /// the caller can paint a placeholder without blocking the UI thread.
     fn page_image(&mut self, index: usize, cx: &mut Context<Self>) -> Option<Arc<Image>> {
-        let Some(doc) = self.doc.as_mut() else {
-            return None;
-        };
+        let doc = self.doc.as_mut()?;
         if let Some(image) = doc.rendered.get(&index) {
             return Some(image.clone());
         }
         // Pre-rendered Typst sheets land in `rendered` already; no bytes to convert.
-        let Some(bytes) = doc.bytes.clone() else {
-            return None;
-        };
+        let bytes = doc.bytes.clone()?;
         if !doc.pending.insert(index) {
             return None;
         }
@@ -475,12 +490,7 @@ impl PdfView {
         let interpreter_settings = doc.interpreter_settings.clone();
         let render_settings = doc.render_settings.clone();
         let task = cx.background_executor().spawn(async move {
-            PdfDocument::render_page_bytes(
-                bytes,
-                index,
-                interpreter_settings,
-                render_settings,
-            )
+            PdfDocument::render_page_bytes(bytes, index, interpreter_settings, render_settings)
         });
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
@@ -524,6 +534,7 @@ impl PdfView {
     pub fn set_spread(&mut self, spread: bool, cx: &mut Context<Self>) {
         if self.spread != spread {
             self.spread = spread;
+            self.list_cache = None;
             cx.notify();
         }
     }
@@ -621,6 +632,7 @@ impl PdfView {
             self.fit = FitMode::Custom;
             self.custom_zoom = clamped;
             self.zoom = clamped;
+            self.list_cache = None;
             cx.notify();
         }
     }
@@ -654,28 +666,59 @@ impl PdfView {
     /// Dragging moves the pages, the way it moves an image in its viewer and
     /// a diagram in its own window: zoomed in, the wheel alone leaves the
     /// rest of the sheet out of reach.
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, _cx: &mut Context<Self>) {
-        let Some((start, offset)) = self.drag else {
-            return;
-        };
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if event.pressed_button != Some(MouseButton::Left) {
-            self.drag = None;
+            if self.drag.take().is_some() {
+                cx.notify();
+            }
             return;
         }
-        self.scroll
-            .base_handle()
-            .set_offset(offset + (event.position - start));
+        // Start a drag only after the pointer leaves the click slop, so a
+        // plain single click still counts as a jump (not a pan).
+        if self.drag.is_none() {
+            let Some(press) = self.press else {
+                return;
+            };
+            let moved = event.position - press;
+            if moved.x.abs() <= px(4.) && moved.y.abs() <= px(4.) {
+                return;
+            }
+            self.drag = Some((press, self.scroll.base_handle().offset()));
+        }
+        let Some((start, origin)) = self.drag else {
+            return;
+        };
+        let next = origin + (event.position - start);
+        let handle = self.scroll.base_handle();
+        // Skip no-op moves so we do not dirty the view every sub-pixel event.
+        if handle.offset() == next {
+            return;
+        }
+        handle.set_offset(next);
+        // Keep the page label in sync without waiting for mouse-up.
+        let page = self.visible_page();
+        if page != self.current_page {
+            self.current_page = page;
+        }
+        cx.notify();
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.drag = None;
-        let Some(press) = self.press.take() else {
-            return;
-        };
-        let moved = event.position - press;
-        if moved.x.abs() > px(4.) || moved.y.abs() > px(4.) {
+        let dragged = self.drag.take().is_some();
+        let press = self.press.take();
+        // Double-click ups are for zoom (handled on mouse_down). Typst jump
+        // is a single left-click with no modifier.
+        if event.click_count != 1 || dragged {
             return;
         }
+        if let Some(press) = press {
+            let moved = event.position - press;
+            if moved.x.abs() > px(4.) || moved.y.abs() > px(4.) {
+                return;
+            }
+        }
+        // Hit-test even when `press` was lost (focusing-click quirks): a
+        // single click on a page should still jump.
         let zoom = self.zoom.max(0.01);
         let hit = self
             .page_bounds
@@ -732,8 +775,10 @@ impl PdfView {
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         // Only the left button gets here; the wiring asks for it.
         if event.click_count != 2 {
+            // Record the press only — dragging starts after a few pixels of
+            // movement so a single click can jump to Typst source.
             self.press = Some(event.position);
-            self.drag = Some((event.position, self.scroll.base_handle().offset()));
+            self.drag = None;
             return;
         }
         self.drag = None;
@@ -749,6 +794,7 @@ impl PdfView {
     pub fn fit_width(&mut self, cx: &mut Context<Self>) {
         if self.fit != FitMode::Width {
             self.fit = FitMode::Width;
+            self.list_cache = None;
             cx.notify();
         }
     }
@@ -757,6 +803,7 @@ impl PdfView {
     pub fn fit_page(&mut self, cx: &mut Context<Self>) {
         if self.fit != FitMode::Page {
             self.fit = FitMode::Page;
+            self.list_cache = None;
             cx.notify();
         }
     }
@@ -843,6 +890,8 @@ impl PdfView {
             .id("pdf-toolbar")
             .h_9()
             .px_3()
+            .w_full()
+            .min_w_0()
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme.border)
@@ -854,6 +903,9 @@ impl PdfView {
                 h_flex()
                     .gap_2()
                     .items_center()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
                     .child(
                         Icon::new(IconName::FileText)
                             .small()
@@ -863,6 +915,8 @@ impl PdfView {
                         div()
                             .text_xs()
                             .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .min_w_0()
+                            .truncate()
                             .child(self.title.clone()),
                     )
                     .when(total > 0, |this| {
@@ -875,6 +929,9 @@ impl PdfView {
                 h_flex()
                     .gap_1()
                     .items_center()
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .overflow_x_hidden()
                     .child(
                         Button::new("pdf-thumbnails")
                             .ghost()
@@ -1121,21 +1178,31 @@ impl PdfView {
         )
     }
 
-    fn render_content(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let theme = cx.theme();
-
-        let Some(doc) = &self.doc else {
-            return self.render_empty("No PDF loaded.", theme.muted_foreground);
-        };
-        if doc.pages.is_empty() {
-            return self.render_empty("This PDF has no pages.", theme.muted_foreground);
-        }
-
+    /// Rows and sizes for the page list, reused across paints while zoom and
+    /// page geometry stay the same (especially while dragging).
+    #[allow(clippy::type_complexity)]
+    fn list_layout(&mut self) -> (Rc<Vec<Vec<usize>>>, Rc<Vec<Size<Pixels>>>) {
         let zoom = self.zoom;
-        let total = doc.pages.len();
-        let viewport_width = self.scroll.bounds().size.width.as_f32();
-        // One row per page, or per pair when the pages are spread out.
-        let rows: Rc<Vec<Vec<usize>>> = Rc::new(self.rows());
+        let Some(doc) = &self.doc else {
+            return (Rc::new(Vec::new()), Rc::new(Vec::new()));
+        };
+        let mut key = doc.pages.len() as u64;
+        key = key.wrapping_mul(31).wrapping_add(self.spread as u64);
+        key = key.wrapping_mul(31).wrapping_add(zoom.to_bits() as u64);
+        for page in &doc.pages {
+            key = key
+                .wrapping_mul(31)
+                .wrapping_add(page.width.to_bits() as u64);
+            key = key
+                .wrapping_mul(31)
+                .wrapping_add(page.height.to_bits() as u64);
+        }
+        if let Some(cache) = &self.list_cache
+            && cache.key == key
+        {
+            return (cache.rows.clone(), cache.sizes.clone());
+        }
+        let rows = self.rows();
         let row_width = |row: &[usize]| {
             row.iter().map(|&ix| doc.pages[ix].width).sum::<f32>()
                 + PAGE_GAP * row.len().saturating_sub(1) as f32
@@ -1145,24 +1212,56 @@ impl PdfView {
                 .map(|&ix| doc.pages[ix].height)
                 .fold(0.0f32, f32::max)
         };
-        let sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
-            rows.iter()
-                .map(|row| {
-                    gpui_kit::size(
-                        px(row_width(row) * zoom),
-                        px(row_height(row) * zoom + PAGE_GAP),
-                    )
-                })
-                .collect(),
-        );
+        let sizes: Vec<Size<Pixels>> = rows
+            .iter()
+            .map(|row| {
+                gpui_kit::size(
+                    px(row_width(row) * zoom),
+                    px(row_height(row) * zoom + PAGE_GAP),
+                )
+            })
+            .collect();
+        let rows = Rc::new(rows);
+        let sizes = Rc::new(sizes);
+        self.list_cache = Some(ListLayoutCache {
+            key,
+            rows: rows.clone(),
+            sizes: sizes.clone(),
+        });
+        (rows, sizes)
+    }
+
+    fn render_content(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let theme = cx.theme();
+
+        if self.doc.as_ref().is_none_or(|doc| doc.pages.is_empty()) {
+            let message = if self.doc.is_none() {
+                "No PDF loaded."
+            } else {
+                "This PDF has no pages."
+            };
+            return self.render_empty(message, theme.muted_foreground);
+        }
+
+        let zoom = self.zoom;
+        let total = self.page_count();
+        let viewport_width = self.scroll.bounds().size.width.as_f32();
+        let dragging = self.drag.is_some();
+        let (rows, sizes) = self.list_layout();
         // Measure the widest row, so the content can be wider than the
         // viewport and zoomed-in pages stay horizontally reachable.
-        let measure_ix = rows
-            .iter()
-            .enumerate()
-            .max_by(|a, b| row_width(a.1).total_cmp(&row_width(b.1)))
-            .map(|(ix, _)| ix)
-            .unwrap_or(0);
+        let measure_ix = {
+            let doc = self.doc.as_ref().unwrap();
+            rows.iter()
+                .enumerate()
+                .max_by(|a, b| {
+                    let aw: f32 = a.1.iter().map(|&ix| doc.pages[ix].width).sum();
+                    let bw: f32 = b.1.iter().map(|&ix| doc.pages[ix].width).sum();
+                    aw.total_cmp(&bw)
+                })
+                .map(|(ix, _)| ix)
+                .unwrap_or(0)
+        };
 
         let border = theme.border;
         let muted = theme.muted_foreground;
@@ -1189,30 +1288,39 @@ impl PdfView {
                                 let width = px(page.width * zoom);
                                 let height = px(page.height * zoom);
                                 match this.page_image(page_ix, cx) {
-                                    Some(image) => div()
-                                        .w(width)
-                                        .h(height)
-                                        .flex_none()
-                                        .relative()
-                                        .child({
+                                    Some(image) => {
+                                        let mut card = div()
+                                            .w(width)
+                                            .h(height)
+                                            .flex_none()
+                                            .relative()
+                                            .bg(rgb(0xffffff))
+                                            .border_1()
+                                            .border_color(border)
+                                            .rounded_sm()
+                                            .overflow_hidden();
+                                        // Skip shadow + hit-test canvases while
+                                        // dragging: they dominate paint cost on
+                                        // every mouse-move refresh.
+                                        if !dragging {
                                             let bounds = this.page_bounds.clone();
-                                            canvas(
-                                                move |area, _, _| {
-                                                    bounds.borrow_mut().insert(page_ix, area);
-                                                },
-                                                |_, _, _, _| {},
-                                            )
-                                            .absolute()
-                                            .size_full()
-                                        })
-                                        .bg(rgb(0xffffff))
-                                        .border_1()
-                                        .border_color(border)
-                                        .shadow_md()
-                                        .rounded_sm()
-                                        .overflow_hidden()
-                                        .child(img(image).w(width).h(height))
-                                        .into_any_element(),
+                                            card = card
+                                                .child(
+                                                    canvas(
+                                                        move |area, _, _| {
+                                                            bounds
+                                                                .borrow_mut()
+                                                                .insert(page_ix, area);
+                                                        },
+                                                        |_, _, _, _| {},
+                                                    )
+                                                    .absolute()
+                                                    .size_full(),
+                                                )
+                                                .shadow_md();
+                                        }
+                                        card.child(img(image).w(width).h(height)).into_any_element()
+                                    }
                                     None => div()
                                         .w(width)
                                         .h(height)
@@ -1288,12 +1396,19 @@ impl Render for PdfView {
         // Resolve fit modes against the live viewport before drawing the
         // toolbar, so the percentage shown matches the pages below it.
         let viewport = self.scroll.bounds().size;
-        self.zoom = self.resolved_zoom(viewport);
+        let next_zoom = self.resolved_zoom(viewport);
+        if next_zoom.to_bits() != self.zoom.to_bits() {
+            self.list_cache = None;
+        }
+        self.zoom = next_zoom;
         // Name the current page before the toolbar, the pages and the
         // thumbnail strip are built, so all three agree within a frame.
         self.current_page = self.visible_page();
-        // Bounds are recorded again for the pages drawn this frame.
-        self.page_bounds.borrow_mut().clear();
+        // Bounds are recorded again for the pages drawn this frame — but not
+        // while dragging, where we skip the hit-test canvases for speed.
+        if self.drag.is_none() {
+            self.page_bounds.borrow_mut().clear();
+        }
         // The pages were laid out against last frame's viewport. When the
         // pane changes size under them (the thumbnail strip opening or
         // closing, a resized split) draw once more against the new one, or
@@ -1311,8 +1426,13 @@ impl Render for PdfView {
                 });
             })
             .id("pdf-view")
+            // So Ctrl+1/2/3 and other workspace bindings still match while the
+            // preview holds focus (entity focus does not inherit parent context).
+            .key_context(WORKSPACE_CONTEXT)
             .track_focus(&self.focus_handle)
             .size_full()
+            .min_w_0()
+            .min_h_0()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_in(cx)))
@@ -1321,6 +1441,21 @@ impl Render for PdfView {
             .on_action(
                 cx.listener(|this, _: &TogglePdfThumbnails, _, cx| this.toggle_thumbnails(cx)),
             )
+            // Workspace actions do not bubble out of this entity when it holds
+            // focus — handle layout/sidebar here so Preview-only is escapable.
+            .on_action(cx.listener(|_, action: &SetLayout, _, cx| {
+                log::info!("ui: PdfView SetLayout -> {:?}", action.0);
+                AppSettings::update(cx, |settings| {
+                    settings.layout = action.0;
+                    settings.focus_mode = false;
+                });
+            }))
+            .on_action(cx.listener(|_, _: &ToggleFileSidebar, _, cx| {
+                log::info!("ui: PdfView ToggleFileSidebar");
+                AppSettings::update(cx, |settings| {
+                    settings.file_sidebar = !settings.file_sidebar;
+                });
+            }))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| this.on_pinch(event, cx)))
             .child(self.render_toolbar(cx))
@@ -1332,6 +1467,7 @@ impl Render for PdfView {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
                     .flex()
                     // The strip is outside the click handler below: double
                     // clicking a thumbnail jumps to its page rather than
@@ -1427,7 +1563,10 @@ mod tests {
         // Pages are not converted on the UI thread: the cache starts empty and
         // fill-in happens via background work (see PdfView::page_image).
         assert!(document.image(0).is_none());
-        let bytes = document.bytes.clone().expect("bytes kept for off-thread render");
+        let bytes = document
+            .bytes
+            .clone()
+            .expect("bytes kept for off-thread render");
         let (image, elapsed) = PdfDocument::render_page_bytes(
             bytes,
             0,
