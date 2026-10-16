@@ -525,8 +525,9 @@ impl FileTree {
         }
     }
 
-    /// Enter on a file opens it (keeping it, like a double click); on a
-    /// folder, it opens or closes it.
+    /// Enter on a folder opens or closes it. Files are renamed from the
+    /// workspace's Enter binding (VS Code's rename-on-Enter habit); a double
+    /// click still opens them from the row click handler.
     pub fn open_selection(&mut self, cx: &mut Context<Self>) {
         let Some(ix) = self.anchor_row() else {
             return;
@@ -535,12 +536,9 @@ impl FileTree {
         let (path, is_dir) = (row.entry.path.clone(), row.entry.is_dir);
         if is_dir {
             self.toggle(path, cx);
-        } else {
-            cx.emit(FileTreeEvent::Open {
-                path,
-                preview: false,
-            });
         }
+        // Files: Enter is handled upstream as RenameInTree; keep this a no-op
+        // so callers that only want folder expand/collapse stay safe.
     }
 
     // ---------------------------------------------------------------------
@@ -1452,6 +1450,19 @@ impl FileTree {
                                         .disabled(!can_paste)
                                         .action(Box::new(crate::actions::PasteInTree)),
                                 )
+                                .separator()
+                                .item(
+                                    PopupMenuItem::new("Copy Path")
+                                        .action(Box::new(crate::actions::CopyPathInTree)),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Copy Relative Path")
+                                        .action(Box::new(crate::actions::CopyRelativePathInTree)),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Reveal in File Manager")
+                                        .action(Box::new(crate::actions::RevealPathInTree)),
+                                )
                         })
                         .into_any_element(),
                 )
@@ -1679,6 +1690,39 @@ fn display_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Absolute path text for the clipboard: the OS display form, one path per
+/// line when several entries are picked (as in VS Code).
+pub(crate) fn absolute_paths_for_clipboard(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Path relative to the open folder root, using `/` separators. Falls back to
+/// the absolute display form when `path` is outside `root` or `root` is missing.
+pub(crate) fn relative_path_for_clipboard(path: &Path, root: Option<&Path>) -> String {
+    match root.and_then(|root| path.strip_prefix(root).ok()) {
+        Some(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().replace('\\', "/"),
+        // The root folder itself: show its name, not an empty string.
+        Some(_) => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+        None => path.display().to_string(),
+    }
+}
+
+/// Relative paths for every picked entry, joined the same way as absolute.
+pub(crate) fn relative_paths_for_clipboard(paths: &[PathBuf], root: Option<&Path>) -> String {
+    paths
+        .iter()
+        .map(|path| relative_path_for_clipboard(path, root))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The name typed into New File / New Folder, as a path relative to the
@@ -1928,6 +1972,38 @@ mod tests {
         assert_eq!(
             expanded,
             [root.to_path_buf()].into_iter().collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn clipboard_paths_are_absolute_or_relative_to_the_root() {
+        let root = Path::new("/work/notes");
+        let nested = Path::new("/work/notes/2026/feb/plan.md");
+        assert_eq!(
+            relative_path_for_clipboard(nested, Some(root)),
+            "2026/feb/plan.md"
+        );
+        assert_eq!(relative_path_for_clipboard(root, Some(root)), "notes");
+        // Outside the folder, or with no root, the absolute form is kept.
+        assert_eq!(
+            relative_path_for_clipboard(Path::new("/elsewhere/x.md"), Some(root)),
+            "/elsewhere/x.md"
+        );
+        assert_eq!(
+            relative_path_for_clipboard(nested, None),
+            "/work/notes/2026/feb/plan.md"
+        );
+        let paths = vec![
+            PathBuf::from("/work/notes/a.md"),
+            PathBuf::from("/work/notes/b/c.md"),
+        ];
+        assert_eq!(
+            absolute_paths_for_clipboard(&paths),
+            "/work/notes/a.md\n/work/notes/b/c.md"
+        );
+        assert_eq!(
+            relative_paths_for_clipboard(&paths, Some(root)),
+            "a.md\nb/c.md"
         );
     }
 }

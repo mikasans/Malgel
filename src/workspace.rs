@@ -55,7 +55,10 @@ use crate::{
     document_view::{DocumentEvent, DocumentView},
     docx, export,
     file_icon::file_icon,
-    file_tree::{FileTree, FileTreeEvent, TreeDrag, invert_key_held},
+    file_tree::{
+        FileTree, FileTreeEvent, TreeDrag, absolute_paths_for_clipboard, invert_key_held,
+        relative_paths_for_clipboard,
+    },
     format,
     links::{self, LinkTarget},
     pdf::{self, Paper},
@@ -298,6 +301,7 @@ struct FindProgress {
     hits: Option<Vec<Hit>>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum MediaLoad {
     Pdf(crate::pdf_view::PdfDocument),
     Image(Arc<gpui_kit::Image>, f32, f32),
@@ -2202,9 +2206,60 @@ impl Workspace {
             .update(cx, |tree, cx| tree.paste_selection(window, cx));
     }
 
-    fn tree_open(&mut self, _: &OpenInTree, _: &mut Window, cx: &mut Context<Self>) {
-        self.file_tree
-            .update(cx, |tree, cx| tree.open_selection(cx));
+    fn tree_open(&mut self, _: &OpenInTree, window: &mut Window, cx: &mut Context<Self>) {
+        // VS Code-ish: Enter on a file starts rename; on a folder, expand/collapse.
+        // Double-click still opens files from the tree row click handler.
+        let Some((_, is_dir)) = self.file_tree.read(cx).single_selection() else {
+            return;
+        };
+        if is_dir {
+            self.file_tree
+                .update(cx, |tree, cx| tree.open_selection(cx));
+        } else {
+            self.tree_rename(&RenameInTree, window, cx);
+        }
+    }
+
+    fn tree_copy_path(&mut self, _: &CopyPathInTree, _: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.file_tree.read(cx).selection();
+        if paths.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(absolute_paths_for_clipboard(
+            &paths,
+        )));
+    }
+
+    fn tree_copy_relative_path(
+        &mut self,
+        _: &CopyRelativePathInTree,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (paths, root) = {
+            let tree = self.file_tree.read(cx);
+            (tree.selection(), tree.root().map(Path::to_path_buf))
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let text = relative_paths_for_clipboard(&paths, root.as_deref());
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    fn tree_reveal_path(&mut self, _: &RevealPathInTree, _: &mut Window, cx: &mut Context<Self>) {
+        let path = {
+            let tree = self.file_tree.read(cx);
+            if let Some((path, _)) = tree.single_selection() {
+                path
+            } else {
+                match tree.selection().into_iter().next() {
+                    Some(path) => path,
+                    None => return,
+                }
+            }
+        };
+        cx.reveal_path(&path);
     }
 
     fn tree_select_up(&mut self, _: &TreeSelectUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -3895,7 +3950,6 @@ impl Workspace {
         );
     }
 
-
     fn zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
         AppSettings::update(cx, |settings| {
             settings.font_size = if delta == 0. {
@@ -4166,9 +4220,7 @@ impl Workspace {
                                     Some(2) => Layout::Preview,
                                     _ => Layout::Split,
                                 };
-                                log::info!(
-                                    "ui: title-bar layout button clicked -> {layout:?}"
-                                );
+                                log::info!("ui: title-bar layout button clicked -> {layout:?}");
                                 window.dispatch_action(Box::new(SetLayout(layout)), cx);
                             })),
                     )
@@ -5372,6 +5424,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::tree_cut))
             .on_action(cx.listener(Self::tree_copy))
             .on_action(cx.listener(Self::tree_paste))
+            .on_action(cx.listener(Self::tree_copy_path))
+            .on_action(cx.listener(Self::tree_copy_relative_path))
+            .on_action(cx.listener(Self::tree_reveal_path))
             .on_action(cx.listener(Self::tree_open))
             .on_action(cx.listener(Self::tree_select_up))
             .on_action(cx.listener(Self::tree_select_down))

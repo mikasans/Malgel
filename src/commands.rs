@@ -143,6 +143,13 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Cut", IconName::Scissors, CutInTree),
             cmd("Copy", IconName::Copy, CopyInTree),
             cmd("Paste", IconName::Clipboard, PasteInTree),
+            cmd("Copy Path", IconName::Copy, CopyPathInTree),
+            cmd("Copy Relative Path", IconName::Copy, CopyRelativePathInTree),
+            cmd(
+                "Reveal in File Manager",
+                IconName::FolderOpen,
+                RevealPathInTree,
+            ),
         ],
     );
 

@@ -179,8 +179,8 @@ impl PdfDocument {
     /// lazily, so a long document is cheap to open.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
         let shared = Arc::new(bytes);
-        let pdf = Pdf::new(shared.clone())
-            .map_err(|err| format!("Failed to parse PDF: {err:?}"))?;
+        let pdf =
+            Pdf::new(shared.clone()).map_err(|err| format!("Failed to parse PDF: {err:?}"))?;
         let pages = pdf
             .pages()
             .iter()
@@ -458,16 +458,12 @@ impl PdfView {
     /// it is not yet ready. Returns `None` while conversion is in flight so
     /// the caller can paint a placeholder without blocking the UI thread.
     fn page_image(&mut self, index: usize, cx: &mut Context<Self>) -> Option<Arc<Image>> {
-        let Some(doc) = self.doc.as_mut() else {
-            return None;
-        };
+        let doc = self.doc.as_mut()?;
         if let Some(image) = doc.rendered.get(&index) {
             return Some(image.clone());
         }
         // Pre-rendered Typst sheets land in `rendered` already; no bytes to convert.
-        let Some(bytes) = doc.bytes.clone() else {
-            return None;
-        };
+        let bytes = doc.bytes.clone()?;
         if !doc.pending.insert(index) {
             return None;
         }
@@ -475,12 +471,7 @@ impl PdfView {
         let interpreter_settings = doc.interpreter_settings.clone();
         let render_settings = doc.render_settings.clone();
         let task = cx.background_executor().spawn(async move {
-            PdfDocument::render_page_bytes(
-                bytes,
-                index,
-                interpreter_settings,
-                render_settings,
-            )
+            PdfDocument::render_page_bytes(bytes, index, interpreter_settings, render_settings)
         });
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
@@ -1427,7 +1418,10 @@ mod tests {
         // Pages are not converted on the UI thread: the cache starts empty and
         // fill-in happens via background work (see PdfView::page_image).
         assert!(document.image(0).is_none());
-        let bytes = document.bytes.clone().expect("bytes kept for off-thread render");
+        let bytes = document
+            .bytes
+            .clone()
+            .expect("bytes kept for off-thread render");
         let (image, elapsed) = PdfDocument::render_page_bytes(
             bytes,
             0,
