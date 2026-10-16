@@ -8,7 +8,8 @@
 //! pages fill in. The viewer is one continuous vertical scroll with
 //! fit-width / fit-page / custom zoom and page navigation, and the gestures
 //! `zoom` documents and the image viewer share: Command/Control with the wheel
-//! zooms, and a double click swaps between the fit and a closer look.
+//! zooms, and a double click swaps between the fit and a closer look. A
+//! single left-click (no modifier) on a live Typst page jumps to the source.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -394,8 +395,9 @@ pub struct PdfView {
 
 /// What a page viewer reports to the document showing it.
 pub enum PdfViewEvent {
-    /// A click (not a drag) on page `page` (0-based) at `x`, `y` points
-    /// from its top left: a live Typst preview jumps to the source there.
+    /// A single left-click (not a drag, not a double-click) on page `page`
+    /// (0-based) at `x`, `y` points from its top left. A live Typst preview
+    /// jumps to the source there — no modifier and no second click needed.
     Clicked { page: usize, x: f32, y: f32 },
 }
 
@@ -646,27 +648,46 @@ impl PdfView {
     /// a diagram in its own window: zoomed in, the wheel alone leaves the
     /// rest of the sheet out of reach.
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, _cx: &mut Context<Self>) {
-        let Some((start, offset)) = self.drag else {
-            return;
-        };
         if event.pressed_button != Some(MouseButton::Left) {
             self.drag = None;
             return;
         }
+        // Start a drag only after the pointer leaves the click slop, so a
+        // plain single click still counts as a jump (not a pan).
+        if self.drag.is_none() {
+            let Some(press) = self.press else {
+                return;
+            };
+            let moved = event.position - press;
+            if moved.x.abs() <= px(4.) && moved.y.abs() <= px(4.) {
+                return;
+            }
+            self.drag = Some((press, self.scroll.base_handle().offset()));
+        }
+        let Some((start, offset)) = self.drag else {
+            return;
+        };
         self.scroll
             .base_handle()
             .set_offset(offset + (event.position - start));
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.drag = None;
-        let Some(press) = self.press.take() else {
-            return;
-        };
-        let moved = event.position - press;
-        if moved.x.abs() > px(4.) || moved.y.abs() > px(4.) {
+        let dragged = self.drag.take().is_some();
+        let press = self.press.take();
+        // Double-click ups are for zoom (handled on mouse_down). Typst jump
+        // is a single left-click with no modifier.
+        if event.click_count != 1 || dragged {
             return;
         }
+        if let Some(press) = press {
+            let moved = event.position - press;
+            if moved.x.abs() > px(4.) || moved.y.abs() > px(4.) {
+                return;
+            }
+        }
+        // Hit-test even when `press` was lost (focusing-click quirks): a
+        // single click on a page should still jump.
         let zoom = self.zoom.max(0.01);
         let hit = self
             .page_bounds
@@ -723,8 +744,10 @@ impl PdfView {
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         // Only the left button gets here; the wiring asks for it.
         if event.click_count != 2 {
+            // Record the press only — dragging starts after a few pixels of
+            // movement so a single click can jump to Typst source.
             self.press = Some(event.position);
-            self.drag = Some((event.position, self.scroll.base_handle().offset()));
+            self.drag = None;
             return;
         }
         self.drag = None;

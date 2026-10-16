@@ -29,9 +29,10 @@ Then press **Ctrl+3** (or click the eye / Preview title-bar button) for preview-
    - Expect: buttons respond within a frame or two; stderr shows `ui: title-bar layout button clicked` / `ui: title-bar SetLayout` without multi-second gaps.
    - Root cause fixed: PDF page SVG conversion no longer runs on the GPUI UI thread; Typst live sheets are rasterized to PNG on the compiler thread.
 
-2. **Preview click → source (mutual jump feedback)**
-   - In Split or Preview layout, click text on a preview page.
+2. **Preview single-click → source (mutual jump feedback)**
+   - In Split or Preview layout, **single left-click** (no Ctrl, no double-click) text on a preview page.
    - Expect: layout becomes Split if it was Preview-only; editor scrolls to the line; line flashes briefly; toast “Preview click: line N”; caret focused.
+   - Double-click still toggles fit/zoom on the page viewer; that is separate from jump.
 
 3. **Go to Definition (first slice)**
    - In the editor, place the caret on `@fig` or `@sec` and press **F12** (or Command Palette → Go to Definition).
