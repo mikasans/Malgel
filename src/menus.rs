@@ -146,6 +146,8 @@ pub fn build(cx: &App) -> Vec<Menu> {
         MenuItem::action("Select all", SelectAll),
         MenuItem::separator(),
         MenuItem::action("Toggle line comment", ToggleLineComment),
+        MenuItem::action("Select next occurrence", SelectNextOccurrence),
+        MenuItem::action("Delete line", DeleteLine),
         MenuItem::separator(),
         MenuItem::action("Find…", Search),
         MenuItem::action("Find in files…", FindInFiles),

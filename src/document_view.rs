@@ -1881,6 +1881,48 @@ impl DocumentView {
             .update(cx, |editor, cx| editor.focus(window, cx));
     }
 
+    /// Ctrl+D: select the word at the caret, then move to its next match.
+    pub fn select_next_occurrence(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).value().to_string();
+        let selection = self.editor.read(cx).selected_range();
+        if let Some(next) = format::next_occurrence(&text, selection) {
+            self.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(next, cx);
+                editor.focus(window, cx);
+            });
+        }
+    }
+
+    /// Ctrl+Shift+K: delete the lines the selection touches.
+    pub fn delete_lines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).value().to_string();
+        let selection = self.editor.read(cx).selected_range();
+        if text.is_empty() {
+            return;
+        }
+        self.apply(format::delete_lines(&text, selection), window, cx);
+        self.editor
+            .update(cx, |editor, cx| editor.focus(window, cx));
+    }
+
+    /// Copy or Cut with nothing selected takes the caret's whole line, as in
+    /// VS Code. Returns whether it was handled.
+    fn copy_whole_line(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let editor = self.editor.read(cx);
+        let selection = editor.selected_range();
+        if !selection.is_empty() || !self.editor.focus_handle(cx).is_focused(window) {
+            return false;
+        }
+        let text = editor.value().to_string();
+        let (_, line) = format::whole_line(&text, selection.start);
+        *LINE_CLIPBOARD.lock().unwrap() = Some(line.clone());
+        cx.write_to_clipboard(ClipboardItem::new_string(line));
+        if cut && !text.is_empty() {
+            self.apply(format::cut_whole_line(&text, selection.start), window, cx);
+        }
+        true
+    }
+
     /// Show or hide the page thumbnails, when a PDF is open. Nothing happens
     /// for any other kind of document.
     pub fn toggle_pdf_thumbnails(&mut self, cx: &mut Context<Self>) {
@@ -1935,6 +1977,16 @@ impl DocumentView {
                 ClipboardEntry::String(string) => {
                     let text = self.editor.read(cx).value().to_string();
                     let selection = self.editor.read(cx).selected_range();
+                    // A line copied with nothing selected goes in above the
+                    // caret's line, whole (VS Code).
+                    let copied_line = LINE_CLIPBOARD.lock().unwrap().clone();
+                    if selection.is_empty()
+                        && copied_line.as_deref() == Some(string.text().as_str())
+                    {
+                        let edit = format::paste_line_above(&text, selection.start, string.text());
+                        self.apply(edit, window, cx);
+                        return true;
+                    }
                     if let Some(edit) = smart_edit::paste_link(&text, selection, string.text()) {
                         self.apply(edit, window, cx);
                         return true;
@@ -2424,6 +2476,16 @@ impl DocumentView {
             .drag_over::<TreeDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
             .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _, _| {
                 this.set_scroll_driver(ScrollDriver::Editor)
+            }))
+            .capture_action(cx.listener(|this, _: &Copy, window, cx| {
+                if this.copy_whole_line(false, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &Cut, window, cx| {
+                if this.copy_whole_line(true, window, cx) {
+                    cx.stop_propagation();
+                }
             }))
             .capture_action(cx.listener(|this, action: &Enter, window, cx| {
                 if !action.secondary
@@ -3110,6 +3172,10 @@ fn other_matches(ranges: &[Range<usize>], current: usize) -> impl Iterator<Item 
         .filter(move |(ix, _)| *ix != current)
         .map(|(_, range)| range)
 }
+
+/// The last line copied whole (nothing selected): pasting exactly that text
+/// with nothing selected puts it in as a line above the caret.
+static LINE_CLIPBOARD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// The first line to show when `rows` were on screen and the caret is on
 /// line `caret`: the caret keeps its distance from the top when visible.

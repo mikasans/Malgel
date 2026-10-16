@@ -1151,6 +1151,41 @@ echo "gap: md text@$XMD txt text@$XTXT"
   || fail "plain-text gutter gap differs from Markdown (md $XMD, txt $XTXT)"
 pass "plain text keeps the Markdown gutter-to-text gap"
 
+# 21a4. Ctrl+D selects the word, then its next match; with nothing selected
+#       Ctrl+C copies the whole line and Ctrl+V puts it in above; Ctrl+Shift+K
+#       deletes the line.
+printf 'alpha one\nbeta\nalpha two\n' >"$WS/notes/lines.md"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'lines.md'
+xdotool key --clearmodifiers Return
+sleep 0.8
+xdotool key --clearmodifiers ctrl+Home
+xdotool key --clearmodifiers ctrl+d
+sleep 0.2
+xdotool key --clearmodifiers ctrl+d
+sleep 0.2
+xdotool type --delay 30 'Z'
+xdotool key --clearmodifiers ctrl+s
+sleep 0.8
+[[ "$(cat "$WS/notes/lines.md")" == $'alpha one\nbeta\nZ two' ]] \
+  || fail "Ctrl+D twice did not select the next match: $(tr '\n' '|' <"$WS/notes/lines.md")"
+xdotool key --clearmodifiers ctrl+Home
+xdotool key --clearmodifiers ctrl+c
+sleep 0.2
+xdotool key --clearmodifiers ctrl+v
+xdotool key --clearmodifiers ctrl+s
+sleep 0.8
+[[ "$(cat "$WS/notes/lines.md")" == $'alpha one\nalpha one\nbeta\nZ two' ]] \
+  || fail "empty-selection copy/paste did not duplicate the line above: $(tr '\n' '|' <"$WS/notes/lines.md")"
+xdotool key --clearmodifiers ctrl+Home
+xdotool key --clearmodifiers ctrl+shift+k
+xdotool key --clearmodifiers ctrl+s
+sleep 0.8
+[[ "$(cat "$WS/notes/lines.md")" == $'alpha one\nbeta\nZ two' ]] \
+  || fail "Ctrl+Shift+K did not delete the line: $(tr '\n' '|' <"$WS/notes/lines.md")"
+pass "Ctrl+D next occurrence, whole-line copy/paste, Ctrl+Shift+K"
+
 # 21b. External edit while dirty: Ctrl+S must not clobber the on-disk line.
 #     The conflict alert must take keyboard focus: typing must not reach the
 #     file, and Esc must dismiss the dialog (Keep) without writing.

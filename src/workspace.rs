@@ -5330,6 +5330,14 @@ impl Render for Workspace {
                     doc.toggle_line_comment(window, cx)
                 })
             }))
+            .on_action(cx.listener(|this, _: &SelectNextOccurrence, window, cx| {
+                this.with_active(window, cx, |doc, window, cx| {
+                    doc.select_next_occurrence(window, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &DeleteLine, window, cx| {
+                this.with_active(window, cx, |doc, window, cx| doc.delete_lines(window, cx))
+            }))
             .on_action(cx.listener(|this, _: &MoveLineUp, window, cx| {
                 this.with_active(window, cx, |doc, window, cx| {
                     doc.move_lines(format::LineMove::Up, window, cx)

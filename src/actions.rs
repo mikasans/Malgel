@@ -89,6 +89,8 @@ actions!(
         MoveLineUp,
         MoveLineDown,
         ToggleLineComment,
+        SelectNextOccurrence,
+        DeleteLine,
     ]
 );
 
@@ -328,6 +330,10 @@ pub fn bind_keys(cx: &mut App) {
         // pair does not fight either.
         // VS Code's Toggle Line Comment.
         KeyBinding::new("secondary-/", ToggleLineComment, Some(EDITOR_CONTEXT)),
+        // VS Code's Add Selection To Next Find Match (one selection here: it
+        // moves to the next match) and Delete Line.
+        KeyBinding::new("secondary-d", SelectNextOccurrence, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-shift-k", DeleteLine, Some(EDITOR_CONTEXT)),
         KeyBinding::new("alt-up", MoveLineUp, Some(EDITOR_CONTEXT)),
         KeyBinding::new("alt-down", MoveLineDown, Some(EDITOR_CONTEXT)),
     ]);

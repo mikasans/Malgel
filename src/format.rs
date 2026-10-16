@@ -216,6 +216,96 @@ pub fn toggle_block(text: &str, selection: Range<usize>, style: Block) -> Edit {
     }
 }
 
+/// The whole line holding `offset`: its range in `text` (line break
+/// included) and its text with a line break always at the end, which is
+/// what an empty-selection Copy or Cut puts on the clipboard (VS Code).
+pub fn whole_line(text: &str, offset: usize) -> (Range<usize>, String) {
+    let offset = offset.min(text.len());
+    let start = text[..offset].rfind('\n').map_or(0, |at| at + 1);
+    let end = text[offset..]
+        .find('\n')
+        .map_or(text.len(), |at| offset + at + 1);
+    let mut line = text[start..end].to_string();
+    if !line.ends_with('\n') {
+        line.push('\n');
+    }
+    (start..end, line)
+}
+
+/// Cut the line under a caret: the line goes, and the caret lands at the
+/// start of the line that moved up into its place.
+pub fn cut_whole_line(text: &str, caret: usize) -> Edit {
+    delete_lines(text, caret..caret)
+}
+
+/// Delete every line the selection touches (Ctrl+Shift+K); a selection
+/// ending at column 0 stops before that line.
+pub fn delete_lines(text: &str, selection: Range<usize>) -> Edit {
+    let len = text.len();
+    let start = selection.start.min(len);
+    let mut end = selection.end.min(len);
+    if end > start && text[..end].ends_with('\n') {
+        end -= 1;
+    }
+    let first = whole_line(text, start).0;
+    let last = whole_line(text, end.max(start)).0;
+    let mut range = first.start..last.end;
+    if !text[range.clone()].ends_with('\n') && range.start > 0 {
+        range.start -= 1; // the last line: remove the break before it instead
+    }
+    let caret = if range.start > 0 && range.end == len && !text.ends_with('\n') {
+        text[..range.start].rfind('\n').map_or(0, |at| at + 1)
+    } else {
+        range.start
+    };
+    Edit {
+        range,
+        text: String::new(),
+        selection: caret..caret,
+    }
+}
+
+/// Paste a whole copied line above the caret's line, the caret staying on
+/// its character.
+pub fn paste_line_above(text: &str, caret: usize, line: &str) -> Edit {
+    let caret = caret.min(text.len());
+    let start = text[..caret].rfind('\n').map_or(0, |at| at + 1);
+    let moved = caret + line.len();
+    Edit {
+        range: start..start,
+        text: line.to_string(),
+        selection: moved..moved,
+    }
+}
+
+/// Ctrl+D: with no selection, select the word at the caret; with one, move
+/// it to the next occurrence of the same text after it, wrapping to the
+/// top. `None` when there is no word or no other occurrence.
+pub fn next_occurrence(text: &str, selection: Range<usize>) -> Option<Range<usize>> {
+    let len = text.len();
+    let (start, end) = (selection.start.min(len), selection.end.min(len));
+    if start == end {
+        let is_word = |ch: char| ch.is_alphanumeric() || ch == '_';
+        let before = text[..start]
+            .char_indices()
+            .rev()
+            .take_while(|(_, ch)| is_word(*ch))
+            .last()
+            .map_or(start, |(at, _)| at);
+        let after = text[start..]
+            .char_indices()
+            .find(|(_, ch)| !is_word(*ch))
+            .map_or(len, |(at, _)| start + at);
+        return (before < after).then_some(before..after);
+    }
+    let needle = &text[start..end];
+    let found = text[end..]
+        .find(needle)
+        .map(|at| end + at)
+        .or_else(|| text[..start].find(needle))?;
+    Some(found..found + needle.len())
+}
+
 /// How a language comments out a line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommentStyle {
@@ -525,6 +615,54 @@ fn clamp(text: &str, range: Range<usize>) -> Range<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whole_line_copy_cut_paste_and_delete() {
+        use super::*;
+        let text = "one\ntwo\nthree";
+        assert_eq!(whole_line(text, 5), (4..8, "two\n".to_string()));
+        assert_eq!(whole_line(text, 10), (8..13, "three\n".to_string()));
+        let apply = |text: &str, edit: Edit| {
+            let mut out = text.to_string();
+            out.replace_range(edit.range.clone(), &edit.text);
+            (out, edit.selection)
+        };
+        assert_eq!(
+            apply(text, cut_whole_line(text, 5)),
+            ("one\nthree".into(), 4..4)
+        );
+        assert_eq!(
+            apply(text, cut_whole_line(text, 10)),
+            ("one\ntwo".into(), 4..4)
+        );
+        assert_eq!(apply("solo", cut_whole_line("solo", 2)), ("".into(), 0..0));
+        // Paste above keeps the caret on its character.
+        assert_eq!(
+            apply(text, paste_line_above(text, 5, "new\n")),
+            ("one\nnew\ntwo\nthree".into(), 9..9)
+        );
+        // Delete lines: two lines, then a column-0 end, then the last line.
+        assert_eq!(apply(text, delete_lines(text, 1..5)).0, "three");
+        assert_eq!(apply(text, delete_lines(text, 0..4)).0, "two\nthree");
+        assert_eq!(apply(text, delete_lines(text, 9..9)).0, "one\ntwo");
+    }
+
+    #[test]
+    fn ctrl_d_selects_the_word_then_the_next_match_wrapping() {
+        use super::next_occurrence;
+        let text = "foo bar foo_x foo";
+        assert_eq!(next_occurrence(text, 1..1), Some(0..3));
+        assert_eq!(next_occurrence(text, 0..3), Some(8..11));
+        assert_eq!(next_occurrence(text, 8..11), Some(14..17));
+        assert_eq!(next_occurrence(text, 14..17), Some(0..3), "wraps");
+        assert_eq!(
+            next_occurrence(text, 3..3),
+            Some(0..3),
+            "caret right after a word"
+        );
+        assert_eq!(next_occurrence("a  b", 2..2), None);
+        assert_eq!(next_occurrence("only", 0..4), None);
+    }
+
     #[test]
     fn toggles_line_comments_at_the_smallest_indent() {
         use super::{CommentStyle::*, toggle_line_comment};
