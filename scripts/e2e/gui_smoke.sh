@@ -1281,6 +1281,19 @@ shot 48b-dialog-error
   || fail "no notification on screen for the file dialog failure"
 kill -0 "$APP_PID" 2>/dev/null || fail "the app died when the file dialog failed"
 pass "a file dialog that cannot open is reported (notification)"
+# The in-app fallback asks for a path, prefilled with $HOME/Untitled.md
+# (fresh HOME); Enter saves there, so Untitled can still be saved.
+xdotool key --clearmodifiers Return
+wait_for 4 test -s "$HOME/Untitled.md" \
+  || fail "the in-app Save As fallback did not save the Untitled document"
+grep -q 'portal' "$HOME/Untitled.md" || fail "fallback save wrote the wrong text"
+sleep 0.5
+shot 48c-fallback-saved
+# The notice sits at the bottom: the top-right band, under the title bar where
+# toasts used to stack over the tabs, is unchanged.
+[[ "$(region_differ 48a-untitled 48c-fallback-saved 380x80+1040+150)" -lt 200 ]] \
+  || fail "the file dialog notice covers the top of the window (tabs)"
+pass "no file dialog: in-app path field saves Untitled; notice stays off the tabs"
 
 # 21d. G5: in Tokyo Moon the line numbers render at >= 4.5:1 (they are painted
 #      with muted.foreground; the old #6e738d was 3.28:1). Last, since the

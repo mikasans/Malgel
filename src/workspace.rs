@@ -30,7 +30,7 @@ use gpui_kit::{
         command::{Command, CommandGroup, CommandItem, CommandState},
         dialog::DialogFooter,
         h_flex,
-        input::Escape,
+        input::{Escape, Input, InputEvent, InputState},
         link::Link,
         menu::{AppMenuBar, ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
         notification::Notification,
@@ -377,6 +377,7 @@ pub struct Workspace {
     theme_picker: Entity<CommandState>,
     /// Focus for the alert dialogs' buttons (initial focus, ring, Tab trap).
     alert_focus: std::rc::Rc<crate::dialog_focus::DialogFocus>,
+    fallback_save_sub: Option<Subscription>,
     go_to_line: Entity<CommandState>,
     /// The one-line prompt New File / New Folder / Rename ask their name in.
     tree_prompt: Entity<CommandState>,
@@ -537,6 +538,7 @@ impl Workspace {
             command_palette,
             theme_picker,
             alert_focus: std::rc::Rc::new(crate::dialog_focus::DialogFocus::new(cx)),
+            fallback_save_sub: None,
             go_to_line,
             tree_prompt,
             find_query,
@@ -3040,22 +3042,133 @@ impl Workspace {
             };
             (dir, name)
         };
+        let fallback = dir.join(&name);
         let chosen = cx.prompt_for_new_path(&dir, Some(&name));
         cx.spawn_in(window, async move |this, cx| {
-            let Some(path) = file_dialog(chosen, cx).await else {
-                return;
-            };
-            _ = this.update_in(cx, |this, window, cx| {
-                if this.write(&doc, &path, window, cx) {
-                    AppSettings::update(cx, |settings| settings.push_recent(&path));
-                    this.sync_file_tree(cx);
-                    if let Some(next) = next {
-                        this.run_after_confirm(next, window, cx);
-                    }
+            let outcome = file_dialog_outcome(chosen.await);
+            _ = this.update_in(cx, |this, window, cx| match outcome {
+                Ok(Some(path)) => this.save_to_chosen(&doc, &path, next, window, cx),
+                Ok(None) => {}
+                // No system dialog: say so, then ask for the path in the app
+                // so an Untitled document can still be saved.
+                Err(detail) => {
+                    report_file_dialog_failure(&detail, window, cx);
+                    this.ask_save_path_in_app(doc, fallback, next, window, cx);
                 }
             });
         })
         .detach();
+    }
+
+    fn save_to_chosen(
+        &mut self,
+        doc: &Entity<DocumentView>,
+        path: &Path,
+        next: Option<AfterConfirm>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.write(doc, path, window, cx) {
+            AppSettings::update(cx, |settings| settings.push_recent(path));
+            self.sync_file_tree(cx);
+            if let Some(next) = next {
+                self.run_after_confirm(next, window, cx);
+            }
+        }
+    }
+
+    /// The fallback when the system file dialog cannot open: a path field,
+    /// prefilled with the folder and suggested name. Enter or Save writes;
+    /// an existing file other than this document's own is not overwritten.
+    fn ask_save_path_in_app(
+        &mut self,
+        doc: Entity<DocumentView>,
+        suggested: PathBuf,
+        next: Option<AfterConfirm>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let input =
+            cx.new(|cx| InputState::new(window, cx).default_value(suggested.display().to_string()));
+        let next = Rc::new(std::cell::RefCell::new(next));
+        let confirm: WindowCallback = {
+            let input = input.clone();
+            let workspace = cx.weak_entity();
+            let next = next.clone();
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                let Some(path) = typed_save_path(&input.read(cx).value()) else {
+                    return;
+                };
+                let Some(this) = workspace.upgrade() else {
+                    return;
+                };
+                let own = doc.read(cx).path().is_some_and(|own| own == path.as_path());
+                if path.exists() && !own {
+                    window.push_notification(
+                        Notification::error(format!(
+                            "“{}” already exists. Pick another name.",
+                            display_name(Some(&path))
+                        ))
+                        .placement(Anchor::BottomRight),
+                        cx,
+                    );
+                    return;
+                }
+                window.close_dialog(cx);
+                let doc = doc.clone();
+                let next = next.borrow_mut().take();
+                this.update(cx, |this, cx| {
+                    this.save_to_chosen(&doc, &path, next, window, cx)
+                });
+            })
+        };
+        self.fallback_save_sub = Some(cx.subscribe_in(&input, window, {
+            let confirm = confirm.clone();
+            move |_, _, event: &InputEvent, window, cx| {
+                // The subscriber runs inside a workspace update; confirm
+                // updates the workspace itself, so run it after.
+                if let InputEvent::PressEnter { .. } = event {
+                    let confirm = confirm.clone();
+                    window.defer(cx, move |window, cx| confirm(window, cx));
+                }
+            }
+        }));
+        let focus = input.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let confirm = confirm.clone();
+            dialog
+                .title("Save as")
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().child("Type the full path to save to:"))
+                        .child(Input::new(&input))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("The system file dialog isn’t available."),
+                        ),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("fallback-save-cancel")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("fallback-save")
+                                .primary()
+                                .label("Save")
+                                .on_click(move |_, window, cx| confirm(window, cx)),
+                        ),
+                )
+        });
     }
 
     /// Write `doc` to `path`; reports failures to the user.
@@ -5525,21 +5638,64 @@ fn esc_closes(content: impl IntoElement) -> gpui_kit::Div {
 }
 
 /// A file dialog's answer: `Ok(Some)` is a choice, `Ok(None)` a cancel, and
-/// `Err` the message to show — the dialog itself failed to open (on Linux,
+/// `Err` the raw reason the dialog itself failed to open (on Linux,
 /// typically no xdg-desktop-portal), which must not look like a cancel.
 fn file_dialog_outcome<T, E: std::fmt::Display, C: std::fmt::Display>(
     answer: Result<Result<Option<T>, E>, C>,
 ) -> Result<Option<T>, String> {
-    let detail = match answer {
-        Ok(Ok(chosen)) => return Ok(chosen),
-        Ok(Err(err)) => err.to_string(),
-        Err(err) => err.to_string(),
+    match answer {
+        Ok(Ok(chosen)) => Ok(chosen),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// A shared window callback (dialog buttons and Enter both confirm).
+type WindowCallback = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// What to do about a missing file dialog, in words a person can act on.
+fn file_dialog_hint() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "Install xdg-desktop-portal-gtk to use it."
+    } else {
+        "The system did not respond."
+    }
+}
+
+/// Report a file dialog that could not open: a plain first line, what to
+/// install, and the raw error last, small and cut to one line. Shown at the
+/// bottom so it never covers the tabs.
+fn report_file_dialog_failure(detail: &str, window: &mut Window, cx: &mut App) {
+    eprintln!("malgel: Couldn't open the file dialog: {detail}");
+    let detail: SharedString = detail.lines().next().unwrap_or_default().to_string().into();
+    window.push_notification(
+        Notification::error(file_dialog_hint())
+            .title("Couldn’t open the file dialog")
+            .placement(Anchor::BottomRight)
+            .content(move |_, _, cx| {
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .truncate()
+                    .child(detail.clone())
+                    .into_any_element()
+            }),
+        cx,
+    );
+}
+
+/// The path typed into the in-app Save As field: trimmed, `~/` expanded;
+/// `None` when empty or naming a folder.
+fn typed_save_path(typed: &str) -> Option<PathBuf> {
+    let typed = typed.trim();
+    if typed.is_empty() || typed.ends_with('/') || typed.ends_with(std::path::MAIN_SEPARATOR) {
+        return None;
+    }
+    let path = match typed.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()?.join(rest),
+        None => PathBuf::from(typed),
     };
-    Err(format!(
-        "Couldn't open the file dialog. {detail}\n\
-         On Linux this needs xdg-desktop-portal with a backend such as \
-         xdg-desktop-portal-gtk."
-    ))
+    Some(path)
 }
 
 /// Wait for a file dialog; a failure to show it becomes an error
@@ -5550,9 +5706,8 @@ async fn file_dialog<T, E: std::fmt::Display, C: std::fmt::Display>(
 ) -> Option<T> {
     match file_dialog_outcome(answer.await) {
         Ok(chosen) => chosen,
-        Err(message) => {
-            eprintln!("malgel: {message}");
-            _ = cx.update(|window, cx| window.push_notification(Notification::error(message), cx));
+        Err(detail) => {
+            _ = cx.update(|window, cx| report_file_dialog_failure(&detail, window, cx));
             None
         }
     }
@@ -5586,11 +5741,26 @@ mod tests {
         assert_eq!(file_dialog_outcome(cancelled), Ok(None));
         let failed: Result<Result<Option<u8>, String>, String> =
             Ok(Err("org.freedesktop.portal.Desktop not found".into()));
-        let message = file_dialog_outcome(failed).unwrap_err();
-        assert!(message.starts_with("Couldn't open the file dialog. org.freedesktop"));
-        assert!(message.contains("xdg-desktop-portal-gtk"));
+        let detail = file_dialog_outcome(failed).unwrap_err();
+        assert_eq!(detail, "org.freedesktop.portal.Desktop not found");
+        assert!(super::file_dialog_hint().lines().count() == 1);
         let dropped: Result<Result<Option<u8>, String>, String> = Err("canceled".into());
         assert!(file_dialog_outcome(dropped).is_err());
+    }
+
+    #[test]
+    fn a_typed_save_path_is_trimmed_and_must_name_a_file() {
+        use super::typed_save_path;
+        use std::path::PathBuf;
+        assert_eq!(
+            typed_save_path("  /tmp/a.md \n"),
+            Some(PathBuf::from("/tmp/a.md"))
+        );
+        assert_eq!(typed_save_path("   "), None);
+        assert_eq!(typed_save_path("/tmp/"), None);
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(typed_save_path("~/x.md"), Some(home.join("x.md")));
+        }
     }
 
     #[test]
