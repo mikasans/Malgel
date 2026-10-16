@@ -3,17 +3,20 @@
 //! Pages are parsed with `hayro_interpret::hayro_syntax::Pdf` and turned into
 //! crisp SVG sheets with `hayro_svg::convert` **on demand**: only the pages in
 //! view are rendered, and rendered pages are cached, so long documents open
-//! and scroll smoothly. The viewer is one continuous vertical scroll with
+//! and scroll smoothly. Conversion runs on a background executor — never on
+//! the GPUI UI thread — so title-bar and layout buttons stay clickable while
+//! pages fill in. The viewer is one continuous vertical scroll with
 //! fit-width / fit-page / custom zoom and page navigation, and the gestures
 //! `zoom` documents and the image viewer share: Command/Control with the wheel
 //! zooms, and a double click swaps between the fit and a closer look.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
+    time::Instant,
 };
 
 use gpui_kit::{
@@ -123,8 +126,17 @@ pub struct PdfDocument {
     /// The parsed file; `None` for pages drawn elsewhere and handed over
     /// ready-made, the way a live Typst preview's are.
     pdf: Option<Pdf>,
+    /// Raw bytes the PDF was parsed from, so a page can be converted on a
+    /// background thread without touching the UI-owned `Pdf`.
+    bytes: Option<Arc<Vec<u8>>>,
     pages: Vec<PdfPage>,
     rendered: HashMap<usize, Arc<Image>>,
+    /// Pages whose background conversion has been scheduled but not yet
+    /// applied. Keeps the UI from spawning the same page twice.
+    pending: HashSet<usize>,
+    /// Bumped on every [`PdfView::reload`] so a late background result from
+    /// a previous document is dropped.
+    generation: u64,
     interpreter_settings: InterpreterSettings,
     render_settings: SvgRenderSettings,
 }
@@ -166,7 +178,9 @@ impl PdfDocument {
     /// Parse `bytes` into a document. Pages are measured now and rendered
     /// lazily, so a long document is cheap to open.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
-        let pdf = Pdf::new(bytes).map_err(|err| format!("Failed to parse PDF: {err:?}"))?;
+        let shared = Arc::new(bytes);
+        let pdf = Pdf::new(shared.clone())
+            .map_err(|err| format!("Failed to parse PDF: {err:?}"))?;
         let pages = pdf
             .pages()
             .iter()
@@ -183,8 +197,11 @@ impl PdfDocument {
             .collect();
         Ok(Self {
             pdf: Some(pdf),
+            bytes: Some(shared),
             pages,
             rendered: HashMap::new(),
+            pending: HashSet::new(),
+            generation: 0,
             interpreter_settings: default_interpreter_settings(),
             render_settings: SvgRenderSettings {
                 bg_color: [255, 255, 255, 255],
@@ -212,8 +229,11 @@ impl PdfDocument {
             .collect();
         Self {
             pdf: None,
+            bytes: None,
             pages,
             rendered,
+            pending: HashSet::new(),
+            generation: 0,
             interpreter_settings: default_interpreter_settings(),
             render_settings: SvgRenderSettings {
                 bg_color: [255, 255, 255, 255],
@@ -234,8 +254,11 @@ impl PdfDocument {
         let Some(pdf) = &self.pdf else {
             return Self {
                 pdf: None,
+                bytes: None,
                 pages: self.pages.clone(),
                 rendered: self.rendered.clone(),
+                pending: HashSet::new(),
+                generation: self.generation,
                 interpreter_settings: self.interpreter_settings.clone(),
                 render_settings: self.render_settings.clone(),
             };
@@ -258,8 +281,11 @@ impl PdfDocument {
             .collect();
         Self {
             pdf: Some(pdf),
+            bytes: self.bytes.clone(),
             pages,
             rendered: HashMap::new(),
+            pending: HashSet::new(),
+            generation: self.generation,
             interpreter_settings: self.interpreter_settings.clone(),
             render_settings: self.render_settings.clone(),
         }
@@ -270,23 +296,26 @@ impl PdfDocument {
         self.pages.len()
     }
 
-    /// The rendered SVG image for page `index`, rendering and caching it the
-    /// first time it is asked for.
-    fn image(&mut self, index: usize) -> Option<Arc<Image>> {
-        if let Some(image) = self.rendered.get(&index) {
-            return Some(image.clone());
-        }
-        let page = self.pdf.as_ref()?.pages().get(index)?;
+    /// A cached sheet for page `index`, if conversion has finished.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn image(&self, index: usize) -> Option<Arc<Image>> {
+        self.rendered.get(&index).cloned()
+    }
+
+    /// Convert page `index` of `bytes` to an SVG image. Runs off the UI thread.
+    fn render_page_bytes(
+        bytes: Arc<Vec<u8>>,
+        index: usize,
+        interpreter_settings: InterpreterSettings,
+        render_settings: SvgRenderSettings,
+    ) -> Option<(Arc<Image>, std::time::Duration)> {
+        let started = Instant::now();
+        let pdf = Pdf::new(bytes).ok()?;
+        let page = pdf.pages().get(index)?;
         let cache = RenderCache::new();
-        let svg = convert(
-            page,
-            &cache,
-            &self.interpreter_settings,
-            &self.render_settings,
-        );
+        let svg = convert(page, &cache, &interpreter_settings, &render_settings);
         let image = Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()));
-        self.rendered.insert(index, image.clone());
-        Some(image)
+        Some((image, started.elapsed()))
     }
 }
 
@@ -410,10 +439,80 @@ impl PdfView {
     /// than from the old cache.
     pub fn reload(&mut self, doc: PdfDocument, cx: &mut Context<Self>) {
         let current_page = self.current_page;
+        let generation = self
+            .doc
+            .as_ref()
+            .map(|doc| doc.generation.wrapping_add(1))
+            .unwrap_or(1);
         self.doc = Some(doc);
+        if let Some(doc) = &mut self.doc {
+            doc.generation = generation;
+            doc.pending.clear();
+        }
         // Clamped: a document that shrank leaves the reader on its last page.
         self.current_page = current_page.min(self.page_count().saturating_sub(1));
         cx.notify();
+    }
+
+    /// The sheet for page `index`, scheduling a background conversion when
+    /// it is not yet ready. Returns `None` while conversion is in flight so
+    /// the caller can paint a placeholder without blocking the UI thread.
+    fn page_image(&mut self, index: usize, cx: &mut Context<Self>) -> Option<Arc<Image>> {
+        let Some(doc) = self.doc.as_mut() else {
+            return None;
+        };
+        if let Some(image) = doc.rendered.get(&index) {
+            return Some(image.clone());
+        }
+        // Pre-rendered Typst sheets land in `rendered` already; no bytes to convert.
+        let Some(bytes) = doc.bytes.clone() else {
+            return None;
+        };
+        if !doc.pending.insert(index) {
+            return None;
+        }
+        let generation = doc.generation;
+        let interpreter_settings = doc.interpreter_settings.clone();
+        let render_settings = doc.render_settings.clone();
+        let task = cx.background_executor().spawn(async move {
+            PdfDocument::render_page_bytes(
+                bytes,
+                index,
+                interpreter_settings,
+                render_settings,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            _ = this.update(cx, |this, cx| {
+                let Some(doc) = this.doc.as_mut() else {
+                    return;
+                };
+                doc.pending.remove(&index);
+                if doc.generation != generation {
+                    log::debug!(
+                        "pdf: drop stale page {index} render (generation {generation} -> {})",
+                        doc.generation
+                    );
+                    return;
+                }
+                match outcome {
+                    Some((image, elapsed)) => {
+                        log::debug!(
+                            "pdf: page {index} converted in {:.1} ms (off UI thread)",
+                            elapsed.as_secs_f64() * 1000.
+                        );
+                        doc.rendered.insert(index, image);
+                        cx.notify();
+                    }
+                    None => {
+                        log::warn!("pdf: page {index} conversion failed");
+                    }
+                }
+            });
+        })
+        .detach();
+        None
     }
 
     /// Whether two pages are shown side by side.
@@ -965,7 +1064,7 @@ impl PdfView {
                                 .filter_map(|ix| {
                                     let page = this.doc.as_ref()?.pages.get(ix)?.clone();
                                     let (width, height) = thumb_size(&page, THUMB_WIDTH);
-                                    let image = this.doc.as_mut().and_then(|doc| doc.image(ix));
+                                    let image = this.page_image(ix, context);
                                     let current_border = if ix == current {
                                         current_border_colour
                                     } else {
@@ -1072,7 +1171,7 @@ impl PdfView {
             cx.entity(),
             "pdf-pages",
             sizes,
-            move |this, range: Range<usize>, _window, _cx| {
+            move |this, range: Range<usize>, _window, cx| {
                 range
                     .filter_map(|row_ix| {
                         let row = rows.get(row_ix)?.clone();
@@ -1089,7 +1188,7 @@ impl PdfView {
                             .map(|(page, &page_ix)| {
                                 let width = px(page.width * zoom);
                                 let height = px(page.height * zoom);
-                                match this.doc.as_mut().and_then(|doc| doc.image(page_ix)) {
+                                match this.page_image(page_ix, cx) {
                                     Some(image) => div()
                                         .w(width)
                                         .h(height)
@@ -1279,7 +1378,7 @@ mod tests {
     #[test]
     fn rendered_pages_keep_their_size_and_sheet() {
         let image = Arc::new(Image::from_bytes(ImageFormat::Svg, b"<svg/>".to_vec()));
-        let mut doc = PdfDocument::from_rendered(vec![(100., 200., image.clone())]);
+        let doc = PdfDocument::from_rendered(vec![(100., 200., image.clone())]);
         assert_eq!(doc.page_count(), 1);
         assert_eq!(doc.pages()[0].height, 200.);
         assert!(Arc::ptr_eq(&doc.image(0).unwrap(), &image));
@@ -1320,13 +1419,24 @@ mod tests {
         let pdf_bytes =
             typst_pdf::pdf(&doc, &typst_pdf::PdfOptions::default()).expect("generate pdf bytes");
 
-        let mut document = PdfDocument::from_bytes(pdf_bytes).expect("parse pdf");
+        let document = PdfDocument::from_bytes(pdf_bytes).expect("parse pdf");
         assert_eq!(document.page_count(), 1);
         assert_eq!(document.pages()[0].page_number, 1);
         assert!(document.pages()[0].width > 0.0);
         assert!(document.pages()[0].height > 0.0);
-        // Rendering a page on demand produces an SVG-backed image.
-        assert!(document.image(0).is_some());
+        // Pages are not converted on the UI thread: the cache starts empty and
+        // fill-in happens via background work (see PdfView::page_image).
+        assert!(document.image(0).is_none());
+        let bytes = document.bytes.clone().expect("bytes kept for off-thread render");
+        let (image, elapsed) = PdfDocument::render_page_bytes(
+            bytes,
+            0,
+            document.interpreter_settings.clone(),
+            document.render_settings.clone(),
+        )
+        .expect("convert page 0 off the UI thread");
+        assert!(!image.bytes.is_empty());
+        assert!(elapsed.as_secs_f64() < 30., "{elapsed:?}");
         assert!(document.image(1).is_none());
     }
 

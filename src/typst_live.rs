@@ -4,18 +4,20 @@
 //! tinymist keeps one compiler world per document, edits its source in
 //! place on every change, lets `comemo` reuse whatever the edit did not
 //! touch, and ships the result to a webview as incremental vector data. A
-//! GPUI view has no webview, so the pages are drawn as SVG sheets here and
-//! the page viewer shows them; a page whose frame did not change keeps its
-//! sheet (and the GPU texture made from it), so typing on page 7 redraws
-//! page 7 only.
+//! GPUI view has no webview, so the pages are drawn here as raster sheets
+//! (SVG → PNG on this thread) and the page viewer shows them; a page whose
+//! frame did not change keeps its sheet (and the GPU texture made from it),
+//! so typing on page 7 redraws page 7 only. Rasterizing off the UI thread
+//! keeps title-bar buttons responsive while the preview updates.
 //!
 //! All of it runs on a thread of its own. The editor sends the text after a
 //! short pause in typing; requests that queue up while a compile runs are
 //! folded into the newest, so the preview never falls behind. A compile that
 //! fails reports its diagnostics and keeps the last good pages. The same
-//! thread answers where a click on a page comes from in the source and where
-//! the caret's text lands on the pages (typst-ide's `jump_from_click` and
-//! `jump_from_cursor`), since it holds the compiled document.
+//! thread answers where a click on a page comes from in the source, where
+//! the caret's text lands on the pages, and where a go-to-definition lands
+//! (typst-ide's `jump_from_click`, `jump_from_cursor`, and `definition`),
+//! since it holds the compiled document.
 
 use std::{
     collections::HashMap,
@@ -32,7 +34,7 @@ use typst::{
     diag::Severity,
     introspection::PagedPosition,
     layout::{Abs, Point},
-    syntax::{LinkedNode, Tag},
+    syntax::{LinkedNode, Side, Tag},
     utils::hash128,
 };
 
@@ -42,6 +44,34 @@ use crate::typst_preview::DocumentWorld;
 
 /// How often the compiler thread checks the files a document named.
 const IMPORT_POLL: Duration = Duration::from_secs(1);
+
+/// Device pixels per Typst point when rasterizing a page sheet. 2× keeps
+/// pages sharp on HiDPI without handing huge SVGs to the UI paint path.
+const SHEET_SCALE: f32 = 2.;
+
+/// Turn a Typst SVG page into a PNG `Image` on the compiler thread so GPUI
+/// never runs resvg on the UI thread for live preview pages.
+fn sheet_image(svg: String, width_pt: f32, height_pt: f32) -> Arc<Image> {
+    match rasterize_svg_png(&svg, width_pt, height_pt) {
+        Some(png) => Arc::new(Image::from_bytes(ImageFormat::Png, png)),
+        None => {
+            log::warn!("typst live: SVG raster failed; falling back to SVG image");
+            Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()))
+        }
+    }
+}
+
+fn rasterize_svg_png(svg: &str, width_pt: f32, height_pt: f32) -> Option<Vec<u8>> {
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_str(svg, &options).ok()?;
+    let width = ((width_pt * SHEET_SCALE).ceil() as u32).max(1);
+    let height = ((height_pt * SHEET_SCALE).ceil() as u32).max(1);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    let transform = resvg::tiny_skia::Transform::from_scale(SHEET_SCALE, SHEET_SCALE);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    pixmap.encode_png().ok()
+}
+
 
 /// A drawn page: its size in points and its sheet.
 #[derive(Clone)]
@@ -151,7 +181,9 @@ impl LiveCompiler {
                             None => {
                                 redrawn += 1;
                                 let svg = typst_svg::svg(page, &typst_svg::SvgOptions::default());
-                                Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()))
+                                let width = page.frame.width().to_pt() as f32;
+                                let height = page.frame.height().to_pt() as f32;
+                                sheet_image(svg, width, height)
                             }
                         };
                         sheets.insert(key, image.clone());
@@ -180,11 +212,17 @@ impl LiveCompiler {
         comemo::evict(10);
         self.read = self.world.read_files();
         self.stamp = Some(crate::typst_preview::stamp_of(&self.read));
+        let elapsed = started.elapsed();
+        log::debug!(
+            "typst live: compile {:.1} ms ({} page(s) redrawn, revision {revision})",
+            elapsed.as_secs_f64() * 1000.,
+            redrawn,
+        );
         Compiled {
             revision,
             pages,
             diagnostics,
-            elapsed: started.elapsed(),
+            elapsed,
             redrawn,
             highlights: highlights(self.world.main_source()),
         }
@@ -265,6 +303,35 @@ impl LiveCompiler {
             position.point.y.to_pt() as f32,
         ))
     }
+
+    /// Where go-to-definition at byte `offset` lands in this source, when the
+    /// definition is in the same file (labels, refs, lets, callees).
+    pub fn definition_at(&self, offset: usize) -> Option<usize> {
+        let source = self.world.main_source();
+        let definition = typst_ide::definition(
+            &self.world,
+            self.document.as_ref(),
+            source,
+            offset,
+            Side::After,
+        ).or_else(|| {
+            typst_ide::definition(
+                &self.world,
+                self.document.as_ref(),
+                source,
+                offset,
+                Side::Before,
+            )
+        })?;
+        match definition {
+            typst_ide::Definition::Span(span)
+                if span.id() == Some(source.id()) =>
+            {
+                self.world.range(span).map(|range| range.start)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// What the editor asks the compiler thread.
@@ -272,6 +339,7 @@ pub enum Request {
     Compile { text: String, revision: usize },
     SourceAt { page: usize, x: f32, y: f32 },
     PageAt { offset: usize },
+    DefinitionAt { offset: usize },
 }
 
 /// What the compiler thread answers.
@@ -279,6 +347,8 @@ pub enum Response {
     Compiled(Compiled),
     SourceAt(usize),
     PageAt(usize, f32, f32),
+    /// Go-to-definition landed at this byte offset in the main source.
+    DefinitionAt(usize),
 }
 
 /// The compiler thread for one document. Dropping it ends the thread.
@@ -337,6 +407,12 @@ impl LiveWorker {
                                 Some((page, x, y)) => Response::PageAt(page, x, y),
                                 None => continue,
                             },
+                            Request::DefinitionAt { offset } => {
+                                match compiler.definition_at(offset) {
+                                    Some(at) => Response::DefinitionAt(at),
+                                    None => continue,
+                                }
+                            }
                         };
                         if answers.unbounded_send(answer).is_err() {
                             return;
@@ -445,6 +521,20 @@ mod tests {
             text[..back].contains("Hello") || back >= text.find("Hello").unwrap(),
             "{back}"
         );
+    }
+
+    #[test]
+    fn go_to_definition_finds_a_label_from_its_ref() {
+        let mut live = compiler("def");
+        let text = "#figure[Hi] <fig>\nSee @fig for details.\n";
+        live.compile(text, 1);
+        let at = text.find("@fig").expect("@fig");
+        let target = live.definition_at(at).expect("label definition");
+        assert!(
+            target < at,
+            "definition {target} should be the label before the ref at {at}"
+        );
+        assert!(text[target..].starts_with("#figure") || text[target..].contains("<fig>"), "{target}");
     }
 
     /// Keystroke-to-pages time on a multi-page document, warm caches.
