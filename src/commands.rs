@@ -162,6 +162,7 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Go to file…", IconName::FileText, QuickOpen),
             cmd("Go to heading…", IconName::Heading1, GoToHeading),
             cmd("Go to line…", IconName::ArrowRight, GoToLine),
+            cmd("Go to Definition", IconName::ArrowRight, GoToDefinition),
             cmd("Go back", IconName::ArrowLeft, GoBack),
             cmd("Go forward", IconName::ArrowRight, GoForward),
         ],

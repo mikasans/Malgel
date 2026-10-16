@@ -839,9 +839,23 @@ impl Workspace {
                 }
                 cx.notify()
             }),
-            cx.subscribe_in(doc, window, |_, _, event, window, cx| match event {
+            cx.subscribe_in(doc, window, |this, _, event, window, cx| match event {
                 DocumentEvent::Notify(message) => {
                     window.push_notification(Notification::info(message.clone()), cx)
+                }
+                DocumentEvent::ShowEditor => {
+                    let layout = AppSettings::get(cx).layout;
+                    if layout == Layout::Preview {
+                        log::info!(
+                            "ui: ShowEditor from preview-only -> Split (so a jump is visible)"
+                        );
+                        AppSettings::update(cx, |settings| {
+                            settings.layout = Layout::Split;
+                            settings.focus_mode = false;
+                        });
+                        this.focus_active(window, cx);
+                        cx.notify();
+                    }
                 }
             }),
         ];
@@ -3391,11 +3405,17 @@ impl Workspace {
 
     fn set_layout(&mut self, action: &SetLayout, window: &mut Window, cx: &mut Context<Self>) {
         let layout = action.0;
+        let started = std::time::Instant::now();
+        log::info!("ui: title-bar SetLayout -> {layout:?}");
         AppSettings::update(cx, |settings| {
             settings.layout = layout;
             settings.focus_mode = false;
         });
         self.focus_active(window, cx);
+        log::debug!(
+            "ui: SetLayout handled in {:.1} ms",
+            started.elapsed().as_secs_f64() * 1000.
+        );
     }
 
     fn toggle_focus_mode(
@@ -3746,6 +3766,23 @@ impl Workspace {
         });
     }
 
+    fn go_to_definition(
+        &mut self,
+        _: &GoToDefinition,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let started = std::time::Instant::now();
+        log::info!("ui: GoToDefinition");
+        self.active_document()
+            .update(cx, |doc, cx| doc.go_to_typst_definition(cx));
+        log::debug!(
+            "ui: GoToDefinition dispatched in {:.1} ms",
+            started.elapsed().as_secs_f64() * 1000.
+        );
+    }
+
+
     fn zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
         AppSettings::update(cx, |settings| {
             settings.font_size = if delta == 0. {
@@ -4016,6 +4053,9 @@ impl Workspace {
                                     Some(2) => Layout::Preview,
                                     _ => Layout::Split,
                                 };
+                                log::info!(
+                                    "ui: title-bar layout button clicked -> {layout:?}"
+                                );
                                 window.dispatch_action(Box::new(SetLayout(layout)), cx);
                             })),
                     )
@@ -5233,6 +5273,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_command_palette))
             .on_action(cx.listener(Self::show_go_to_line))
             .on_action(cx.listener(Self::go_to_line_at))
+            .on_action(cx.listener(Self::go_to_definition))
             .on_action(cx.listener(Self::show_quick_open))
             .on_action(cx.listener(Self::open_quick_path))
             .on_action(cx.listener(Self::find_in_files))
