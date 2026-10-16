@@ -141,6 +141,8 @@ pub struct LiveCompiler {
     revision: usize,
     document: Option<PagedDocument>,
     sheets: HashMap<u128, Arc<Image>>,
+    /// Diagnostics from the last compile, reused when the source is unchanged.
+    diagnostics: Vec<LiveDiagnostic>,
 }
 
 impl LiveCompiler {
@@ -153,12 +155,52 @@ impl LiveCompiler {
             revision: 0,
             document: None,
             sheets: HashMap::new(),
+            diagnostics: Vec::new(),
         }
     }
 
     /// Compile `text`, drawing only pages that changed.
     pub fn compile(&mut self, text: &str, revision: usize) -> Compiled {
         let started = Instant::now();
+        // Same source as last success: reuse sheets — no recompile, no redraw.
+        if text == self.text
+            && self.document.is_some()
+            && !self.sheets.is_empty()
+        {
+            self.revision = revision;
+            let pages = self.document.as_ref().map(|document| {
+                document
+                    .pages()
+                    .iter()
+                    .map(|page| {
+                        let key = hash128(page);
+                        let image = self
+                            .sheets
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                let svg = typst_svg::svg(page, &typst_svg::SvgOptions::default());
+                                let width = page.frame.width().to_pt() as f32;
+                                let height = page.frame.height().to_pt() as f32;
+                                sheet_image(svg, width, height)
+                            });
+                        LivePage {
+                            width: page.frame.width().to_pt() as f32,
+                            height: page.frame.height().to_pt() as f32,
+                            image,
+                        }
+                    })
+                    .collect()
+            });
+            return Compiled {
+                revision,
+                pages,
+                diagnostics: self.diagnostics.clone(),
+                elapsed: started.elapsed(),
+                redrawn: 0,
+                highlights: highlights(self.world.main_source()),
+            };
+        }
         if self.text != text {
             self.text = text.to_string();
         }
@@ -221,6 +263,7 @@ impl LiveCompiler {
             elapsed.as_secs_f64() * 1000.,
             redrawn,
         );
+        self.diagnostics = diagnostics.clone();
         Compiled {
             revision,
             pages,
@@ -388,28 +431,49 @@ impl LiveWorker {
                     // Fold a queue of edits into the newest one.
                     let mut batch = vec![first];
                     batch.extend(inbox.try_iter());
-                    let newest = batch
+                    // One gesture → one answer: keep only the newest of each kind.
+                    let newest_compile = batch
                         .iter()
                         .rposition(|r| matches!(r, Request::Compile { .. }));
+                    let newest_source = batch
+                        .iter()
+                        .rposition(|r| matches!(r, Request::SourceAt { .. }));
+                    let newest_page = batch
+                        .iter()
+                        .rposition(|r| matches!(r, Request::PageAt { .. }));
+                    let newest_def = batch
+                        .iter()
+                        .rposition(|r| matches!(r, Request::DefinitionAt { .. }));
                     for (ix, request) in batch.into_iter().enumerate() {
                         let answer = match request {
                             Request::Compile { text, revision } => {
-                                if Some(ix) != newest {
+                                if Some(ix) != newest_compile {
                                     continue;
                                 }
                                 Response::Compiled(compiler.compile(&text, revision))
                             }
                             Request::SourceAt { page, x, y } => {
+                                if Some(ix) != newest_source {
+                                    continue;
+                                }
                                 match compiler.source_at(page, x, y) {
                                     Some(offset) => Response::SourceAt(offset),
                                     None => continue,
                                 }
                             }
-                            Request::PageAt { offset } => match compiler.page_at(offset) {
-                                Some((page, x, y)) => Response::PageAt(page, x, y),
-                                None => continue,
-                            },
+                            Request::PageAt { offset } => {
+                                if Some(ix) != newest_page {
+                                    continue;
+                                }
+                                match compiler.page_at(offset) {
+                                    Some((page, x, y)) => Response::PageAt(page, x, y),
+                                    None => continue,
+                                }
+                            }
                             Request::DefinitionAt { offset } => {
+                                if Some(ix) != newest_def {
+                                    continue;
+                                }
                                 match compiler.definition_at(offset) {
                                     Some(at) => Response::DefinitionAt(at),
                                     None => continue,

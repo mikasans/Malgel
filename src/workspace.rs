@@ -3575,6 +3575,11 @@ impl Workspace {
 
     fn set_layout(&mut self, action: &SetLayout, window: &mut Window, cx: &mut Context<Self>) {
         let layout = action.0;
+        let current = AppSettings::get(cx);
+        // One gesture → one layout change: ignore re-clicks of the active mode.
+        if current.layout == layout && !current.focus_mode {
+            return;
+        }
         let started = std::time::Instant::now();
         log::info!("ui: title-bar SetLayout -> {layout:?}");
         AppSettings::update(cx, |settings| {

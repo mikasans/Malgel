@@ -66,6 +66,9 @@ const PAGE_GAP: f32 = 20.;
 /// Margin around the page column, in logical pixels.
 const PAGE_MARGIN: f32 = 24.;
 
+/// Ignore a second click-to-source within this window at the same page/spot.
+const CLICK_DEDUPE: std::time::Duration = std::time::Duration::from_millis(280);
+
 /// Width a page thumbnail is drawn at, in logical pixels.
 const THUMB_WIDTH: f32 = 96.;
 /// Padding around a thumbnail inside its cell, in logical pixels.
@@ -307,20 +310,46 @@ impl PdfDocument {
         self.rendered.get(&index).cloned()
     }
 
-    /// Convert page `index` of `bytes` to an SVG image. Runs off the UI thread.
+    /// Whether `other` shows the same page sheets (shared `Arc`s) and sizes.
+    fn same_sheets_as(&self, other: &Self) -> bool {
+        if self.pages.len() != other.pages.len() || self.rendered.len() != other.rendered.len() {
+            return false;
+        }
+        self.pages.iter().zip(&other.pages).all(|(a, b)| {
+            a.width == b.width
+                && a.height == b.height
+                && match (self.rendered.get(&a.index), other.rendered.get(&b.index)) {
+                    (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                    (None, None) => true,
+                    _ => false,
+                }
+        })
+    }
+
+    /// Convert `indices` of `bytes` to SVG images. Runs off the UI thread.
+    /// One parse and one [`RenderCache`] for the batch — Hayro expects the
+    /// cache to be reused across pages of the same PDF.
     fn render_page_bytes(
         bytes: Arc<Vec<u8>>,
-        index: usize,
+        indices: Vec<usize>,
         interpreter_settings: InterpreterSettings,
         render_settings: SvgRenderSettings,
-    ) -> Option<(Arc<Image>, std::time::Duration)> {
-        let started = Instant::now();
-        let pdf = Pdf::new(bytes).ok()?;
-        let page = pdf.pages().get(index)?;
+    ) -> Vec<(usize, Arc<Image>, std::time::Duration)> {
+        let Ok(pdf) = Pdf::new(bytes) else {
+            return Vec::new();
+        };
         let cache = RenderCache::new();
-        let svg = convert(page, &cache, &interpreter_settings, &render_settings);
-        let image = Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()));
-        Some((image, started.elapsed()))
+        let mut out = Vec::with_capacity(indices.len());
+        for index in indices {
+            let started = Instant::now();
+            let Some(page) = pdf.pages().get(index) else {
+                continue;
+            };
+            let svg = convert(page, &cache, &interpreter_settings, &render_settings);
+            let image = Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()));
+            out.push((index, image, started.elapsed()));
+        }
+        out
     }
 }
 
@@ -406,6 +435,8 @@ pub struct PdfView {
     /// Cached virtual-list row geometry, invalidated when zoom/spread/pages change.
     /// Avoids reallocating size vectors on every mouse-move paint while dragging.
     list_cache: Option<ListLayoutCache>,
+    /// Last click-to-source emit, so a bounced mouse-up does not jump twice.
+    last_click: Option<(Instant, usize, i32, i32)>,
 }
 
 /// What a page viewer reports to the document showing it.
@@ -444,6 +475,7 @@ impl PdfView {
             page_bounds: Rc::default(),
             press: None,
             list_cache: None,
+            last_click: None,
         }
     }
 
@@ -456,6 +488,13 @@ impl PdfView {
     /// are dropped, so the new pages are drawn from the new content rather
     /// than from the old cache.
     pub fn reload(&mut self, doc: PdfDocument, cx: &mut Context<Self>) {
+        // Typst live reuses Arc sheets for unchanged pages; skip a full
+        // invalidate when geometry and images are already what we show.
+        if let Some(old) = &self.doc
+            && old.same_sheets_as(&doc)
+        {
+            return;
+        }
         let current_page = self.current_page;
         let generation = self
             .doc
@@ -486,11 +525,27 @@ impl PdfView {
         if !doc.pending.insert(index) {
             return None;
         }
+        // Prefetch neighbours in the same job so one Pdf + RenderCache covers
+        // a scroll window instead of re-parsing per page.
+        let page_count = doc.pages.len();
+        let mut indices = vec![index];
+        for neighbour in [index.saturating_sub(1), index + 1] {
+            if neighbour == index || neighbour >= page_count {
+                continue;
+            }
+            if doc.rendered.contains_key(&neighbour) {
+                continue;
+            }
+            if doc.pending.insert(neighbour) {
+                indices.push(neighbour);
+            }
+        }
+        let requested = indices.clone();
         let generation = doc.generation;
         let interpreter_settings = doc.interpreter_settings.clone();
         let render_settings = doc.render_settings.clone();
         let task = cx.background_executor().spawn(async move {
-            PdfDocument::render_page_bytes(bytes, index, interpreter_settings, render_settings)
+            PdfDocument::render_page_bytes(bytes, indices, interpreter_settings, render_settings)
         });
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
@@ -498,26 +553,34 @@ impl PdfView {
                 let Some(doc) = this.doc.as_mut() else {
                     return;
                 };
-                doc.pending.remove(&index);
+                for &req in &requested {
+                    doc.pending.remove(&req);
+                }
                 if doc.generation != generation {
                     log::debug!(
-                        "pdf: drop stale page {index} render (generation {generation} -> {})",
+                        "pdf: drop stale page batch render (generation {generation} -> {})",
                         doc.generation
                     );
                     return;
                 }
-                match outcome {
-                    Some((image, elapsed)) => {
-                        log::debug!(
-                            "pdf: page {index} converted in {:.1} ms (off UI thread)",
-                            elapsed.as_secs_f64() * 1000.
-                        );
-                        doc.rendered.insert(index, image);
-                        cx.notify();
+                let mut any = false;
+                let mut done = HashSet::new();
+                for (done_index, image, elapsed) in outcome {
+                    log::debug!(
+                        "pdf: page {done_index} converted in {:.1} ms (off UI thread)",
+                        elapsed.as_secs_f64() * 1000.
+                    );
+                    doc.rendered.insert(done_index, image);
+                    done.insert(done_index);
+                    any = true;
+                }
+                for &req in &requested {
+                    if !done.contains(&req) {
+                        log::warn!("pdf: page {req} conversion failed");
                     }
-                    None => {
-                        log::warn!("pdf: page {index} conversion failed");
-                    }
+                }
+                if any {
+                    cx.notify();
                 }
             });
         })
@@ -730,6 +793,19 @@ impl PdfView {
                 (page, local.x.as_f32() / zoom, local.y.as_f32() / zoom)
             });
         if let Some((page, x, y)) = hit {
+            // Quantize so a bounced mouse-up at the same spot is one jump.
+            let qx = (x * 4.).round() as i32;
+            let qy = (y * 4.).round() as i32;
+            let now = Instant::now();
+            if let Some((when, last_page, lx, ly)) = self.last_click
+                && last_page == page
+                && lx == qx
+                && ly == qy
+                && now.duration_since(when) < CLICK_DEDUPE
+            {
+                return;
+            }
+            self.last_click = Some((now, page, qx, qy));
             cx.emit(PdfViewEvent::Clicked { page, x, y });
         }
     }
@@ -1567,13 +1643,15 @@ mod tests {
             .bytes
             .clone()
             .expect("bytes kept for off-thread render");
-        let (image, elapsed) = PdfDocument::render_page_bytes(
+        let rendered = PdfDocument::render_page_bytes(
             bytes,
-            0,
+            vec![0],
             document.interpreter_settings.clone(),
             document.render_settings.clone(),
-        )
-        .expect("convert page 0 off the UI thread");
+        );
+        assert_eq!(rendered.len(), 1, "convert page 0 off the UI thread");
+        let (index, image, elapsed) = &rendered[0];
+        assert_eq!(*index, 0);
         assert!(!image.bytes.is_empty());
         assert!(elapsed.as_secs_f64() < 30., "{elapsed:?}");
         assert!(document.image(1).is_none());

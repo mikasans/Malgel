@@ -163,6 +163,8 @@ pub struct DocumentView {
     /// Brief highlight of a jumped-to range (preview click / go-to-definition).
     jump_flash: Option<TextDecorationCollection>,
     jump_flash_task: Option<Task<()>>,
+    /// Last preview/definition jump, so one gesture does not toast/flash twice.
+    last_jump: Option<(std::time::Instant, usize)>,
     /// The paragraph left undimmed in focus mode.
     focus_block: Option<Range<usize>>,
 
@@ -297,6 +299,7 @@ impl DocumentView {
             focus_decorations: None,
             jump_flash: None,
             jump_flash_task: None,
+            last_jump: None,
             focus_block: None,
             scroll_driver: ScrollDriver::Editor,
             synced_editor_scroll: None,
@@ -489,6 +492,7 @@ impl DocumentView {
             focus_decorations: None,
             jump_flash: None,
             jump_flash_task: None,
+            last_jump: None,
             focus_block: None,
             scroll_driver: ScrollDriver::Editor,
             synced_editor_scroll: None,
@@ -551,6 +555,7 @@ impl DocumentView {
             focus_decorations: None,
             jump_flash: None,
             jump_flash_task: None,
+            last_jump: None,
             focus_block: None,
             scroll_driver: ScrollDriver::Editor,
             synced_editor_scroll: None,
@@ -1320,6 +1325,14 @@ impl DocumentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let now = std::time::Instant::now();
+        if let Some((when, last)) = self.last_jump
+            && last == offset
+            && now.duration_since(when) < JUMP_DEDUPE
+        {
+            return;
+        }
+        self.last_jump = Some((now, offset));
         if !Self::shows_editor(cx) {
             cx.emit(DocumentEvent::ShowEditor);
         }
@@ -2941,6 +2954,8 @@ impl Render for DocumentView {
 /// How long typing pauses before a Typst source is compiled again. Short:
 /// a compile of a long document takes a few milliseconds once warm.
 const LIVE_DEBOUNCE: Duration = Duration::from_millis(40);
+/// Ignore a second jump-to-source at the same offset within this window.
+const JUMP_DEDUPE: Duration = Duration::from_millis(350);
 /// How long the caret rests before the preview scrolls to show it.
 const LIVE_REVEAL_DELAY: Duration = Duration::from_millis(150);
 
