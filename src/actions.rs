@@ -251,9 +251,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-`", SummonTerminal, workspace),
         KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("secondary-1", SetLayout(Layout::Editor), workspace),
-        KeyBinding::new("secondary-2", SetLayout(Layout::Split), workspace),
-        KeyBinding::new("secondary-3", SetLayout(Layout::Preview), workspace),
+        // No key-context: layout must switch even when the Typst/PDF viewer or
+        // Markdown preview holds focus (those entities do not inherit Workspace).
+        KeyBinding::new("secondary-1", SetLayout(Layout::Editor), None),
+        KeyBinding::new("secondary-2", SetLayout(Layout::Split), None),
+        KeyBinding::new("secondary-3", SetLayout(Layout::Preview), None),
         // The last binding for an action is the one menus display.
         KeyBinding::new("secondary-+", ZoomIn, None),
         KeyBinding::new("secondary-=", ZoomIn, None),

@@ -49,7 +49,11 @@ use hayro_svg::{
     },
 };
 
-use crate::actions::{TogglePdfThumbnails, ZoomIn, ZoomOut, ZoomReset};
+use crate::actions::{
+    SetLayout, ToggleFileSidebar, TogglePdfThumbnails, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
+    ZoomReset,
+};
+use crate::themes::AppSettings;
 use crate::zoom;
 
 /// How a document is zoomed when it is opened: the whole first page, the way
@@ -857,6 +861,8 @@ impl PdfView {
             .id("pdf-toolbar")
             .h_9()
             .px_3()
+            .w_full()
+            .min_w_0()
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme.border)
@@ -868,6 +874,9 @@ impl PdfView {
                 h_flex()
                     .gap_2()
                     .items_center()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
                     .child(
                         Icon::new(IconName::FileText)
                             .small()
@@ -877,6 +886,8 @@ impl PdfView {
                         div()
                             .text_xs()
                             .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .min_w_0()
+                            .truncate()
                             .child(self.title.clone()),
                     )
                     .when(total > 0, |this| {
@@ -889,6 +900,9 @@ impl PdfView {
                 h_flex()
                     .gap_1()
                     .items_center()
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .overflow_x_hidden()
                     .child(
                         Button::new("pdf-thumbnails")
                             .ghost()
@@ -1325,8 +1339,13 @@ impl Render for PdfView {
                 });
             })
             .id("pdf-view")
+            // So Ctrl+1/2/3 and other workspace bindings still match while the
+            // preview holds focus (entity focus does not inherit parent context).
+            .key_context(WORKSPACE_CONTEXT)
             .track_focus(&self.focus_handle)
             .size_full()
+            .min_w_0()
+            .min_h_0()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_in(cx)))
@@ -1335,6 +1354,21 @@ impl Render for PdfView {
             .on_action(
                 cx.listener(|this, _: &TogglePdfThumbnails, _, cx| this.toggle_thumbnails(cx)),
             )
+            // Workspace actions do not bubble out of this entity when it holds
+            // focus — handle layout/sidebar here so Preview-only is escapable.
+            .on_action(cx.listener(|_, action: &SetLayout, _, cx| {
+                log::info!("ui: PdfView SetLayout -> {:?}", action.0);
+                AppSettings::update(cx, |settings| {
+                    settings.layout = action.0;
+                    settings.focus_mode = false;
+                });
+            }))
+            .on_action(cx.listener(|_, _: &ToggleFileSidebar, _, cx| {
+                log::info!("ui: PdfView ToggleFileSidebar");
+                AppSettings::update(cx, |settings| {
+                    settings.file_sidebar = !settings.file_sidebar;
+                });
+            }))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| this.on_pinch(event, cx)))
             .child(self.render_toolbar(cx))
@@ -1346,6 +1380,7 @@ impl Render for PdfView {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
                     .flex()
                     // The strip is outside the click handler below: double
                     // clicking a thumbnail jumps to its page rather than

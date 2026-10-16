@@ -1484,9 +1484,11 @@ impl DocumentView {
         v_flex()
             .id("typst-live-pane")
             .size_full()
+            .min_w_0()
+            .min_h_0()
             .bg(theme.background)
             .children(banner)
-            .child(div().flex_1().min_h_0().child(body))
+            .child(div().flex_1().min_h_0().min_w_0().child(body))
             .into_any_element()
     }
 
@@ -2884,22 +2886,57 @@ impl Render for DocumentView {
                 .child(
                     resizable_panel()
                         .size_range(rems(16.).to_pixels(window.rem_size())..Pixels::MAX)
-                        .child(self.render_editor(window, cx)),
+                        .child(
+                            div()
+                                .size_full()
+                                .min_w_0()
+                                .min_h_0()
+                                .child(self.render_editor(window, cx)),
+                        ),
                 )
                 .child(
                     resizable_panel()
                         .size_range(rems(16.).to_pixels(window.rem_size())..Pixels::MAX)
-                        .child(self.render_side(window, cx)),
+                        .child(
+                            div()
+                                .size_full()
+                                .min_w_0()
+                                .min_h_0()
+                                .child(self.render_side(window, cx)),
+                        ),
                 )
                 .into_any_element(),
         };
+        // min_w_0: flex parents default to min-width:auto, which lets the PDF
+        // toolbar/pages force the split pane past the window and clip the right edge.
+        let body = div()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .on_action(cx.listener(|_, action: &crate::actions::SetLayout, _, cx| {
+                log::info!("ui: DocumentView SetLayout -> {:?}", action.0);
+                AppSettings::update(cx, |settings| {
+                    settings.layout = action.0;
+                    settings.focus_mode = false;
+                });
+            }))
+            .on_action(
+                cx.listener(|_, _: &crate::actions::ToggleFileSidebar, _, cx| {
+                    AppSettings::update(cx, |settings| {
+                        settings.file_sidebar = !settings.file_sidebar;
+                    });
+                }),
+            )
+            .child(body)
+            .into_any_element();
         if !self.large || self.bar_dismissed {
             return body;
         }
         v_flex()
             .size_full()
+            .min_w_0()
             .child(self.render_large_file_bar(cx))
-            .child(div().flex_1().min_h_0().child(body))
+            .child(div().flex_1().min_h_0().min_w_0().child(body))
             .into_any_element()
     }
 }

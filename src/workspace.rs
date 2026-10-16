@@ -3582,6 +3582,9 @@ impl Workspace {
             settings.focus_mode = false;
         });
         self.focus_active(window, cx);
+        // Global observers usually refresh, but notify explicitly so leaving
+        // Preview-only cannot depend on focus-only side effects.
+        cx.notify();
         log::debug!(
             "ui: SetLayout handled in {:.1} ms",
             started.elapsed().as_secs_f64() * 1000.
@@ -5384,7 +5387,7 @@ impl Render for Workspace {
                     v_flex()
                         .size_full()
                         .when(self.shows_tabs(cx), |this| this.child(self.render_tabs(cx)))
-                        .child(div().flex_1().min_h_0().child(document)),
+                        .child(div().flex_1().min_h_0().min_w_0().child(document)),
                 ),
         );
         if show_outline {
