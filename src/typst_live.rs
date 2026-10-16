@@ -163,10 +163,7 @@ impl LiveCompiler {
     pub fn compile(&mut self, text: &str, revision: usize) -> Compiled {
         let started = Instant::now();
         // Same source as last success: reuse sheets — no recompile, no redraw.
-        if text == self.text
-            && self.document.is_some()
-            && !self.sheets.is_empty()
-        {
+        if text == self.text && self.document.is_some() && !self.sheets.is_empty() {
             self.revision = revision;
             let pages = self.document.as_ref().map(|document| {
                 document
@@ -174,16 +171,12 @@ impl LiveCompiler {
                     .iter()
                     .map(|page| {
                         let key = hash128(page);
-                        let image = self
-                            .sheets
-                            .get(&key)
-                            .cloned()
-                            .unwrap_or_else(|| {
-                                let svg = typst_svg::svg(page, &typst_svg::SvgOptions::default());
-                                let width = page.frame.width().to_pt() as f32;
-                                let height = page.frame.height().to_pt() as f32;
-                                sheet_image(svg, width, height)
-                            });
+                        let image = self.sheets.get(&key).cloned().unwrap_or_else(|| {
+                            let svg = typst_svg::svg(page, &typst_svg::SvgOptions::default());
+                            let width = page.frame.width().to_pt() as f32;
+                            let height = page.frame.height().to_pt() as f32;
+                            sheet_image(svg, width, height)
+                        });
                         LivePage {
                             width: page.frame.width().to_pt() as f32,
                             height: page.frame.height().to_pt() as f32,
