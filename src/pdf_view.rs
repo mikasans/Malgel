@@ -367,6 +367,14 @@ fn fit_zoom(
     }
 }
 
+/// Row list + per-row sizes for the page virtual list.
+struct ListLayoutCache {
+    /// Fingerprint: page count, spread, zoom bits, and page geometry.
+    key: u64,
+    rows: Rc<Vec<Vec<usize>>>,
+    sizes: Rc<Vec<Size<Pixels>>>,
+}
+
 /// A GPUI view displaying a scrollable PDF document.
 pub struct PdfView {
     path: Option<PathBuf>,
@@ -395,6 +403,9 @@ pub struct PdfView {
     page_bounds: Rc<std::cell::RefCell<HashMap<usize, gpui_kit::Bounds<Pixels>>>>,
     /// Where the left button went down, to tell a click from a drag.
     press: Option<Point<Pixels>>,
+    /// Cached virtual-list row geometry, invalidated when zoom/spread/pages change.
+    /// Avoids reallocating size vectors on every mouse-move paint while dragging.
+    list_cache: Option<ListLayoutCache>,
 }
 
 /// What a page viewer reports to the document showing it.
@@ -432,6 +443,7 @@ impl PdfView {
             focus_handle: cx.focus_handle(),
             page_bounds: Rc::default(),
             press: None,
+            list_cache: None,
         }
     }
 
@@ -457,6 +469,7 @@ impl PdfView {
         }
         // Clamped: a document that shrank leaves the reader on its last page.
         self.current_page = current_page.min(self.page_count().saturating_sub(1));
+        self.list_cache = None;
         cx.notify();
     }
 
@@ -521,6 +534,7 @@ impl PdfView {
     pub fn set_spread(&mut self, spread: bool, cx: &mut Context<Self>) {
         if self.spread != spread {
             self.spread = spread;
+            self.list_cache = None;
             cx.notify();
         }
     }
@@ -618,6 +632,7 @@ impl PdfView {
             self.fit = FitMode::Custom;
             self.custom_zoom = clamped;
             self.zoom = clamped;
+            self.list_cache = None;
             cx.notify();
         }
     }
@@ -651,9 +666,11 @@ impl PdfView {
     /// Dragging moves the pages, the way it moves an image in its viewer and
     /// a diagram in its own window: zoomed in, the wheel alone leaves the
     /// rest of the sheet out of reach.
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, _cx: &mut Context<Self>) {
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if event.pressed_button != Some(MouseButton::Left) {
-            self.drag = None;
+            if self.drag.take().is_some() {
+                cx.notify();
+            }
             return;
         }
         // Start a drag only after the pointer leaves the click slop, so a
@@ -668,12 +685,22 @@ impl PdfView {
             }
             self.drag = Some((press, self.scroll.base_handle().offset()));
         }
-        let Some((start, offset)) = self.drag else {
+        let Some((start, origin)) = self.drag else {
             return;
         };
-        self.scroll
-            .base_handle()
-            .set_offset(offset + (event.position - start));
+        let next = origin + (event.position - start);
+        let handle = self.scroll.base_handle();
+        // Skip no-op moves so we do not dirty the view every sub-pixel event.
+        if handle.offset() == next {
+            return;
+        }
+        handle.set_offset(next);
+        // Keep the page label in sync without waiting for mouse-up.
+        let page = self.visible_page();
+        if page != self.current_page {
+            self.current_page = page;
+        }
+        cx.notify();
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -767,6 +794,7 @@ impl PdfView {
     pub fn fit_width(&mut self, cx: &mut Context<Self>) {
         if self.fit != FitMode::Width {
             self.fit = FitMode::Width;
+            self.list_cache = None;
             cx.notify();
         }
     }
@@ -775,6 +803,7 @@ impl PdfView {
     pub fn fit_page(&mut self, cx: &mut Context<Self>) {
         if self.fit != FitMode::Page {
             self.fit = FitMode::Page;
+            self.list_cache = None;
             cx.notify();
         }
     }
@@ -1149,21 +1178,31 @@ impl PdfView {
         )
     }
 
-    fn render_content(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let theme = cx.theme();
-
-        let Some(doc) = &self.doc else {
-            return self.render_empty("No PDF loaded.", theme.muted_foreground);
-        };
-        if doc.pages.is_empty() {
-            return self.render_empty("This PDF has no pages.", theme.muted_foreground);
-        }
-
+    /// Rows and sizes for the page list, reused across paints while zoom and
+    /// page geometry stay the same (especially while dragging).
+    #[allow(clippy::type_complexity)]
+    fn list_layout(&mut self) -> (Rc<Vec<Vec<usize>>>, Rc<Vec<Size<Pixels>>>) {
         let zoom = self.zoom;
-        let total = doc.pages.len();
-        let viewport_width = self.scroll.bounds().size.width.as_f32();
-        // One row per page, or per pair when the pages are spread out.
-        let rows: Rc<Vec<Vec<usize>>> = Rc::new(self.rows());
+        let Some(doc) = &self.doc else {
+            return (Rc::new(Vec::new()), Rc::new(Vec::new()));
+        };
+        let mut key = doc.pages.len() as u64;
+        key = key.wrapping_mul(31).wrapping_add(self.spread as u64);
+        key = key.wrapping_mul(31).wrapping_add(zoom.to_bits() as u64);
+        for page in &doc.pages {
+            key = key
+                .wrapping_mul(31)
+                .wrapping_add(page.width.to_bits() as u64);
+            key = key
+                .wrapping_mul(31)
+                .wrapping_add(page.height.to_bits() as u64);
+        }
+        if let Some(cache) = &self.list_cache
+            && cache.key == key
+        {
+            return (cache.rows.clone(), cache.sizes.clone());
+        }
+        let rows = self.rows();
         let row_width = |row: &[usize]| {
             row.iter().map(|&ix| doc.pages[ix].width).sum::<f32>()
                 + PAGE_GAP * row.len().saturating_sub(1) as f32
@@ -1173,24 +1212,56 @@ impl PdfView {
                 .map(|&ix| doc.pages[ix].height)
                 .fold(0.0f32, f32::max)
         };
-        let sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
-            rows.iter()
-                .map(|row| {
-                    gpui_kit::size(
-                        px(row_width(row) * zoom),
-                        px(row_height(row) * zoom + PAGE_GAP),
-                    )
-                })
-                .collect(),
-        );
+        let sizes: Vec<Size<Pixels>> = rows
+            .iter()
+            .map(|row| {
+                gpui_kit::size(
+                    px(row_width(row) * zoom),
+                    px(row_height(row) * zoom + PAGE_GAP),
+                )
+            })
+            .collect();
+        let rows = Rc::new(rows);
+        let sizes = Rc::new(sizes);
+        self.list_cache = Some(ListLayoutCache {
+            key,
+            rows: rows.clone(),
+            sizes: sizes.clone(),
+        });
+        (rows, sizes)
+    }
+
+    fn render_content(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let theme = cx.theme();
+
+        if self.doc.as_ref().is_none_or(|doc| doc.pages.is_empty()) {
+            let message = if self.doc.is_none() {
+                "No PDF loaded."
+            } else {
+                "This PDF has no pages."
+            };
+            return self.render_empty(message, theme.muted_foreground);
+        }
+
+        let zoom = self.zoom;
+        let total = self.page_count();
+        let viewport_width = self.scroll.bounds().size.width.as_f32();
+        let dragging = self.drag.is_some();
+        let (rows, sizes) = self.list_layout();
         // Measure the widest row, so the content can be wider than the
         // viewport and zoomed-in pages stay horizontally reachable.
-        let measure_ix = rows
-            .iter()
-            .enumerate()
-            .max_by(|a, b| row_width(a.1).total_cmp(&row_width(b.1)))
-            .map(|(ix, _)| ix)
-            .unwrap_or(0);
+        let measure_ix = {
+            let doc = self.doc.as_ref().unwrap();
+            rows.iter()
+                .enumerate()
+                .max_by(|a, b| {
+                    let aw: f32 = a.1.iter().map(|&ix| doc.pages[ix].width).sum();
+                    let bw: f32 = b.1.iter().map(|&ix| doc.pages[ix].width).sum();
+                    aw.total_cmp(&bw)
+                })
+                .map(|(ix, _)| ix)
+                .unwrap_or(0)
+        };
 
         let border = theme.border;
         let muted = theme.muted_foreground;
@@ -1217,30 +1288,39 @@ impl PdfView {
                                 let width = px(page.width * zoom);
                                 let height = px(page.height * zoom);
                                 match this.page_image(page_ix, cx) {
-                                    Some(image) => div()
-                                        .w(width)
-                                        .h(height)
-                                        .flex_none()
-                                        .relative()
-                                        .child({
+                                    Some(image) => {
+                                        let mut card = div()
+                                            .w(width)
+                                            .h(height)
+                                            .flex_none()
+                                            .relative()
+                                            .bg(rgb(0xffffff))
+                                            .border_1()
+                                            .border_color(border)
+                                            .rounded_sm()
+                                            .overflow_hidden();
+                                        // Skip shadow + hit-test canvases while
+                                        // dragging: they dominate paint cost on
+                                        // every mouse-move refresh.
+                                        if !dragging {
                                             let bounds = this.page_bounds.clone();
-                                            canvas(
-                                                move |area, _, _| {
-                                                    bounds.borrow_mut().insert(page_ix, area);
-                                                },
-                                                |_, _, _, _| {},
-                                            )
-                                            .absolute()
-                                            .size_full()
-                                        })
-                                        .bg(rgb(0xffffff))
-                                        .border_1()
-                                        .border_color(border)
-                                        .shadow_md()
-                                        .rounded_sm()
-                                        .overflow_hidden()
-                                        .child(img(image).w(width).h(height))
-                                        .into_any_element(),
+                                            card = card
+                                                .child(
+                                                    canvas(
+                                                        move |area, _, _| {
+                                                            bounds
+                                                                .borrow_mut()
+                                                                .insert(page_ix, area);
+                                                        },
+                                                        |_, _, _, _| {},
+                                                    )
+                                                    .absolute()
+                                                    .size_full(),
+                                                )
+                                                .shadow_md();
+                                        }
+                                        card.child(img(image).w(width).h(height)).into_any_element()
+                                    }
                                     None => div()
                                         .w(width)
                                         .h(height)
@@ -1316,12 +1396,19 @@ impl Render for PdfView {
         // Resolve fit modes against the live viewport before drawing the
         // toolbar, so the percentage shown matches the pages below it.
         let viewport = self.scroll.bounds().size;
-        self.zoom = self.resolved_zoom(viewport);
+        let next_zoom = self.resolved_zoom(viewport);
+        if next_zoom.to_bits() != self.zoom.to_bits() {
+            self.list_cache = None;
+        }
+        self.zoom = next_zoom;
         // Name the current page before the toolbar, the pages and the
         // thumbnail strip are built, so all three agree within a frame.
         self.current_page = self.visible_page();
-        // Bounds are recorded again for the pages drawn this frame.
-        self.page_bounds.borrow_mut().clear();
+        // Bounds are recorded again for the pages drawn this frame — but not
+        // while dragging, where we skip the hit-test canvases for speed.
+        if self.drag.is_none() {
+            self.page_bounds.borrow_mut().clear();
+        }
         // The pages were laid out against last frame's viewport. When the
         // pane changes size under them (the thumbnail strip opening or
         // closing, a resized split) draw once more against the new one, or
