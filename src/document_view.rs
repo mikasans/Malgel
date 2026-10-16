@@ -1984,14 +1984,11 @@ impl DocumentView {
     /// Comment the selected lines out, or back in (Ctrl+/), in this file
     /// type's comment syntax; Markdown and untitled documents use `<!-- -->`.
     pub fn toggle_line_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ext = match self.path.as_deref() {
-            Some(path) => path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(str::to_ascii_lowercase),
-            None => Some("md".to_string()),
+        let style = match self.path.as_deref() {
+            None => format::comment_style(Some("md")),
+            Some(path) => format::comment_style_for_path(Some(path)),
         };
-        let Some(style) = format::comment_style(ext.as_deref()) else {
+        let Some(style) = style else {
             return;
         };
         let text = self.editor.read(cx).value().to_string();

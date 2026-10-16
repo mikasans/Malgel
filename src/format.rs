@@ -320,17 +320,61 @@ pub enum CommentStyle {
 pub fn comment_style(ext: Option<&str>) -> Option<CommentStyle> {
     use CommentStyle::*;
     Some(match ext? {
-        "md" | "markdown" | "mdown" | "mkd" | "html" | "htm" | "xml" | "svg" | "vue" => {
-            Wrap("<!--", "-->")
-        }
-        "css" | "scss" | "less" => Wrap("/*", "*/"),
+        // HTML-family and Markdown use wrap markers for "line" toggle.
+        "md" | "markdown" | "mdown" | "mkd" | "mkdn" | "mdx" | "html" | "htm" | "xml" | "svg"
+        | "vue" | "svelte" | "astro" => Wrap("<!--", "-->"),
+        // Stylesheets: no line marker, so wrap each line in a block comment.
+        "css" | "scss" | "sass" | "less" | "styl" => Wrap("/*", "*/"),
+        // C-family / curly-brace languages: `//`. Typst uses `//` for lines
+        // (`/* */` is block-comment territory, not Ctrl+/).
         "rs" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" | "go" | "c" | "h"
-        | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "java" | "kt" | "kts" | "zig" | "php" | "cs"
-        | "scala" | "swift" | "proto" | "typ" | "jsonc" | "dart" => Line("//"),
-        "py" | "rb" | "sh" | "bash" | "zsh" | "yml" | "yaml" | "toml" | "ex" | "exs" | "mk"
-        | "mak" | "cmake" | "r" | "pl" | "conf" | "ini" | "nix" | "tf" | "dockerfile" => Line("#"),
-        "lua" | "sql" | "hs" => Line("--"),
-        "tex" | "sty" | "bib" => Line("%"),
+        | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "java" | "kt" | "kts" | "zig" | "php"
+        | "cs" | "scala" | "swift" | "proto" | "typ" | "typst" | "jsonc" | "json5" | "dart"
+        | "groovy" | "gradle" | "sol" | "move" | "wgsl" | "glsl" | "vert" | "frag" | "comp"
+        | "m" | "mm" | "d" | "v" | "sv" | "fs" | "fsi" | "fsx" | "odin" => Line("//"),
+        // Hash comments: Python, shells, Ruby, YAML/TOML, Make, Docker, GraphQL…
+        "py" | "pyw" | "pyi" | "rb" | "ru" | "sh" | "bash" | "zsh" | "fish" | "ksh" | "yml"
+        | "yaml" | "toml" | "ex" | "exs" | "mk" | "mak" | "makefile" | "cmake" | "r" | "rmd"
+        | "pl" | "pm" | "conf" | "ini" | "cfg" | "nix" | "tf" | "hcl" | "dockerfile"
+        | "containerfile" | "jl" | "julia" | "ps1" | "psm1" | "psd1" | "coffee" | "litcoffee"
+        | "raku" | "p6" | "tcl" | "awk" | "sed" | "gitignore" | "dockerignore" | "env"
+        | "properties" | "gql" | "graphql" | "graphqls" | "nim" | "nims" | "cr" => Line("#"),
+        "f90" | "f95" | "f03" | "f08" | "for" | "ftn" => Line("!"),
+        "lua" | "sql" | "hs" | "lhs" | "elm" | "purs" | "dhall" | "vhd" | "vhdl" => Line("--"),
+        "tex" | "sty" | "cls" | "bib" | "latex" | "ltx" | "matlab" => Line("%"),
+        "clj" | "cljs" | "cljc" | "edn" | "lisp" | "el" | "scm" | "ss" | "rkt" => Line(";"),
+        "erl" | "hrl" => Line("%"),
+        "ml" | "mli" | "mll" | "mly" => Wrap("(*", "*)"),
+        _ => return None,
+    })
+}
+
+/// Comment style for a path: extension first, then well-known basenames
+/// without an extension (`Dockerfile`, `Makefile`, …).
+pub fn comment_style_for_path(path: Option<&std::path::Path>) -> Option<CommentStyle> {
+    let path = path?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if let Some(style) = comment_style(ext.as_deref()) {
+        return Some(style);
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    use CommentStyle::*;
+    Some(match name.as_str() {
+        "dockerfile" | "containerfile" | "dockerignore" | "gitignore" | "gitattributes"
+        | "gemfile" | "rakefile" | "guardfile" | "podfile" | "brewfile" | "justfile"
+        | "procfile" | "vagrantfile" | "berksfile" | "capfile" | "thorfile" | "fastfile"
+        | "appfile" | "matchfile" | "pluginfile" | "snapfile" | "makefile" | "gnumakefile" => {
+            Line("#")
+        }
+        "cmakelists.txt" => Line("#"),
+        _ if name.starts_with("dockerfile.") || name.ends_with(".dockerfile") => Line("#"),
         _ => return None,
     })
 }
@@ -695,7 +739,37 @@ mod tests {
         assert!(toggle_line_comment("\n\n", 0..1, Line("#")).is_none());
         assert_eq!(super::comment_style(Some("txt")), None);
         assert_eq!(super::comment_style(Some("typ")), Some(Line("//")));
+        assert_eq!(super::comment_style(Some("typst")), Some(Line("//")));
         assert_eq!(super::comment_style(Some("py")), Some(Line("#")));
+        assert_eq!(super::comment_style(Some("pyi")), Some(Line("#")));
+        assert_eq!(super::comment_style(Some("rs")), Some(Line("//")));
+        assert_eq!(super::comment_style(Some("css")), Some(Wrap("/*", "*/")));
+        assert_eq!(super::comment_style(Some("lua")), Some(Line("--")));
+        assert_eq!(super::comment_style(Some("tex")), Some(Line("%")));
+        assert_eq!(super::comment_style(Some("clj")), Some(Line(";")));
+        assert_eq!(super::comment_style(Some("f90")), Some(Line("!")));
+        assert_eq!(super::comment_style(Some("ml")), Some(Wrap("(*", "*)")));
+        use std::path::Path;
+        assert_eq!(
+            super::comment_style_for_path(Some(Path::new("Dockerfile"))),
+            Some(Line("#"))
+        );
+        assert_eq!(
+            super::comment_style_for_path(Some(Path::new("Makefile"))),
+            Some(Line("#"))
+        );
+        assert_eq!(
+            super::comment_style_for_path(Some(Path::new("src/main.typ"))),
+            Some(Line("//"))
+        );
+        assert_eq!(
+            super::comment_style_for_path(Some(Path::new("script.py"))),
+            Some(Line("#"))
+        );
+        assert_eq!(
+            super::comment_style_for_path(Some(Path::new("notes.txt"))),
+            None
+        );
     }
 
     use super::*;
