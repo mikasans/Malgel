@@ -67,7 +67,11 @@ fn rasterize_svg_png(svg: &str, width_pt: f32, height_pt: f32) -> Option<Vec<u8>
     let width = ((width_pt * SHEET_SCALE).ceil() as u32).max(1);
     let height = ((height_pt * SHEET_SCALE).ceil() as u32).max(1);
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
-    let transform = resvg::tiny_skia::Transform::from_scale(SHEET_SCALE, SHEET_SCALE);
+    // Fit the SVG's own size into the pixmap. A plain SHEET_SCALE assumept=px
+    // clip when typst_svg's user space does not match page points 1:1.
+    let sx = width as f32 / tree.size().width().max(1.);
+    let sy = height as f32 / tree.size().height().max(1.);
+    let transform = resvg::tiny_skia::Transform::from_scale(sx, sy);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     pixmap.encode_png().ok()
 }
@@ -519,6 +523,26 @@ mod tests {
             text[..back].contains("Hello") || back >= text.find("Hello").unwrap(),
             "{back}"
         );
+    }
+
+    #[test]
+    fn heading_refs_need_numbering_to_produce_pages() {
+        let mut live = compiler("heading-ref");
+        // Same class of error as samples/nav-preview.typ without `#set heading`.
+        let broken = "= Title <sec>\n\nSee @sec.\n";
+        let failed = live.compile(broken, 1);
+        assert!(failed.pages.is_none(), "unnumbered heading ref must fail");
+        assert!(
+            failed.diagnostics.iter().any(|d| d.error),
+            "expected a compile error"
+        );
+        let ok = "#set heading(numbering: \"1.\")\n= Title <sec>\n\nSee @sec.\n";
+        let compiled = live.compile(ok, 2);
+        assert!(
+            compiled.pages.is_some(),
+            "numbered heading ref should compile"
+        );
+        assert!(!compiled.pages.as_ref().unwrap().is_empty());
     }
 
     #[test]

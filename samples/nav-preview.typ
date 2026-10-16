@@ -2,6 +2,9 @@
 
 Click the preview pages to jump back here. Press F12 on `@fig` or `@sec` for go-to-definition.
 
+// Heading refs need numbering; without it Typst errors and the preview has 0 pages.
+#set heading(numbering: "1.")
+
 #figure(
   rect(width: 80%, height: 40pt, fill: luma(230)),
   caption: [A labelled figure],

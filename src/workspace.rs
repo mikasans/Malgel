@@ -100,10 +100,10 @@ enum KeyboardTarget {
 }
 
 /// A PDF or an image is rendered *instead of* the editor and the preview, so
-/// the keyboard has to go to that viewer. Focusing the editor anyway points
-/// the keyboard at an element that is not in the render tree — no key binding
-/// matches it and every shortcut stops working, which is what happened while a
-/// PDF was open.
+/// the keyboard has to go to that viewer. Focusing a view that is not in the
+/// render tree leaves every shortcut and title-bar `dispatch_action` dead —
+/// the same class of bug as focusing the Markdown preview while a Typst live
+/// `PdfView` is what is actually drawn.
 /// One row of the Quick Open picker.
 #[derive(Clone, Debug, PartialEq)]
 struct QuickOpenRow {
@@ -1124,7 +1124,9 @@ impl Workspace {
                 .media_focus_handle(cx)
                 .unwrap_or_else(|| doc.editor().focus_handle(cx)),
             KeyboardTarget::Editor => doc.editor().focus_handle(cx),
-            KeyboardTarget::Preview => doc.preview().read(cx).focus_handle().clone(),
+            // Typst live preview is a PdfView, not the Markdown TextView —
+            // focusing an off-tree handle drops every workspace action.
+            KeyboardTarget::Preview => doc.preview_pane_focus_handle(cx),
         };
         window.defer(cx, move |window, cx| focus.focus(window, cx));
     }
@@ -4187,9 +4189,14 @@ impl Workspace {
                             .icon(Icon::new(IconName::PanelLeft))
                             .tooltip("Toggle side bar")
                             .selected(settings.file_sidebar)
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(ToggleFileSidebar), cx)
-                            }),
+                            // Call the workspace directly: in preview-only the
+                            // focused pane may not bubble `dispatch_action`.
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle(
+                                    |settings| settings.file_sidebar = !settings.file_sidebar,
+                                    cx,
+                                );
+                            })),
                     )
                     .child(
                         ButtonGroup::new("layout")
@@ -4214,14 +4221,16 @@ impl Workspace {
                                 "Preview",
                                 Layout::Preview,
                             ))
-                            .on_click(cx.listener(|_, clicked: &Vec<usize>, window, cx| {
+                            .on_click(cx.listener(|this, clicked: &Vec<usize>, window, cx| {
                                 let layout = match clicked.first() {
                                     Some(0) => Layout::Editor,
                                     Some(2) => Layout::Preview,
                                     _ => Layout::Split,
                                 };
                                 log::info!("ui: title-bar layout button clicked -> {layout:?}");
-                                window.dispatch_action(Box::new(SetLayout(layout)), cx);
+                                // Direct call — do not rely on action dispatch
+                                // from a focused preview pane (see focus_active).
+                                this.set_layout(&SetLayout(layout), window, cx);
                             })),
                     )
                     .child(
@@ -4239,9 +4248,9 @@ impl Workspace {
                             } else {
                                 "Use dark appearance"
                             })
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(ToggleAppearance), cx)
-                            }),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_appearance(&ToggleAppearance, window, cx);
+                            })),
                     ),
             )
     }

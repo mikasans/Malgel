@@ -342,6 +342,19 @@ impl DocumentView {
             .map(|image| image.read(cx).focus_handle(cx))
     }
 
+    /// Focus handle for the preview side that is actually on screen: a live
+    /// Typst `PdfView` when that pane is showing, otherwise the Markdown
+    /// `TextView`. Preview-only layout used to focus the Markdown preview even
+    /// for Typst, which left focus on an element not in the tree — title-bar
+    /// `dispatch_action` (SetLayout, sidebar toggle, …) then never reached the
+    /// workspace.
+    pub fn preview_pane_focus_handle(&self, cx: &App) -> FocusHandle {
+        if let Some(live) = &self.live {
+            return live.view.read(cx).focus_handle(cx);
+        }
+        self.preview().read(cx).focus_handle().clone()
+    }
+
     pub fn path(&self) -> Option<&PathBuf> {
         self.path.as_ref()
     }
@@ -778,6 +791,10 @@ impl DocumentView {
     /// typing too large a number still moves the caret rather than doing
     /// nothing.
     pub fn go_to_line(&mut self, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Error-banner / outline jumps from preview-only must surface the editor.
+        if !Self::shows_editor(cx) {
+            cx.emit(DocumentEvent::ShowEditor);
+        }
         let editor = self.editor.read(cx);
         let rope = editor.text();
         let len = rope.len();
