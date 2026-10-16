@@ -321,26 +321,24 @@ pub fn comment_style(ext: Option<&str>) -> Option<CommentStyle> {
     use CommentStyle::*;
     Some(match ext? {
         // HTML-family and Markdown use wrap markers for "line" toggle.
-        "md" | "markdown" | "mdown" | "mkd" | "mkdn" | "mdx" | "html" | "htm" | "xml"
-        | "svg" | "vue" | "svelte" | "astro" => Wrap("<!--", "-->"),
+        "md" | "markdown" | "mdown" | "mkd" | "mkdn" | "mdx" | "html" | "htm" | "xml" | "svg"
+        | "vue" | "svelte" | "astro" => Wrap("<!--", "-->"),
         // Stylesheets: no line marker, so wrap each line in a block comment.
         "css" | "scss" | "sass" | "less" | "styl" => Wrap("/*", "*/"),
         // C-family / curly-brace languages: `//`. Typst uses `//` for lines
         // (`/* */` is block-comment territory, not Ctrl+/).
-        "rs" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" | "go" | "c"
-        | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "java" | "kt" | "kts"
-        | "zig" | "php" | "cs" | "scala" | "swift" | "proto" | "typ" | "typst" | "jsonc"
-        | "json5" | "dart" | "groovy" | "gradle" | "sol" | "move" | "wgsl" | "glsl"
-        | "vert" | "frag" | "comp" | "m" | "mm" | "d" | "v" | "sv"
-        | "fs" | "fsi" | "fsx" | "odin" => Line("//"),
+        "rs" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" | "go" | "c" | "h"
+        | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "java" | "kt" | "kts" | "zig" | "php"
+        | "cs" | "scala" | "swift" | "proto" | "typ" | "typst" | "jsonc" | "json5" | "dart"
+        | "groovy" | "gradle" | "sol" | "move" | "wgsl" | "glsl" | "vert" | "frag" | "comp"
+        | "m" | "mm" | "d" | "v" | "sv" | "fs" | "fsi" | "fsx" | "odin" => Line("//"),
         // Hash comments: Python, shells, Ruby, YAML/TOML, Make, Docker, GraphQL…
-        "py" | "pyw" | "pyi" | "rb" | "ru" | "sh" | "bash" | "zsh" | "fish" | "ksh"
-        | "yml" | "yaml" | "toml" | "ex" | "exs" | "mk" | "mak" | "makefile" | "cmake"
-        | "r" | "rmd" | "pl" | "pm" | "conf" | "ini" | "cfg" | "nix" | "tf" | "hcl"
-        | "dockerfile" | "containerfile" | "jl" | "julia" | "ps1" | "psm1" | "psd1"
-        | "coffee" | "litcoffee" | "raku" | "p6" | "tcl" | "awk" | "sed" | "gitignore"
-        | "dockerignore" | "env" | "properties" | "gql" | "graphql" | "graphqls" | "nim"
-        | "nims" | "cr" => Line("#"),
+        "py" | "pyw" | "pyi" | "rb" | "ru" | "sh" | "bash" | "zsh" | "fish" | "ksh" | "yml"
+        | "yaml" | "toml" | "ex" | "exs" | "mk" | "mak" | "makefile" | "cmake" | "r" | "rmd"
+        | "pl" | "pm" | "conf" | "ini" | "cfg" | "nix" | "tf" | "hcl" | "dockerfile"
+        | "containerfile" | "jl" | "julia" | "ps1" | "psm1" | "psd1" | "coffee" | "litcoffee"
+        | "raku" | "p6" | "tcl" | "awk" | "sed" | "gitignore" | "dockerignore" | "env"
+        | "properties" | "gql" | "graphql" | "graphqls" | "nim" | "nims" | "cr" => Line("#"),
         "f90" | "f95" | "f03" | "f08" | "for" | "ftn" => Line("!"),
         "lua" | "sql" | "hs" | "lhs" | "elm" | "purs" | "dhall" | "vhd" | "vhdl" => Line("--"),
         "tex" | "sty" | "cls" | "bib" | "latex" | "ltx" | "matlab" => Line("%"),
@@ -371,9 +369,10 @@ pub fn comment_style_for_path(path: Option<&std::path::Path>) -> Option<CommentS
     Some(match name.as_str() {
         "dockerfile" | "containerfile" | "dockerignore" | "gitignore" | "gitattributes"
         | "gemfile" | "rakefile" | "guardfile" | "podfile" | "brewfile" | "justfile"
-        | "procfile" | "vagrantfile" | "berksfile" | "capfile" | "thorfile"
-        | "fastfile" | "appfile" | "matchfile" | "pluginfile" | "snapfile" | "makefile"
-        | "gnumakefile" => Line("#"),
+        | "procfile" | "vagrantfile" | "berksfile" | "capfile" | "thorfile" | "fastfile"
+        | "appfile" | "matchfile" | "pluginfile" | "snapfile" | "makefile" | "gnumakefile" => {
+            Line("#")
+        }
         "cmakelists.txt" => Line("#"),
         _ if name.starts_with("dockerfile.") || name.ends_with(".dockerfile") => Line("#"),
         _ => return None,
@@ -767,7 +766,10 @@ mod tests {
             super::comment_style_for_path(Some(Path::new("script.py"))),
             Some(Line("#"))
         );
-        assert_eq!(super::comment_style_for_path(Some(Path::new("notes.txt"))), None);
+        assert_eq!(
+            super::comment_style_for_path(Some(Path::new("notes.txt"))),
+            None
+        );
     }
 
     use super::*;
