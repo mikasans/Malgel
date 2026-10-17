@@ -27,8 +27,9 @@ use gpui_kit::{
         input::{Input, InputEvent, InputState},
         v_flex,
     },
-    div, px,
+    div,
     prelude::FluentBuilder as _,
+    px,
 };
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 

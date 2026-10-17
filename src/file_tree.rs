@@ -1427,6 +1427,12 @@ impl FileTree {
                                 )
                                 .separator()
                                 .item(
+                                    PopupMenuItem::new("Open to the Side")
+                                        .disabled(at_root)
+                                        .action(Box::new(crate::actions::OpenToSideInTree)),
+                                )
+                                .separator()
+                                .item(
                                     PopupMenuItem::new("Rename…")
                                         .disabled(at_root)
                                         .action(Box::new(crate::actions::RenameInTree)),

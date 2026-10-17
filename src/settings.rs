@@ -201,7 +201,6 @@ pub fn zoom_percent(font_size: f32) -> u32 {
     ((size / DEFAULT_FONT_SIZE) * 100.).round() as u32
 }
 
-
 fn settings_path() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("settings.json"))
 }

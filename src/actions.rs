@@ -16,9 +16,11 @@ actions!(
         NewFile,
         Open,
         OpenFolder,
+        OpenRecentPicker,
         SummonTerminal,
         Save,
         SaveAs,
+        SaveAll,
         ExportHtml,
         ExportPdf,
         ExportDocx,
@@ -47,6 +49,7 @@ actions!(
         ToggleTabs,
         ToggleFileSidebar,
         ToggleOutline,
+        ToggleMaximizedPanel,
         TogglePdfThumbnails,
         ToggleSpellCheck,
         ToggleFocusMode,
@@ -79,6 +82,7 @@ actions!(
         CopyRelativePathInTree,
         RevealPathInTree,
         OpenInTree,
+        OpenToSideInTree,
         FocusExplorer,
         TreeSelectUp,
         TreeSelectDown,
@@ -276,6 +280,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-k secondary-s", OpenKeyboardShortcuts, None),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-k cmd-s", OpenKeyboardShortcuts, None),
+        // VS Code Save All: Ctrl+K S (S without Ctrl). Distinct from Ctrl+K Ctrl+S.
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("secondary-k s", SaveAll, workspace),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("secondary-k s", SaveAll, Some(EDITOR_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-k s", SaveAll, workspace),
         // The last binding for an action is the one menus display.
         KeyBinding::new("secondary-+", ZoomIn, None),
         KeyBinding::new("secondary-=", ZoomIn, None),
@@ -295,7 +306,11 @@ pub fn bind_keys(cx: &mut App) {
         // Ctrl+X/C/V are what VS Code binds them to, and they only reach the
         // tree while it has the keyboard — in the editor the same keys keep
         // editing text.
+        // FILE_TREE_CONTEXT keeps Del/arrows scoped; F2 also binds globally so
+        // an explorer selection still renames after a click that focused the
+        // editor (probe #6 AC). Handler no-ops without a tree selection.
         KeyBinding::new("f2", RenameInTree, Some(FILE_TREE_CONTEXT)),
+        KeyBinding::new("f2", RenameInTree, None),
         KeyBinding::new("delete", DeleteInTree, Some(FILE_TREE_CONTEXT)),
         KeyBinding::new("backspace", DeleteInTree, Some(FILE_TREE_CONTEXT)),
         KeyBinding::new("secondary-x", CutInTree, Some(FILE_TREE_CONTEXT)),
@@ -418,8 +433,14 @@ mod tests {
         let bold = KeyBinding::new("secondary-shift-b", Bold, None);
         assert_eq!(bold.keystrokes().len(), 1);
         assert_ne!(
-            (sidebar.keystrokes()[0].key(), sidebar.keystrokes()[0].modifiers().shift),
-            (bold.keystrokes()[0].key(), bold.keystrokes()[0].modifiers().shift),
+            (
+                sidebar.keystrokes()[0].key(),
+                sidebar.keystrokes()[0].modifiers().shift
+            ),
+            (
+                bold.keystrokes()[0].key(),
+                bold.keystrokes()[0].modifiers().shift
+            ),
             "Bold must not share Ctrl+B with Toggle Side Bar"
         );
     }
@@ -437,7 +458,10 @@ mod tests {
         assert_eq!(fold_ks.key(), "{");
         assert_eq!(unfold_ks.key(), "}");
         assert!(!fold_ks.modifiers().shift, "Shift is already encoded in {{");
-        assert!(!unfold_ks.modifiers().shift, "Shift is already encoded in }}");
+        assert!(
+            !unfold_ks.modifiers().shift,
+            "Shift is already encoded in }}"
+        );
         assert!(fold_ks.modifiers().control || fold_ks.modifiers().platform);
 
         // The naive VS Code spellings parse, but they are not what Linux delivers

@@ -94,10 +94,11 @@ pub fn build(cx: &App) -> Vec<Menu> {
         MenuItem::action("New", NewFile),
         MenuItem::action("Open…", Open),
         MenuItem::action("Open folder…", OpenFolder),
-        submenu("Open recent", recent),
+        submenu("Open Recent", recent),
         MenuItem::separator(),
         MenuItem::action("Save", Save),
         MenuItem::action("Save as…", SaveAs),
+        MenuItem::action("Save All", SaveAll),
         MenuItem::separator(),
         // The three exports share one submenu so the File menu still reads in
         // one screen, as VS Code's does.
@@ -129,7 +130,8 @@ pub fn build(cx: &App) -> Vec<Menu> {
     if !macos {
         // On Windows and Linux, VS Code keeps Settings under File ▸
         // Preferences; macOS keeps it in the application menu (above).
-        file.push(MenuItem::separator());
+        // No separator before Settings: Save All already fills the 20-item
+        // non-scrolling budget (MAX_MENU_ITEMS).
         file.push(MenuItem::action("Settings…", OpenSettings));
         file.push(MenuItem::separator());
         file.push(MenuItem::action("Quit", Quit));
@@ -338,6 +340,49 @@ mod tests {
             assert_eq!(
                 checked,
                 ["Preview", "Tabs", "Sync scrolling", "Line numbers"]
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn file_menu_has_save_all_and_open_recent(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::themes::init(Settings::default(), cx);
+            cx.set_global(AppSettings(Settings::default()));
+        });
+        cx.read(|cx| {
+            let menus = build(cx);
+            let file = menus.iter().find(|menu| menu.name == "File").unwrap();
+            let names: Vec<_> = file
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    MenuItem::Action { name, .. } => Some(name.to_string()),
+                    MenuItem::Submenu(sub) => Some(sub.name.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                names.iter().any(|n| n == "Save All"),
+                "File menu missing Save All: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "Open Recent"),
+                "File menu missing Open Recent: {names:?}"
+            );
+            let view = menus.iter().find(|menu| menu.name == "View").unwrap();
+            let view_names: Vec<_> = view
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    MenuItem::Action { name, .. } => Some(name.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                view_names.iter().any(|n| n == "Outline"),
+                "View menu missing Outline: {view_names:?}"
             );
         });
     }

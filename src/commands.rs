@@ -85,12 +85,52 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
         "Fold" => vec![label, "fold region", "collapse"],
         "Unfold" => vec![label, "unfold region", "expand fold"],
         // Round-4: palette query "search" must hit Find in files (Ctrl+Shift+F).
-        "Find in files…" => vec![label, "search", "search in files", "find in folder", "workspace search"],
-        "Split Editor Right" => vec![label, "split", "split right", "split editor", "open to the side"],
+        "Find in files…" => vec![
+            label,
+            "search",
+            "search in files",
+            "find in folder",
+            "workspace search",
+        ],
+        "Split Editor Right" => vec![
+            label,
+            "split",
+            "split right",
+            "split editor",
+            "open to the side",
+        ],
         "Split Editor Down" => vec![label, "split", "split down", "split editor", "open below"],
         "Keyboard Shortcuts" => {
-            vec![label, "keyboard", "shortcut", "shortcuts", "keybindings", "hotkeys"]
+            vec![
+                label,
+                "keyboard",
+                "shortcut",
+                "shortcuts",
+                "keybindings",
+                "hotkeys",
+            ]
         }
+        // Probe #6: chords work; palette queries must too.
+        "Replace…" => vec![label, "replace", "find replace", "search replace"],
+        "Go to line…" => vec![label, "goto", "goto line", "go to line", "go to"],
+        "Save All" => vec![label, "save all", "saveall"],
+        "Open Recent…" => vec![
+            label,
+            "open recent",
+            "recent",
+            "recent files",
+            "recent folders",
+        ],
+        "Toggle Maximized Panel" => {
+            vec![
+                label,
+                "maximize",
+                "maximize panel",
+                "maximized panel",
+                "toggle maximized panel",
+            ]
+        }
+        "Outline" => vec![label, "outline", "table of contents", "headings"],
         _ => vec![label],
     }
 }
@@ -121,6 +161,8 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Open folder…", IconName::FolderOpen, OpenFolder),
             cmd("Save", IconName::Save, Save),
             cmd("Save as…", IconName::Save, SaveAs),
+            cmd("Save All", IconName::Save, SaveAll),
+            cmd("Open Recent…", IconName::Clock, OpenRecentPicker),
             cmd(
                 "Change end of line sequence",
                 IconName::ArrowLeftRight,
@@ -153,6 +195,7 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("New folder…", IconName::FolderPlus, NewFolderInTree),
             cmd("Rename…", IconName::PenLine, RenameInTree),
             cmd("Delete", IconName::Trash, DeleteInTree),
+            cmd("Open to the Side", IconName::Columns2, OpenToSideInTree),
             cmd("Cut", IconName::Scissors, CutInTree),
             cmd("Copy", IconName::Copy, CopyInTree),
             cmd("Paste", IconName::Clipboard, PasteInTree),
@@ -170,6 +213,11 @@ pub fn groups() -> Vec<CommandGroupSpec> {
         "Edit",
         vec![
             cmd("Find in files…", IconName::Search, FindInFiles),
+            cmd(
+                "Replace…",
+                IconName::Replace,
+                gpui_kit::component::input::Replace,
+            ),
             cmd("Copy as rich text", IconName::Clipboard, CopyRichText),
             cmd("Tidy table", IconName::List, TidyTable),
         ],
@@ -216,7 +264,11 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Outline", IconName::ListTree, ToggleOutline),
             cmd("Focus mode", IconName::Maximize2, ToggleFocusMode),
             cmd("Toggle word wrap", IconName::TextWrap, ToggleSoftWrap),
-            cmd("Preview soft line breaks", IconName::TextWrap, ToggleGfmBreaks),
+            cmd(
+                "Preview soft line breaks",
+                IconName::TextWrap,
+                ToggleGfmBreaks,
+            ),
             cmd("Line numbers", IconName::ListOrdered, ToggleLineNumbers),
             cmd("Fold", IconName::ChevronDown, Fold),
             cmd("Unfold", IconName::ChevronRight, Unfold),
@@ -225,6 +277,11 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Restore session", IconName::Clock, ToggleRestoreSession),
             cmd("Toggle light and dark", IconName::Moon, ToggleAppearance),
             cmd("Toggle Terminal", IconName::Terminal, SummonTerminal),
+            cmd(
+                "Toggle Maximized Panel",
+                IconName::Maximize2,
+                ToggleMaximizedPanel,
+            ),
             cmd("Zoom in", IconName::ZoomIn, ZoomIn),
             cmd("Zoom out", IconName::ZoomOut, ZoomOut),
             cmd("Actual size", IconName::ScanText, ZoomReset),
@@ -288,7 +345,11 @@ pub fn groups() -> Vec<CommandGroupSpec> {
     let help = group(
         "Help",
         vec![
-            cmd("Keyboard Shortcuts", IconName::Keyboard, OpenKeyboardShortcuts),
+            cmd(
+                "Keyboard Shortcuts",
+                IconName::Keyboard,
+                OpenKeyboardShortcuts,
+            ),
             cmd("Markdown guide", IconName::BookOpen, OpenMarkdownGuide),
             cmd("About Malgel", IconName::Info, About),
         ],
@@ -345,5 +406,24 @@ mod tests {
             .find(|i| i.label == "Toggle Terminal")
             .expect("Toggle Terminal in palette");
         assert!(terminal.action.partial_eq(&SummonTerminal));
+    }
+
+    #[test]
+    fn palette_probe6_aliases_and_staples() {
+        let groups = groups();
+        let labels: Vec<_> = groups
+            .iter()
+            .flat_map(|g| g.items.iter().map(|i| i.label))
+            .collect();
+        assert!(labels.contains(&"Save All"));
+        assert!(labels.contains(&"Open Recent…"));
+        assert!(labels.contains(&"Replace…"));
+        assert!(labels.contains(&"Toggle Maximized Panel"));
+        assert!(keywords("Replace…").contains(&"replace"));
+        assert!(keywords("Go to line…").contains(&"goto"));
+        assert!(keywords("Go to line…").contains(&"goto line"));
+        assert!(keywords("Save All").contains(&"save all"));
+        assert!(keywords("Toggle Maximized Panel").contains(&"maximize"));
+        assert!(keywords("Open Recent…").contains(&"open recent"));
     }
 }

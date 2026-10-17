@@ -134,6 +134,10 @@ pub struct DocumentView {
     analysis_task: Option<Task<()>>,
     /// The indentation detected when the text was loaded.
     indent: crate::document::Indent,
+
+    /// Status-bar / highlighter language override (VS Code "Change Language Mode").
+    /// `None` follows the path; set from the status-bar picker.
+    language_override: Option<SharedString>,
     /// Whether the preview shows only the start of a large document.
     preview_limited: bool,
     /// Past `LARGE_DOCUMENT_BYTES`: the editor's rope is the only copy of
@@ -283,6 +287,7 @@ impl DocumentView {
             analysis: Arc::default(),
             analysis_task: None,
             indent: crate::document::Indent::DEFAULT,
+            language_override: None,
             preview_limited: false,
             large: false,
             reduced: false,
@@ -476,6 +481,7 @@ impl DocumentView {
             analysis: Arc::new(Analysis::default()),
             analysis_task: None,
             indent: crate::document::Indent::DEFAULT,
+            language_override: None,
             preview_limited: false,
             large: false,
             reduced: false,
@@ -539,6 +545,7 @@ impl DocumentView {
             analysis: Arc::new(Analysis::default()),
             analysis_task: None,
             indent: crate::document::Indent::DEFAULT,
+            language_override: None,
             preview_limited: false,
             large: false,
             reduced: false,
@@ -580,6 +587,9 @@ impl DocumentView {
     /// document's pages are Typst's output, so saying "Markdown" beside them
     /// would name the wrong thing.
     pub fn language_label(&self) -> SharedString {
+        if let Some(override_label) = &self.language_override {
+            return override_label.clone();
+        }
         if self.reduced {
             return "Plain Text".into();
         }
@@ -589,6 +599,41 @@ impl DocumentView {
     /// The indentation the status bar names.
     pub fn indent(&self) -> crate::document::Indent {
         self.indent
+    }
+
+    /// Apply Spaces/Tabs from the status-bar picker (does not reformat existing text).
+    pub fn set_indent(&mut self, indent: crate::document::Indent, cx: &mut Context<Self>) {
+        if self.indent == indent {
+            return;
+        }
+        self.indent = indent;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_tab_size(
+                TabSize {
+                    tab_size: indent.size,
+                    hard_tabs: indent.hard_tabs,
+                },
+                cx,
+            );
+        });
+        cx.notify();
+    }
+
+    /// Change Language Mode from the status bar (highlighter + label).
+    pub fn set_language_mode(
+        &mut self,
+        label: SharedString,
+        highlighter: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.language_override = Some(label);
+        if !self.reduced {
+            self.editor
+                .update(cx, |editor, cx| editor.set_highlighter(highlighter, cx));
+        }
+        let _ = window;
+        cx.notify();
     }
 
     /// Whether this text document gets the rendered preview beside it:

@@ -89,6 +89,10 @@ enum AfterConfirm {
     CloseDocuments(Vec<EntityId>),
     CloseWindow,
     Quit,
+    /// Continue Save All after an untitled Save As (remaining entity ids + final next).
+    SaveAllThen(Vec<EntityId>, Box<AfterConfirm>),
+    /// No-op sentinel for chained Save All without a follow-up.
+    Nop,
 }
 
 /// Which view of the active document should hold the keyboard.
@@ -439,6 +443,8 @@ pub struct Workspace {
     /// Integrated terminal in the bottom panel (Ctrl+`).
     terminal: Entity<TerminalPanel>,
     terminal_visible: bool,
+    /// When true, the terminal panel takes most of the center (VS Code Maximize Panel).
+    terminal_maximized: bool,
     /// Second editor group: another open document beside or below the active one.
     editor_split: Option<EditorSplit>,
     /// Debounce for title-bar path copy toasts.
@@ -589,6 +595,7 @@ impl Workspace {
             document_subscriptions: Vec::new(),
             terminal,
             terminal_visible: false,
+            terminal_maximized: false,
             editor_split: None,
             last_path_copy: None,
             _subscriptions: subscriptions,
@@ -1731,6 +1738,10 @@ impl Workspace {
             } => {
                 if !doc.read(cx).is_dirty() {
                     doc.update(cx, |doc, cx| doc.reload(text, line_ending, window, cx));
+                    window.push_notification(
+                        Notification::info(format!("“{name}” reloaded from disk.")),
+                        cx,
+                    );
                     return;
                 }
                 if window.has_active_dialog(cx) {
@@ -1797,16 +1808,23 @@ impl Workspace {
             let overwrite_doc = doc.clone();
             let overwrite_path = doc.read(cx).path().cloned();
             let overwrite_decided = decided.clone();
+            let compare_ws = workspace.clone();
+            let compare_doc = doc.clone();
+            let compare_text = text.clone();
+            let compare_decided = decided.clone();
+            let compare_name = name.clone();
             alert
                 .title(format!("“{name}” changed on disk"))
-                .description("Another program saved this file while you have unsaved changes here.")
+                .description(
+                    "Another program saved this file while you have unsaved changes here. Reload discards local edits; Overwrite writes your buffer; Compare opens the disk version in a new tab.",
+                )
                 .keyboard(true)
                 .on_cancel(move |_, window, cx| {
                     keep_esc(window, cx);
                     true
                 })
                 .on_ok(move |_, window, cx| {
-                    // Enter activates the primary button (Keep my changes).
+                    // Enter activates the primary button (Keep / Cancel path).
                     keep_ok(window, cx);
                     true
                 })
@@ -1815,7 +1833,7 @@ impl Workspace {
                         .justify_end()
                         .child(
                             Button::new("reload")
-                                .label("Use the file on disk")
+                                .label("Reload")
                                 .outline()
                                 .on_click(move |_, window, cx| {
                                     if reload_decided.replace(true) {
@@ -1833,10 +1851,24 @@ impl Workspace {
                                 }),
                         )
                         .child(
-                            Button::new("keep")
-                                .label("Keep my changes")
-                                .primary()
-                                .on_click(move |_, window, cx| keep_btn(window, cx)),
+                            Button::new("compare")
+                                .label("Compare")
+                                .outline()
+                                .on_click(move |_, window, cx| {
+                                    if compare_decided.replace(true) {
+                                        return;
+                                    }
+                                    window.close_dialog(cx);
+                                    // Keep local edits; open disk snapshot in a new tab for side-by-side review.
+                                    compare_doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
+                                    let disk = compare_text.as_ref().clone();
+                                    let label = format!("{} (on disk)", compare_name);
+                                    _ = compare_ws.update(cx, |this, cx| {
+                                        this.pending_disk_prompt.remove(&id);
+                                        this.open_compare_buffer(disk, label, window, cx);
+                                        this.focus_active(window, cx);
+                                    });
+                                }),
                         )
                         .child(
                             Button::new("overwrite")
@@ -1856,6 +1888,12 @@ impl Workspace {
                                         this.focus_active(window, cx);
                                     });
                                 }),
+                        )
+                        .child(
+                            Button::new("keep")
+                                .label("Keep")
+                                .primary()
+                                .on_click(move |_, window, cx| keep_btn(window, cx)),
                         ),
                 )
         });
@@ -1928,10 +1966,130 @@ impl Workspace {
                 term.set_cwd(cwd, cx);
                 term.ensure_running(window, cx);
             });
+        } else {
+            self.terminal_maximized = false;
         }
         cx.notify();
     }
 
+    /// Toggle Maximized Panel (VS Code): enlarge the terminal when it is open.
+    fn toggle_maximized_panel(
+        &mut self,
+        _: &ToggleMaximizedPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.terminal_visible {
+            self.terminal_visible = true;
+            self.terminal_maximized = true;
+            let cwd = terminal::terminal_cwd(
+                self.file_tree.read(cx).root(),
+                self.active_document().read(cx).path().map(|p| p.as_path()),
+            );
+            self.terminal.update(cx, |term, cx| {
+                term.set_cwd(cwd, cx);
+                term.ensure_running(window, cx);
+            });
+        } else {
+            self.terminal_maximized = !self.terminal_maximized;
+        }
+        cx.notify();
+    }
+
+    /// Open Recent… (palette / File): searchable list of recent files and folders.
+    fn show_open_recent(
+        &mut self,
+        _: &OpenRecentPicker,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let recent = AppSettings::get(cx).recent_files.clone();
+        if recent.is_empty() {
+            window.push_notification(Notification::info("No recent files or folders."), cx);
+            return;
+        }
+        // Reuse theme_picker CommandState — only one such dialog at a time.
+        self.theme_picker
+            .update(cx, |state, cx| state.set_query("", window, cx));
+        let state = self.theme_picker.clone();
+        let focus = state.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        let workspace = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let items: Vec<(usize, String)> = recent
+                .iter()
+                .enumerate()
+                .map(|(ix, path)| {
+                    let name = display_name(Some(path));
+                    let kind = if path.is_dir() { "Folder" } else { "File" };
+                    (ix, format!("{name}  —  {kind}  —  {}", path.display()))
+                })
+                .collect();
+            let pick_items = items.clone();
+            let mut group = CommandGroup::new().label("Recent");
+            for (_, label) in &items {
+                group = group.item(CommandItem::new().label(label.clone()));
+            }
+            dialog.close_button(false).p_0().child(esc_closes(
+                Command::new(&state)
+                    .bordered(false)
+                    .placeholder("Open Recent")
+                    .max_h(rems(24.))
+                    .group(group)
+                    .empty(|_, _, _| div().px_3().py_2().child("No matching recent items"))
+                    .on_confirm({
+                        let workspace = workspace.clone();
+                        move |index, window, cx| {
+                            window.close_dialog(cx);
+                            if let Some((ix, _)) = pick_items.get(index.row) {
+                                window.dispatch_action(Box::new(OpenRecent(*ix)), cx);
+                            }
+                            if let Some(this) = workspace.upgrade() {
+                                this.update(cx, |this, cx| this.focus_active(window, cx));
+                            }
+                        }
+                    })
+                    .on_cancel(|window, cx| window.close_dialog(cx)),
+            ))
+        });
+    }
+
+    /// Disk-conflict Compare: open the on-disk snapshot as an untitled tab.
+    fn open_compare_buffer(
+        &mut self,
+        text: String,
+        _label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ending = LineEnding::detect(&text);
+        let doc = cx.new(|cx| DocumentView::new(text, None, ending, window, cx));
+        self.add_document(doc, true, window, cx);
+        window.push_notification(
+            Notification::info("Opened on-disk copy in a new tab for comparison."),
+            cx,
+        );
+    }
+
+    /// Explorer: open the selected file in a split to the side.
+    fn tree_open_to_side(
+        &mut self,
+        _: &OpenToSideInTree,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((path, is_dir)) = self.file_tree.read(cx).single_selection() else {
+            return;
+        };
+        if is_dir || !path.is_file() {
+            return;
+        }
+        self.open_paths(vec![path], Placement::NewTab, window, cx);
+        self.open_editor_split(false, window, cx);
+    }
 
     /// After a folder becomes the Explorer root, avoid leaving a pointless
     /// blank Untitled as the only editor (round-4). Prefer README / first
@@ -2775,21 +2933,138 @@ impl Workspace {
     }
 
     /// Close the window or quit once every document with unsaved changes
-    /// has been saved or discarded, asking about each in turn.
+    /// has been saved or discarded. With two or more dirty buffers, ask once
+    /// with Save All / Don't Save / Cancel (probe #6); otherwise the single-file dialog.
     fn confirm_close(&mut self, next: AfterConfirm, window: &mut Window, cx: &mut Context<Self>) {
-        let pending = self
+        let dirty: Vec<_> = self
             .documents
             .iter()
-            .find(|doc| doc.read(cx).is_dirty() && !self.discarded.contains(&doc.entity_id()));
-        match pending.cloned() {
-            Some(doc) => {
+            .filter(|doc| doc.read(cx).is_dirty() && !self.discarded.contains(&doc.entity_id()))
+            .cloned()
+            .collect();
+        match dirty.as_slice() {
+            [] => self.run_after_confirm(next, window, cx),
+            [doc] => {
                 if let Some(ix) = self.document_index(doc.entity_id()) {
                     self.activate_inner(ix, false, window, cx);
                 }
-                self.confirm_unsaved(doc, next, window, cx);
+                self.confirm_unsaved(doc.clone(), next, window, cx);
             }
-            None => self.run_after_confirm(next, window, cx),
+            many => self.confirm_unsaved_many(many.to_vec(), next, window, cx),
         }
+    }
+
+    /// Multi-dirty quit/close: list every unsaved buffer and offer Save All.
+    fn confirm_unsaved_many(
+        &mut self,
+        dirty: Vec<Entity<DocumentView>>,
+        next: AfterConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let names: Vec<String> = dirty.iter().map(|doc| doc.read(cx).name()).collect();
+        let list = names
+            .iter()
+            .map(|n| format!("• {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let count = dirty.len();
+        let workspace = cx.weak_entity();
+        let focus = self.alert_focus.clone();
+        focus.focus_primary_soon(window, cx);
+        window.open_alert_dialog(cx, move |alert, window, cx| {
+            let (save, discard, cancel) = (workspace.clone(), workspace.clone(), workspace.clone());
+            let (save_next, discard_next) = (next.clone(), next.clone());
+            let cancel_esc = cancel.clone();
+            let save_ok = save.clone();
+            let save_ok_next = next.clone();
+            alert
+                .title(format!("Save changes to {count} files?"))
+                .description(format!(
+                    "Your changes will be lost if you don’t save them.\n\n{list}"
+                ))
+                .keyboard(true)
+                .on_cancel(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    _ = cancel_esc.update(cx, |this, cx| {
+                        this.discarded.clear();
+                        this.focus_active(window, cx);
+                    });
+                    true
+                })
+                .on_ok(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    let next = save_ok_next.clone();
+                    _ = save_ok.update(cx, |this, cx| {
+                        this.focus_active(window, cx);
+                        this.save_all_documents(Some(next), window, cx);
+                    });
+                    true
+                })
+                .footer(
+                    focus.trap(
+                        DialogFooter::new()
+                            .justify_end()
+                            .child(
+                                Button::new("discard-all")
+                                    .label("Don’t Save")
+                                    .outline()
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        let next = discard_next.clone();
+                                        _ = discard.update(cx, |this, cx| {
+                                            let ids: Vec<_> = this
+                                                .documents
+                                                .iter()
+                                                .filter(|d| d.read(cx).is_dirty())
+                                                .map(|d| d.entity_id())
+                                                .collect();
+                                            for id in ids {
+                                                if let Some(ix) = this.document_index(id) {
+                                                    this.documents[ix].update(cx, |doc, _| {
+                                                        doc.discard_recovery()
+                                                    });
+                                                }
+                                                this.discarded.insert(id);
+                                            }
+                                            this.focus_active(window, cx);
+                                            this.run_after_confirm(next, window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(div().flex_1())
+                            .child(Button::new("cancel").label("Cancel").outline().on_click(
+                                move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    _ = cancel.update(cx, |this, cx| {
+                                        this.discarded.clear();
+                                        this.focus_active(window, cx);
+                                    });
+                                },
+                            ))
+                            .child(
+                                focus.primary(
+                                    Button::new("save-all")
+                                        .label("Save All")
+                                        .primary()
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let next = save_next.clone();
+                                            _ = save.update(cx, |this, cx| {
+                                                this.focus_active(window, cx);
+                                                this.save_all_documents(Some(next), window, cx);
+                                            });
+                                        }),
+                                    window,
+                                    cx,
+                                ),
+                            ),
+                    ),
+                )
+        });
     }
 
     /// Run `next` now, or once the user has saved or discarded `doc`'s
@@ -2938,6 +3213,26 @@ impl Workspace {
                     window.remove_window();
                 }
             }
+            AfterConfirm::SaveAllThen(rest, final_next) => {
+                let docs: Vec<_> = rest
+                    .into_iter()
+                    .filter_map(|id| self.document_index(id).map(|ix| self.documents[ix].clone()))
+                    .collect();
+                match docs.as_slice() {
+                    [] => self.run_after_confirm(*final_next, window, cx),
+                    [first] => self.save_document(first.clone(), Some(*final_next), window, cx),
+                    [first, more @ ..] => {
+                        let more_ids: Vec<EntityId> = more.iter().map(|d| d.entity_id()).collect();
+                        self.save_document(
+                            first.clone(),
+                            Some(AfterConfirm::SaveAllThen(more_ids, final_next)),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
+            AfterConfirm::Nop => {}
         }
     }
 
@@ -3086,6 +3381,60 @@ impl Workspace {
             return;
         }
         self.prompt_save_path(doc, None, window, cx);
+    }
+
+    /// Save every dirty document that has a path; prompt Save As for untitled ones.
+    fn save_all(&mut self, _: &SaveAll, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_all_documents(None, window, cx);
+    }
+
+    fn save_all_documents(
+        &mut self,
+        next: Option<AfterConfirm>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dirty: Vec<_> = self
+            .documents
+            .iter()
+            .filter(|doc| doc.read(cx).is_dirty() && !self.discarded.contains(&doc.entity_id()))
+            .cloned()
+            .collect();
+        if dirty.is_empty() {
+            if let Some(next) = next {
+                self.run_after_confirm(next, window, cx);
+            }
+            return;
+        }
+        // Untitled first so Save As does not interleave oddly with path saves.
+        let mut untitled = Vec::new();
+        let mut with_path = Vec::new();
+        for doc in dirty {
+            if doc.read(cx).path().is_some() {
+                with_path.push(doc);
+            } else {
+                untitled.push(doc);
+            }
+        }
+        for doc in with_path {
+            self.save_document(doc, None, window, cx);
+        }
+        match untitled.as_slice() {
+            [] => {
+                if let Some(next) = next {
+                    self.run_after_confirm(next, window, cx);
+                }
+            }
+            [first] => self.save_document(first.clone(), next, window, cx),
+            [first, rest @ ..] => {
+                let rest_ids: Vec<EntityId> = rest.iter().map(|d| d.entity_id()).collect();
+                let chained = match next {
+                    Some(n) => AfterConfirm::SaveAllThen(rest_ids, Box::new(n)),
+                    None => AfterConfirm::SaveAllThen(rest_ids, Box::new(AfterConfirm::Nop)),
+                };
+                self.save_document(first.clone(), Some(chained), window, cx);
+            }
+        }
     }
 
     /// Save `doc`, asking for a location first when it has none, then
@@ -4234,12 +4583,7 @@ impl Workspace {
         self.open_editor_split(true, window, cx);
     }
 
-    fn close_editor_split(
-        &mut self,
-        _: &CloseEditorSplit,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn close_editor_split(&mut self, _: &CloseEditorSplit, _: &mut Window, cx: &mut Context<Self>) {
         self.editor_split = None;
         cx.notify();
     }
@@ -4264,10 +4608,8 @@ impl Workspace {
         cx.notify();
     }
 
-
     // ---------------------------------------------------------------------
     // Rendering
-
 
     /// True when there is no folder and the only buffer is the welcome /
     /// blank Untitled — show Open folder / Open / New CTAs (round-4).
@@ -4304,9 +4646,7 @@ impl Workspace {
                     .small()
                     .label("Open folder…")
                     .tooltip("Open folder (Ctrl+K Ctrl+O)")
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(OpenFolder), cx)
-                    }),
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenFolder), cx)),
             )
             .child(
                 Button::new("welcome-open-file")
@@ -4314,9 +4654,7 @@ impl Workspace {
                     .outline()
                     .label("Open…")
                     .tooltip("Open file (Ctrl+O)")
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(Open), cx)
-                    }),
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(Open), cx)),
             )
             .child(
                 Button::new("welcome-new-file")
@@ -4324,9 +4662,7 @@ impl Workspace {
                     .outline()
                     .label("New file")
                     .tooltip("New file (Ctrl+N)")
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(NewFile), cx)
-                    }),
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(NewFile), cx)),
             )
     }
 
@@ -5005,7 +5341,8 @@ impl Workspace {
         let settings = AppSettings::get(cx);
         let muted = cx.theme().muted_foreground;
         let item = |text: String| div().text_color(muted).child(text);
-        let language = item(doc.language_label().to_string());
+        let workspace = cx.weak_entity();
+        let language_label = doc.language_label().to_string();
 
         // A viewer has no text: no words, caret, line ending or indent to
         // report. It says where you are in it instead, as VS Code's image
@@ -5014,7 +5351,7 @@ impl Workspace {
             let status = doc.media_status(cx);
             return StatusBar::new()
                 .left(h_flex().gap_4().children(status.into_iter().map(item)))
-                .right(h_flex().gap_4().child(language))
+                .right(h_flex().gap_4().child(item(language_label)))
                 .into_any_element();
         }
 
@@ -5029,7 +5366,11 @@ impl Workspace {
             selection_character_count(&editor.text().slice(selection.clone()).to_string())
         };
         let line_ending = doc.line_ending();
+        let indent = doc.indent();
         let shows_editor = settings.layout.shows_editor() || !doc.has_preview();
+        let ws_eol = workspace.clone();
+        let ws_indent = workspace.clone();
+        let ws_lang = workspace.clone();
         StatusBar::new()
             .left(
                 h_flex()
@@ -5079,13 +5420,46 @@ impl Workspace {
                                 .replace('_', "-"),
                         ))
                     })
-                    // The indentation the file uses, detected when it was
-                    // read, as VS Code reports it.
-                    .child(item(doc.indent().label()))
+                    // Indent picker (Spaces: N / Tab Size: N).
+                    .child({
+                        let label = indent.label();
+                        Button::new("indent-mode")
+                            .ghost()
+                            .xsmall()
+                            .compact()
+                            .label(label)
+                            .tooltip("Select Indentation")
+                            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                                let mut menu = menu;
+                                for (hard_tabs, size, name) in [
+                                    (false, 2usize, "Spaces: 2"),
+                                    (false, 4, "Spaces: 4"),
+                                    (false, 8, "Spaces: 8"),
+                                    (true, 2, "Tab Size: 2"),
+                                    (true, 4, "Tab Size: 4"),
+                                    (true, 8, "Tab Size: 8"),
+                                ] {
+                                    let ws = ws_indent.clone();
+                                    menu = menu.item(PopupMenuItem::new(name).on_click(
+                                        move |_, window, cx| {
+                                            _ = ws.update(cx, |this, cx| {
+                                                this.active_document().update(cx, |doc, cx| {
+                                                    doc.set_indent(
+                                                        crate::document::Indent { hard_tabs, size },
+                                                        cx,
+                                                    );
+                                                });
+                                                cx.notify();
+                                                let _ = window;
+                                            });
+                                        },
+                                    ));
+                                }
+                                menu
+                            })
+                    })
                     .children(doc.encoding().label().map(|label| item(label.to_string())))
-                    // VS Code's status bar switches the line ending when its
-                    // EOL item is clicked; Malgel toggles LF and CRLF there
-                    // too.
+                    // EOL picker: LF / CRLF (VS Code-like).
                     .child(
                         Button::new("line-ending")
                             .ghost()
@@ -5093,8 +5467,27 @@ impl Workspace {
                             .compact()
                             .label(line_ending.label())
                             .tooltip("Select End of Line Sequence")
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(ToggleLineEnding), cx)
+                            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                                let ws_lf = ws_eol.clone();
+                                let ws_crlf = ws_eol.clone();
+                                menu.item(PopupMenuItem::new("LF").on_click(move |_, _, cx| {
+                                    _ = ws_lf.update(cx, |this, cx| {
+                                        this.active_document().update(cx, |doc, cx| {
+                                            doc.set_line_ending(LineEnding::Lf, cx);
+                                        });
+                                        cx.notify();
+                                    });
+                                }))
+                                .item(
+                                    PopupMenuItem::new("CRLF").on_click(move |_, _, cx| {
+                                        _ = ws_crlf.update(cx, |this, cx| {
+                                            this.active_document().update(cx, |doc, cx| {
+                                                doc.set_line_ending(LineEnding::CrLf, cx);
+                                            });
+                                            cx.notify();
+                                        });
+                                    }),
+                                )
                             }),
                     )
                     // Zoom as a percentage of the default UI font size (Ctrl+= / -).
@@ -5102,11 +5495,114 @@ impl Workspace {
                         "{}%",
                         crate::settings::zoom_percent(settings.font_size)
                     )))
-                    .child(language),
+                    // Language mode picker.
+                    .child(
+                        Button::new("language-mode")
+                            .ghost()
+                            .xsmall()
+                            .compact()
+                            .label(language_label)
+                            .tooltip("Select Language Mode")
+                            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                                let mut menu = menu;
+                                for (label, highlighter) in STATUS_LANGUAGE_MODES {
+                                    let ws = ws_lang.clone();
+                                    let label_s: SharedString = (*label).into();
+                                    menu = menu.item(PopupMenuItem::new(*label).on_click(
+                                        move |_, window, cx| {
+                                            let label_s = label_s.clone();
+                                            _ = ws.update(cx, |this, cx| {
+                                                this.active_document().update(cx, |doc, cx| {
+                                                    doc.set_language_mode(
+                                                        label_s.clone(),
+                                                        highlighter,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                                cx.notify();
+                                            });
+                                        },
+                                    ));
+                                }
+                                menu
+                            }),
+                    ),
             )
             .into_any_element()
     }
+
+    /// Light breadcrumbs under the tab strip: folder › file (probe #6).
+    fn render_breadcrumbs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let doc = self.active_document().read(cx);
+        let crumbs = match doc.path() {
+            Some(path) => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(root) = self.file_tree.read(cx).root() {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        for c in rel.components() {
+                            parts.push(c.as_os_str().to_string_lossy().into_owned());
+                        }
+                    }
+                }
+                if parts.is_empty() {
+                    parts.push(display_name(Some(path)));
+                    if let Some(parent) = path.parent().and_then(|p| p.file_name()) {
+                        parts.insert(0, parent.to_string_lossy().into_owned());
+                    }
+                }
+                parts
+            }
+            None => vec!["Untitled".into()],
+        };
+        h_flex()
+            .id("breadcrumbs")
+            .h(px(22.))
+            .flex_none()
+            .items_center()
+            .px_3()
+            .gap_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .children(crumbs.into_iter().enumerate().flat_map(|(i, part)| {
+                let mut row = Vec::new();
+                if i > 0 {
+                    row.push(
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .child("›")
+                            .into_any_element(),
+                    );
+                }
+                row.push(div().child(part).into_any_element());
+                row
+            }))
+    }
 }
+
+/// Modes offered by the status-bar language picker.
+const STATUS_LANGUAGE_MODES: &[(&str, &str)] = &[
+    ("Markdown", "markdown"),
+    ("Plain Text", "text"),
+    ("Typst", "text"),
+    ("Rust", "rust"),
+    ("Python", "python"),
+    ("JavaScript", "javascript"),
+    ("TypeScript", "typescript"),
+    ("JSON", "json"),
+    ("YAML", "yaml"),
+    ("TOML", "toml"),
+    ("HTML", "html"),
+    ("CSS", "css"),
+    ("Shell Script", "bash"),
+    ("Go", "go"),
+    ("C", "c"),
+    ("C++", "cpp"),
+];
 
 /// The settings dialog: Malgel's optional features and how it behaves.
 pub fn open_settings(window: &mut Window, cx: &mut App) {
@@ -5636,6 +6132,7 @@ impl Render for Workspace {
                     v_flex()
                         .size_full()
                         .when(self.shows_tabs(cx), |this| this.child(self.render_tabs(cx)))
+                        .child(self.render_breadcrumbs(cx))
                         .when(self.shows_welcome_cta(cx), |this| {
                             this.child(self.render_welcome_cta(cx))
                         })
@@ -5666,6 +6163,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::save_as))
+            .on_action(cx.listener(Self::save_all))
+            .on_action(cx.listener(Self::show_open_recent))
+            .on_action(cx.listener(Self::toggle_maximized_panel))
             .on_action(cx.listener(Self::export_html))
             .on_action(cx.listener(Self::export_pdf))
             .on_action(cx.listener(Self::export_docx))
@@ -5692,6 +6192,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::tree_copy_relative_path))
             .on_action(cx.listener(Self::tree_reveal_path))
             .on_action(cx.listener(Self::tree_open))
+            .on_action(cx.listener(Self::tree_open_to_side))
             .on_action(cx.listener(Self::tree_select_up))
             .on_action(cx.listener(Self::tree_select_down))
             .on_action(cx.listener(Self::tree_select_left))
@@ -5979,10 +6480,7 @@ impl Workspace {
             if this.editor_split.is_some() {
                 this.editor_split = Some(EditorSplit {
                     other: ix,
-                    vertical: this
-                        .editor_split
-                        .map(|s| s.vertical)
-                        .unwrap_or(false),
+                    vertical: this.editor_split.map(|s| s.vertical).unwrap_or(false),
                 });
                 this.tab_insertion = None;
                 cx.notify();
@@ -6004,13 +6502,7 @@ impl Workspace {
                     .id("editor-split-vertical")
                     .size_full()
                     .child(stack(active, "doc-stack-primary"))
-                    .child(
-                        div()
-                            .h(px(1.))
-                            .w_full()
-                            .bg(cx.theme().border)
-                            .flex_none(),
-                    )
+                    .child(div().h(px(1.)).w_full().bg(cx.theme().border).flex_none())
                     .child(stack(other, "doc-stack-secondary"))
                     .into_any_element()
             } else {
@@ -6018,13 +6510,7 @@ impl Workspace {
                     .id("editor-split-horizontal")
                     .size_full()
                     .child(stack(active, "doc-stack-primary"))
-                    .child(
-                        div()
-                            .w(px(1.))
-                            .h_full()
-                            .bg(cx.theme().border)
-                            .flex_none(),
-                    )
+                    .child(div().w(px(1.)).h_full().bg(cx.theme().border).flex_none())
                     .child(stack(other, "doc-stack-secondary"))
                     .into_any_element()
             };
@@ -6078,20 +6564,38 @@ impl Workspace {
             .child(main);
 
         if self.terminal_visible && !focus_mode {
-            let term_h = rems(12.).to_pixels(rem);
-            v_resizable("center-with-terminal")
-                .child(
-                    resizable_panel()
-                        .size_range(rems(12.).to_pixels(rem)..Pixels::MAX)
-                        .child(body),
-                )
-                .child(
-                    resizable_panel()
-                        .size(term_h)
-                        .size_range(rems(6.).to_pixels(rem)..rems(28.).to_pixels(rem))
-                        .child(self.terminal.clone()),
-                )
-                .into_any_element()
+            if self.terminal_maximized {
+                // Maximized panel: terminal dominates; editor keeps a thin strip.
+                let editor_h = rems(6.).to_pixels(rem);
+                v_resizable("center-with-terminal-max")
+                    .child(
+                        resizable_panel()
+                            .size(editor_h)
+                            .size_range(rems(4.).to_pixels(rem)..rems(16.).to_pixels(rem))
+                            .child(body),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size_range(rems(12.).to_pixels(rem)..Pixels::MAX)
+                            .child(self.terminal.clone()),
+                    )
+                    .into_any_element()
+            } else {
+                let term_h = rems(12.).to_pixels(rem);
+                v_resizable("center-with-terminal")
+                    .child(
+                        resizable_panel()
+                            .size_range(rems(12.).to_pixels(rem)..Pixels::MAX)
+                            .child(body),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(term_h)
+                            .size_range(rems(6.).to_pixels(rem)..rems(28.).to_pixels(rem))
+                            .child(self.terminal.clone()),
+                    )
+                    .into_any_element()
+            }
         } else {
             body.into_any_element()
         }
