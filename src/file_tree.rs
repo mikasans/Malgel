@@ -15,8 +15,8 @@ use std::{
 
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
-    MouseDownEvent, MouseUpEvent, ParentElement as _, Render, SharedString,
+    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, Modifiers,
+    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle,
     Window,
     assets::IconName,
@@ -665,12 +665,7 @@ impl FileTree {
         cx.notify();
     }
 
-    fn commit_inline_rename(
-        &mut self,
-        name: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn commit_inline_rename(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.renaming.clone() else {
             return;
         };
@@ -1353,30 +1348,28 @@ impl FileTree {
                                 }),
                         )
                         .child(Icon::new(icon).small().text_color(muted).flex_none())
-                        .child(
-                            if renaming_path.as_ref() == Some(&entry.path) {
-                                if let Some(input) = rename_input.clone() {
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .on_action(cx.listener(|this, _: &Escape, _, cx| {
-                                            this.cancel_inline_rename(cx);
-                                        }))
-                                        .child(Input::new(&input).appearance(false))
-                                        .into_any_element()
-                                } else {
-                                    div()
-                                        .truncate()
-                                        .child(SharedString::from(entry.name.clone()))
-                                        .into_any_element()
-                                }
+                        .child(if renaming_path.as_ref() == Some(&entry.path) {
+                            if let Some(input) = rename_input.clone() {
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .on_action(cx.listener(|this, _: &Escape, _, cx| {
+                                        this.cancel_inline_rename(cx);
+                                    }))
+                                    .child(Input::new(&input).appearance(false))
+                                    .into_any_element()
                             } else {
                                 div()
                                     .truncate()
                                     .child(SharedString::from(entry.name.clone()))
                                     .into_any_element()
-                            },
-                        )
+                            }
+                        } else {
+                            div()
+                                .truncate()
+                                .child(SharedString::from(entry.name.clone()))
+                                .into_any_element()
+                        })
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {

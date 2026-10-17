@@ -5,16 +5,20 @@
 //! can bind those accelerators globally.
 
 use gpui_kit::{
-    App, AppContext as _, ClickEvent, Context, DismissEvent, Entity, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, KeyBinding, MouseButton, OwnedMenu,
-    OwnedMenuItem, ParentElement, Render, Role, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, anchored, deferred, div, prelude::FluentBuilder, px,
+    App, AppContext as _, ClickEvent, Context, DismissEvent, Entity, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, KeyBinding, MouseButton, OwnedMenu, OwnedMenuItem,
+    ParentElement, Render, Role, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    Window, anchored,
     base::actions::{Cancel, SelectLeft, SelectRight},
     component::{
-        GlobalState, InteractiveElementExt as _, Selectable, Sizable, h_flex,
+        GlobalState, InteractiveElementExt as _, Selectable, Sizable,
         button::{Button, ButtonVariants},
+        h_flex,
         menu::{PopupMenu, PopupMenuItem},
     },
+    deferred, div,
+    prelude::FluentBuilder,
+    px,
 };
 
 const CONTEXT: &str = "MalgelTitleMenuBar";

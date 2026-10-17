@@ -1960,9 +1960,10 @@ impl Workspace {
         self.open_paths(vec![path], Placement::Default, window, cx);
     }
 
-
     fn active_terminal(&self) -> &Entity<TerminalPanel> {
-        &self.terminals[self.terminal_active.min(self.terminals.len().saturating_sub(1))]
+        &self.terminals[self
+            .terminal_active
+            .min(self.terminals.len().saturating_sub(1))]
     }
 
     fn ensure_terminal_visible(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1990,7 +1991,6 @@ impl Workspace {
         cx.notify();
     }
 
-
     fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
         let term = cx.new(|cx| TerminalPanel::new(window, cx));
         self.terminals.push(term);
@@ -2016,7 +2016,8 @@ impl Workspace {
             }
         }
         if self.terminal_visible {
-            self.active_terminal().update(cx, |term, cx| term.focus_input(window, cx));
+            self.active_terminal()
+                .update(cx, |term, cx| term.focus_input(window, cx));
         }
         cx.notify();
     }
@@ -2105,9 +2106,7 @@ impl Workspace {
                             window.close_dialog(cx);
                             if let Some((_, line)) = jump_rows.get(index.row) {
                                 let line = *line;
-                                confirm_doc.update(cx, |doc, cx| {
-                                    doc.go_to_line(line, window, cx)
-                                });
+                                confirm_doc.update(cx, |doc, cx| doc.go_to_line(line, window, cx));
                             }
                         }
                     })
@@ -2187,12 +2186,7 @@ impl Workspace {
         );
     }
 
-    fn show_extensions(
-        &mut self,
-        _: &ShowExtensions,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn show_extensions(&mut self, _: &ShowExtensions, window: &mut Window, cx: &mut Context<Self>) {
         window.push_notification(
             Notification::info("Extensions are not available yet — on the roadmap."),
             cx,
@@ -6512,10 +6506,7 @@ impl Render for Workspace {
                 )
             }))
             .on_action(cx.listener(|this, _: &ToggleMinimap, _, cx| {
-                this.toggle(
-                    |settings| settings.minimap = !settings.minimap,
-                    cx,
-                )
+                this.toggle(|settings| settings.minimap = !settings.minimap, cx)
             }))
             .on_action(cx.listener(|this, action: &OpenAppMenu, window, cx| {
                 this.app_menu_bar.update(cx, |bar, cx| {
@@ -6875,17 +6866,17 @@ impl Workspace {
                                             .flex_none(),
                                     )
                                     .child(
-                                        div()
-                                            .min_w_0()
-                                            .child(problem.message.clone())
-                                            .when_some(line, |this, line| {
+                                        div().min_w_0().child(problem.message.clone()).when_some(
+                                            line,
+                                            |this, line| {
                                                 this.child(
                                                     div()
                                                         .text_xs()
                                                         .text_color(theme.muted_foreground)
                                                         .child(format!("Line {line}")),
                                                 )
-                                            }),
+                                            },
+                                        ),
                                     ),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -6899,17 +6890,32 @@ impl Workspace {
             )
     }
 
-
     fn render_terminal_area(&self, _cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         if self.terminal_split && self.terminals.len() >= 2 {
             let a = self.terminal_active.min(self.terminals.len() - 1);
-            let b = if a + 1 < self.terminals.len() { a + 1 } else { a.saturating_sub(1) };
+            let b = if a + 1 < self.terminals.len() {
+                a + 1
+            } else {
+                a.saturating_sub(1)
+            };
             h_flex()
                 .id("terminal-split")
                 .size_full()
                 .gap_px()
-                .child(div().flex_1().min_w_0().size_full().child(self.terminals[a].clone()))
-                .child(div().flex_1().min_w_0().size_full().child(self.terminals[b].clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .size_full()
+                        .child(self.terminals[a].clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .size_full()
+                        .child(self.terminals[b].clone()),
+                )
                 .into_any_element()
         } else {
             self.active_terminal().clone().into_any_element()

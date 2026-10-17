@@ -2923,7 +2923,14 @@ impl DocumentView {
             .id("editor-with-minimap")
             .size_full()
             .min_w_0()
-            .child(div().flex_1().min_w_0().min_h_0().size_full().child(editor_pane))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .size_full()
+                    .child(editor_pane),
+            )
             .child(self.render_minimap(cx))
             .into_any_element()
     }
@@ -2965,18 +2972,23 @@ impl DocumentView {
             .bg(theme.sidebar.opacity(0.6))
             .py_1()
             .overflow_hidden()
-            .children(slots_data.into_iter().enumerate().map(|(slot, (jump_line, alpha))| {
-                div()
-                    .id(("minimap-slot", slot))
-                    .flex_1()
-                    .mx_1()
-                    .rounded(px(1.))
-                    .bg(theme.foreground.opacity(alpha))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.go_to_line(jump_line, window, cx);
-                    }))
-            }))
+            .children(
+                slots_data
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, (jump_line, alpha))| {
+                        div()
+                            .id(("minimap-slot", slot))
+                            .flex_1()
+                            .mx_1()
+                            .rounded(px(1.))
+                            .bg(theme.foreground.opacity(alpha))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.go_to_line(jump_line, window, cx);
+                            }))
+                    }),
+            )
     }
 
     /// Find's other matches: the editor paints them as a faint, desaturated
