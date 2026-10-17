@@ -5574,6 +5574,12 @@ impl Render for Workspace {
                     doc.move_lines(format::LineMove::Down, window, cx)
                 })
             }))
+            .on_action(cx.listener(|this, _: &Fold, window, cx| {
+                this.with_active(window, cx, |doc, _window, cx| doc.fold_at_cursor(cx))
+            }))
+            .on_action(cx.listener(|this, _: &Unfold, window, cx| {
+                this.with_active(window, cx, |doc, _window, cx| doc.unfold_at_cursor(cx))
+            }))
             .on_action(cx.listener(|this, _: &TogglePdfThumbnails, window, cx| {
                 this.with_active(window, cx, |doc, _window, cx| doc.toggle_pdf_thumbnails(cx))
             }))

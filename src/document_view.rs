@@ -1065,6 +1065,11 @@ impl DocumentView {
     // Line numbers
 
     /// Whether `position` is over the line numbers (not the fold arrows).
+    ///
+    /// The fold column sits immediately to the right of the digit run (gpui
+    /// reserves ~18px for chevrons after a 6px margin). Ending the hit test
+    /// at the last digit keeps chevron clicks out of whole-line selection so
+    /// the editor's fold toggle can run.
     fn in_line_numbers(
         &self,
         position: gpui_kit::Point<Pixels>,
@@ -1090,12 +1095,88 @@ impl DocumentView {
             .map(|size| size.width)
             .unwrap_or(font_size * 0.6);
         let digits = line_number_digits(editor.text().lines_len());
-        let right = bounds.origin.x + digit * digits as f32 + px(6.);
+        // Digits only — leave the margin and fold column for chevron hits.
+        let right = bounds.origin.x + digit * digits as f32;
         let left = bounds.origin.x - px(EDITOR_EDGE) - px(1.);
         position.x >= left
             && position.x < right
             && position.y >= bounds.origin.y
             && position.y < bounds.origin.y + bounds.size.height
+    }
+
+    /// Whether `position` is over the fold chevron column (right of the digits).
+    fn in_fold_column(&self, position: gpui_kit::Point<Pixels>, window: &Window, cx: &App) -> bool {
+        if !shows_folding(AppSettings::get(cx).focus_mode) {
+            return false;
+        }
+        let editor = self.editor.read(cx);
+        let bounds = editor.input_bounds();
+        if bounds.size.width <= px(0.) {
+            return false;
+        }
+        let font_size = rems(0.875).to_pixels(window.rem_size());
+        let font = gpui_kit::font(cx.theme().mono_font_family.clone());
+        let system = window.text_system();
+        let digit = system
+            .advance(system.resolve_font(&font), font_size, '+')
+            .map(|size| size.width)
+            .unwrap_or(font_size * 0.6);
+        let digits = line_number_digits(editor.text().lines_len());
+        // Match gpui-base: digits, then 6px margin, then ~18px fold hitbox.
+        let left = bounds.origin.x + digit * digits as f32;
+        let right = left + px(6.) + px(18.);
+        position.x >= left
+            && position.x < right
+            && position.y >= bounds.origin.y
+            && position.y < bounds.origin.y + bounds.size.height
+    }
+
+    /// Fold at the caret (VS Code Fold).
+    pub fn fold_at_cursor(&mut self, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            let position = editor.cursor_position();
+            editor.fold_at(position, cx);
+        });
+    }
+
+    /// Unfold at the caret (VS Code Unfold).
+    pub fn unfold_at_cursor(&mut self, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            let position = editor.cursor_position();
+            editor.unfold_line_at(position, cx);
+        });
+    }
+
+    /// Toggle the fold candidate for the buffer line under `position`.
+    fn toggle_fold_at_point(
+        &mut self,
+        position: gpui_kit::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.editor.update(cx, |editor, cx| {
+            // Resolve the line via the editor's own hit test (wrap / scroll).
+            let (offset, _, _) = editor.resolve_mouse_position(position);
+            let line = editor.text().offset_to_point(offset).row;
+            // Prefer a candidate that starts on this display line; else the
+            // innermost covering candidate (same rule as fold_at).
+            let start = editor
+                .fold_candidates()
+                .iter()
+                .find(|c| c.start_line == line)
+                .map(|c| c.start_line)
+                .or_else(|| {
+                    editor
+                        .fold_candidates()
+                        .iter()
+                        .filter(|c| line > c.start_line && line < c.end_line)
+                        .max_by_key(|c| c.start_line)
+                        .map(|c| c.start_line)
+                });
+            let Some(start_line) = start else {
+                return false;
+            };
+            editor.toggle_fold(start_line, cx)
+        })
     }
 
     /// After the editor placed the caret for a press on the line numbers,
@@ -2569,9 +2650,20 @@ impl DocumentView {
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.gutter_anchor = None;
                 this.gutter_press = None;
-                if event.button != MouseButton::Left
-                    || !this.in_line_numbers(event.position, window, cx)
-                {
+                if event.button != MouseButton::Left {
+                    return;
+                }
+                // Fold chevrons sit beside the digits; handle them before
+                // whole-line selection so a chevron click toggles instead of
+                // selecting the heading line.
+                if this.in_fold_column(event.position, window, cx) {
+                    if this.toggle_fold_at_point(event.position, cx) {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                    }
+                    return;
+                }
+                if !this.in_line_numbers(event.position, window, cx) {
                     return;
                 }
                 // Let the editor hit-test the press (it knows soft-wrap rows,

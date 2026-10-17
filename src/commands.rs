@@ -78,6 +78,8 @@ pub fn palette(groups: &[CommandGroupSpec]) -> Vec<CommandGroup> {
 fn keywords(label: &'static str) -> Vec<&'static str> {
     match label {
         "Color theme…" => vec![label, "theme", "colour theme", "preferences color theme"],
+        "Fold" => vec![label, "fold region", "collapse"],
+        "Unfold" => vec![label, "unfold region", "expand fold"],
         _ => vec![label],
     }
 }
@@ -197,6 +199,8 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Focus mode", IconName::Maximize2, ToggleFocusMode),
             cmd("Toggle word wrap", IconName::TextWrap, ToggleSoftWrap),
             cmd("Line numbers", IconName::ListOrdered, ToggleLineNumbers),
+            cmd("Fold", IconName::ChevronDown, Fold),
+            cmd("Unfold", IconName::ChevronRight, Unfold),
             cmd("Sync scrolling", IconName::ArrowLeftRight, ToggleScrollSync),
             cmd("Check spelling", IconName::SpellCheck, ToggleSpellCheck),
             cmd("Restore session", IconName::Clock, ToggleRestoreSession),

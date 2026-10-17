@@ -2794,8 +2794,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64bb52b29a8dcdc8d3f595b8b0839c076f237572ab601ba4577d3da8ae085728"
+source = "git+https://github.com/mikasans/gpui-kit?branch=malgel-fold-0.7.0#c2e3e472f4f0b0bd70f547e52e43c1d8423d6331"
 dependencies = [
  "aho-corasick",
  "anyhow",
