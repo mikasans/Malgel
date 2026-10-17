@@ -2481,13 +2481,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((path, is_dir)) = self.file_tree.read(cx).single_selection() else {
-            return;
-        };
-        if is_dir || !path.is_file() {
+        // Explorer selection first; palette / tab context falls back to active doc.
+        let path = self
+            .file_tree
+            .read(cx)
+            .single_selection()
+            .and_then(|(p, is_dir)| {
+                if !is_dir && p.is_file() {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self.active_document()
+                    .read(cx)
+                    .path()
+                    .filter(|p| p.is_file())
+                    .cloned()
+            });
+        let Some(path) = path else {
             window.push_notification(Notification::info("Select a file to compare."), cx);
             return;
-        }
+        };
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -2515,13 +2531,28 @@ impl Workspace {
             );
             return;
         };
-        let Some((right, is_dir)) = self.file_tree.read(cx).single_selection() else {
-            return;
-        };
-        if is_dir || !right.is_file() {
+        let right = self
+            .file_tree
+            .read(cx)
+            .single_selection()
+            .and_then(|(p, is_dir)| {
+                if !is_dir && p.is_file() {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self.active_document()
+                    .read(cx)
+                    .path()
+                    .filter(|p| p.is_file())
+                    .cloned()
+            });
+        let Some(right) = right else {
             window.push_notification(Notification::info("Select a file to compare."), cx);
             return;
-        }
+        };
         if left == right {
             window.push_notification(Notification::info("Pick a different file to compare."), cx);
             return;
@@ -4792,6 +4823,8 @@ impl Workspace {
     /// Land a dropped tab: a move, or with the invert key held a copy
     /// (duplicate) at the insertion point, as in VS Code.
     fn finish_tab_drop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Edge-split preview is for the editor body; a tab-bar land cancels it.
+        self.tab_split_preview = None;
         let Some(insertion) = self.tab_insertion.take() else {
             return;
         };
@@ -5095,24 +5128,35 @@ impl Workspace {
                 // The rows depend on the query when it is a path, so the
                 // dialog is drawn again as it changes.
                 .on_query(|_, window, _| window.refresh())
-                .on_confirm(move |index: IndexPath, window, cx| {
-                    let Some(row) = picked
-                        .get(index.section)
-                        .and_then(|rows| rows.get(index.row))
-                        .cloned()
-                    else {
-                        return;
-                    };
-                    if row.is_dir {
-                        // Into the folder, as VS Code's picker does.
-                        let mut typed = row.label.clone();
-                        typed.push('/');
-                        navigate.update(cx, |state, cx| state.set_query(typed, window, cx));
-                        window.refresh();
-                        return;
+                .on_confirm({
+                    let restore = restore.clone();
+                    move |index: IndexPath, window, cx| {
+                        let Some(row) = picked
+                            .get(index.section)
+                            .and_then(|rows| rows.get(index.row))
+                            .cloned()
+                        else {
+                            return;
+                        };
+                        if row.is_dir {
+                            // Into the folder, as VS Code's picker does.
+                            let mut typed = row.label.clone();
+                            typed.push('/');
+                            navigate.update(cx, |state, cx| state.set_query(typed, window, cx));
+                            window.refresh();
+                            return;
+                        }
+                        window.close_dialog(cx);
+                        // Probe #14: after Terminal was focused, dispatch_action can miss
+                        // the workspace and leave Untitled — call open_quick_path directly.
+                        let path = row.path.clone();
+                        let line = row.line;
+                        if let Some(this) = restore.upgrade() {
+                            this.update(cx, |this, cx| {
+                                this.open_quick_path(&OpenQuickPath(path, line), window, cx);
+                            });
+                        }
                     }
-                    window.close_dialog(cx);
-                    window.dispatch_action(Box::new(OpenQuickPath(row.path, row.line)), cx);
                 })
                 .on_cancel(|window, cx| window.close_dialog(cx));
             let restore = restore.clone();
@@ -5523,6 +5567,41 @@ impl Workspace {
         self.editor_split = Some(EditorSplit { other, vertical });
         // Editor split is independent of Markdown edit|preview layout.
         AppSettings::update(cx, |settings| settings.focus_mode = false);
+        self.tab_split_preview = None;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Probe #14: land a dragged tab as a real second editor group (move, not
+    /// clone). Primary keeps a *different* document; empty groups collapse on close.
+    fn move_tab_into_split(
+        &mut self,
+        dragged: usize,
+        vertical: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.documents.len() < 2 {
+            // Only one tab — still open a mirrored split (VS Code does).
+            self.open_editor_split(vertical, window, cx);
+            return;
+        }
+        let dragged = dragged.min(self.documents.len().saturating_sub(1));
+        let primary = if self.active != dragged {
+            self.active
+        } else {
+            (0..self.documents.len())
+                .find(|&i| i != dragged)
+                .unwrap_or(dragged)
+        };
+        self.active = primary;
+        self.editor_split = Some(EditorSplit {
+            other: dragged,
+            vertical,
+        });
+        AppSettings::update(cx, |settings| settings.focus_mode = false);
+        self.tab_insertion = None;
+        self.tab_split_preview = None;
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -5738,6 +5817,19 @@ impl Workspace {
                                 // Direct call — do not rely on action dispatch
                                 // from a focused preview pane (see focus_active).
                                 this.set_layout(&SetLayout(layout), window, cx);
+                            })),
+                    )
+                    .child(
+                        // Probe #14: editor-group split (not MD edit|preview Columns2).
+                        Button::new("split-editor-right")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .icon(Icon::new(IconName::PanelRightOpen))
+                            .tooltip("Split Editor Right (Ctrl+\\)")
+                            .selected(self.editor_split.is_some_and(|s| !s.vertical))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.split_editor_right(&SplitEditorRight, window, cx);
                             })),
                     )
                     .child(
@@ -6111,7 +6203,118 @@ impl Workspace {
                                                 Some(path) => {
                                                     let text = path.display().to_string();
                                                     let reveal = path.clone();
+                                                    let ws_sel = ws.clone();
+                                                    let ws_cmp = ws.clone();
+                                                    let sel_path = path.clone();
+                                                    let cmp_path = path.clone();
                                                     menu.item(
+                                                        PopupMenuItem::new("Select for Compare")
+                                                            .on_click(move |_, window, cx| {
+                                                                _ = ws_sel.update(cx, |this, cx| {
+                                                                    this.compare_selection =
+                                                                        Some(sel_path.clone());
+                                                                    let name = sel_path
+                                                                        .file_name()
+                                                                        .map(|n| {
+                                                                            n.to_string_lossy()
+                                                                                .into_owned()
+                                                                        })
+                                                                        .unwrap_or_else(|| {
+                                                                            sel_path
+                                                                                .display()
+                                                                                .to_string()
+                                                                        });
+                                                                    window.push_notification(
+                                                                        Notification::info(format!(
+                                                                            "Selected {name} for compare. Right-click another file → Compare with Selected."
+                                                                        )),
+                                                                        cx,
+                                                                    );
+                                                                    cx.notify();
+                                                                });
+                                                            }),
+                                                    )
+                                                    .item(
+                                                        PopupMenuItem::new("Compare with Selected")
+                                                            .on_click(move |_, window, cx| {
+                                                                _ = ws_cmp.update(cx, |this, cx| {
+                                                                    // Use this tab as the right side.
+                                                                    let right = cmp_path.clone();
+                                                                    let Some(left) =
+                                                                        this.compare_selection.clone()
+                                                                    else {
+                                                                        window.push_notification(
+                                                                            Notification::info(
+                                                                                "Select for Compare on a file first.",
+                                                                            ),
+                                                                            cx,
+                                                                        );
+                                                                        return;
+                                                                    };
+                                                                    if left == right {
+                                                                        window.push_notification(
+                                                                            Notification::info(
+                                                                                "Pick a different file to compare.",
+                                                                            ),
+                                                                            cx,
+                                                                        );
+                                                                        return;
+                                                                    }
+                                                                    let Ok(left_text) =
+                                                                        std::fs::read_to_string(&left)
+                                                                    else {
+                                                                        window.push_notification(
+                                                                            Notification::info(
+                                                                                "Couldn’t read the first file.",
+                                                                            ),
+                                                                            cx,
+                                                                        );
+                                                                        return;
+                                                                    };
+                                                                    let Ok(right_text) =
+                                                                        std::fs::read_to_string(&right)
+                                                                    else {
+                                                                        window.push_notification(
+                                                                            Notification::info(
+                                                                                "Couldn’t read the second file.",
+                                                                            ),
+                                                                            cx,
+                                                                        );
+                                                                        return;
+                                                                    };
+                                                                    let left_name = left
+                                                                        .file_name()
+                                                                        .map(|n| {
+                                                                            n.to_string_lossy()
+                                                                                .into_owned()
+                                                                        })
+                                                                        .unwrap_or_else(|| {
+                                                                            "left".into()
+                                                                        });
+                                                                    let right_name = right
+                                                                        .file_name()
+                                                                        .map(|n| {
+                                                                            n.to_string_lossy()
+                                                                                .into_owned()
+                                                                        })
+                                                                        .unwrap_or_else(|| {
+                                                                            "right".into()
+                                                                        });
+                                                                    this.open_diff_session(
+                                                                        format!(
+                                                                            "Compare: {left_name} ↔ {right_name}"
+                                                                        ),
+                                                                        left_name,
+                                                                        right_name,
+                                                                        left_text,
+                                                                        right_text,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }),
+                                                    )
+                                                    .item(
                                                         PopupMenuItem::new("Copy Path").on_click(
                                                             move |_, _, cx| {
                                                                 cx.write_to_clipboard(
@@ -7344,31 +7547,12 @@ impl Workspace {
 
         let drop_listener = cx.listener(|this, drag: &TabDrag, window, cx| {
             let ix = drag.index.min(this.documents.len().saturating_sub(1));
-            // Probe #12: drop on edge preview creates/moves a split group.
+            // Probe #14: edge preview → real second editor group (move, not MD preview).
             if let Some(vertical) = this.tab_split_preview.take() {
-                // Probe #13: move the dragged tab into the new group; keep a
-                // *different* document in the primary pane (no duplicate/orphan).
-                let dragged = ix.min(this.documents.len().saturating_sub(1));
-                let primary = if this.active != dragged {
-                    this.active
-                } else {
-                    (0..this.documents.len())
-                        .find(|&i| i != dragged)
-                        .unwrap_or(dragged)
-                };
-                this.active = primary;
-                this.editor_split = Some(EditorSplit {
-                    other: dragged,
-                    vertical,
-                });
-                AppSettings::update(cx, |settings| settings.focus_mode = false);
-                this.tab_insertion = None;
-                this.focus_active(window, cx);
-                cx.notify();
+                this.move_tab_into_split(ix, vertical, window, cx);
                 return;
             }
-            // Dropping a tab onto the right/bottom half of a split group opens
-            // that tab in the secondary pane; otherwise activate + edit|preview.
+            // Dropping a tab onto an existing split shows it in the secondary pane.
             if this.editor_split.is_some() {
                 this.editor_split = Some(EditorSplit {
                     other: ix,
@@ -7378,11 +7562,8 @@ impl Workspace {
                 cx.notify();
                 return;
             }
+            // Center drop: activate only — do not flip Layout::Split (MD preview).
             this.activate(ix, window, cx);
-            AppSettings::update(cx, |settings| {
-                settings.layout = Layout::Split;
-                settings.focus_mode = false;
-            });
             this.tab_insertion = None;
             cx.notify();
         });
@@ -7401,6 +7582,7 @@ impl Workspace {
                 h_flex()
                     .id("editor-split-horizontal")
                     .size_full()
+                    .items_stretch()
                     .child(stack(active, "doc-stack-primary"))
                     .child(div().w(px(1.)).h_full().bg(cx.theme().border).flex_none())
                     .child(stack(other, "doc-stack-secondary"))
@@ -7419,13 +7601,23 @@ impl Workspace {
             let preview = self.tab_split_preview;
             let ws_right = cx.weak_entity();
             let ws_down = cx.weak_entity();
+            // Probe #14: edge strips must accept the drop themselves — GPUI does
+            // not bubble TabDrag drops from a child without on_drop up to the
+            // document-stack parent (D0≡D1 / no second group).
+            let drop_right = cx.listener(|this, drag: &TabDrag, window, cx| {
+                this.tab_split_preview = Some(false);
+                this.move_tab_into_split(drag.index, false, window, cx);
+            });
+            let drop_down = cx.listener(|this, drag: &TabDrag, window, cx| {
+                this.tab_split_preview = Some(true);
+                this.move_tab_into_split(drag.index, true, window, cx);
+            });
             div()
                 .id("document-stack")
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
                 .relative()
-                // Edge strips set tab_split_preview; drop creates Split Right/Down.
                 .on_drop(drop_listener)
                 .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
                 .children(self.documents.iter().enumerate().map(|(ix, doc)| {
@@ -7444,10 +7636,11 @@ impl Workspace {
                         .top_0()
                         .right_0()
                         .bottom_0()
-                        .w(px(28.))
+                        .w(px(40.))
                         .when(preview == Some(false), |this| {
                             this.bg(cx.theme().drop_target)
                         })
+                        .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
                         .on_drag_move::<TabDrag>(move |_: &DragMoveEvent<TabDrag>, _, cx| {
                             _ = ws_right.update(cx, |this, cx| {
                                 if this.tab_split_preview != Some(false) {
@@ -7455,7 +7648,8 @@ impl Workspace {
                                     cx.notify();
                                 }
                             });
-                        }),
+                        })
+                        .on_drop(drop_right),
                 )
                 .child(
                     div()
@@ -7464,10 +7658,11 @@ impl Workspace {
                         .left_0()
                         .right_0()
                         .bottom_0()
-                        .h(px(28.))
+                        .h(px(40.))
                         .when(preview == Some(true), |this| {
                             this.bg(cx.theme().drop_target)
                         })
+                        .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
                         .on_drag_move::<TabDrag>(move |_: &DragMoveEvent<TabDrag>, _, cx| {
                             _ = ws_down.update(cx, |this, cx| {
                                 if this.tab_split_preview != Some(true) {
@@ -7475,7 +7670,8 @@ impl Workspace {
                                     cx.notify();
                                 }
                             });
-                        }),
+                        })
+                        .on_drop(drop_down),
                 )
                 .into_any_element()
         }
@@ -7911,44 +8107,28 @@ impl Workspace {
         let hunk = session.hunks.get(current);
         let left_lines = crate::diff::lines(&session.left);
         let right_lines = crate::diff::lines(&session.right);
-        let pane_lines =
-            |hunk: Option<&crate::diff::Hunk>, lines: &[&str], side_left: bool| -> Vec<String> {
-                let Some(h) = hunk else {
-                    return vec!["(no hunk)".into()];
-                };
-                let (start0, count) = if side_left {
-                    (h.left_start, h.left_count)
-                } else {
-                    (h.right_start, h.right_count)
-                };
-                let start = start0.saturating_sub(2);
-                let end = (start0 + count.max(1) + 2).min(lines.len());
-                if start >= end {
-                    // Pure insert/delete on this side — still show context.
-                    let fallback = start0.min(lines.len().saturating_sub(1));
-                    if lines.is_empty() {
-                        return vec!["(empty)".into()];
-                    }
-                    return vec![format!("{:>4} │ {}", fallback + 1, lines[fallback])];
-                }
-                lines[start..end]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| format!("{:>4} │ {}", start + i + 1, line))
-                    .collect()
-            };
-        let left_view = pane_lines(hunk, &left_lines, true);
-        let right_view = pane_lines(hunk, &right_lines, false);
+        // Probe #14: h_flex() centers on the cross axis by default, so panes
+        // collapsed to label height and floated mid-screen (blank body). Stretch
+        // + h_full so each pane resolves flex_1 scroll height against the row.
+        let left_view = match hunk {
+            Some(h) => crate::diff::pane_view(h, &left_lines, true),
+            None => vec!["(no hunk)".into()],
+        };
+        let right_view = match hunk {
+            Some(h) => crate::diff::pane_view(h, &right_lines, false),
+            None => vec!["(no hunk)".into()],
+        };
         let workspace = cx.weak_entity();
         let render_pane = |id: &'static str, label: String, lines: Vec<String>, border_r: bool| {
             let theme = cx.theme();
-            let mut pane = v_flex().flex_1().min_w_0().min_h_0();
+            let mut pane = v_flex().id(format!("{id}-pane")).flex_1().h_full().min_w_0().min_h_0();
             if border_r {
                 pane = pane.border_r_1().border_color(theme.border);
             }
             pane.child(
                 div()
                     .flex_none()
+                    .w_full()
                     .px_3()
                     .py_1()
                     .text_xs()
@@ -7958,20 +8138,24 @@ impl Workspace {
                     .child(label),
             )
             .child(
-                v_flex()
+                // Use div (not nested v_flex) so overflow_y_scrollbar gets a
+                // definite flex_1 height from the stretched pane.
+                div()
                     .id(id)
                     .flex_1()
                     .min_h_0()
+                    .w_full()
                     .p_2()
-                    .gap_0p5()
                     .font_family(theme.mono_font_family.clone())
                     .text_xs()
                     .text_color(theme.foreground)
+                    .bg(theme.background)
                     .overflow_y_scrollbar()
                     .children(lines.into_iter().enumerate().map(|(i, line)| {
                         div()
                             .id((id, i))
                             .flex_none()
+                            .w_full()
                             .whitespace_nowrap()
                             .child(line)
                     })),
@@ -8035,8 +8219,11 @@ impl Workspace {
             )
             .child(
                 h_flex()
+                    .id("diff-panes")
                     .flex_1()
                     .min_h_0()
+                    .w_full()
+                    .items_stretch()
                     .child(render_pane(
                         "diff-left",
                         session.left_label.clone(),

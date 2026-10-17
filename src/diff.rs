@@ -178,6 +178,32 @@ fn collapse_hunks(ops: &[Op]) -> Vec<Hunk> {
     hunks
 }
 
+
+/// Format the visible lines for one side of a hunk (with ±2 lines of context).
+/// Always returns at least one row when `lines` is non-empty or the hunk exists,
+/// so Compare panes never paint an empty body when hunk count ≥ 1.
+pub fn pane_view(hunk: &Hunk, lines: &[&str], side_left: bool) -> Vec<String> {
+    let (start0, count) = if side_left {
+        (hunk.left_start, hunk.left_count)
+    } else {
+        (hunk.right_start, hunk.right_count)
+    };
+    let start = start0.saturating_sub(2);
+    let end = (start0 + count.max(1) + 2).min(lines.len());
+    if start >= end {
+        let fallback = start0.min(lines.len().saturating_sub(1));
+        if lines.is_empty() {
+            return vec!["(empty)".into()];
+        }
+        return vec![format!("{:>4} │ {}", fallback + 1, lines[fallback])];
+    }
+    lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:>4} │ {}", start + i + 1, line))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,4 +244,34 @@ mod tests {
         assert_eq!(h[0].left_count, 1);
         assert_eq!(h[0].right_count, 0);
     }
+
+    #[test]
+    fn pane_view_nonempty_when_hunk_present() {
+        let left = "file a\nPROBE-A\n";
+        let right = "file b\nPROBE-B\n";
+        let h = hunks(left, right);
+        assert!(!h.is_empty());
+        let left_lines = lines(left);
+        let right_lines = lines(right);
+        let lv = pane_view(&h[0], &left_lines, true);
+        let rv = pane_view(&h[0], &right_lines, false);
+        assert!(!lv.is_empty(), "left pane lines must be non-empty");
+        assert!(!rv.is_empty(), "right pane lines must be non-empty");
+        assert!(lv.iter().any(|l| l.contains("file a") || l.contains("PROBE-A")));
+        assert!(rv.iter().any(|l| l.contains("file b") || l.contains("PROBE-B")));
+    }
+
+    #[test]
+    fn pane_view_pure_insert_still_shows_context() {
+        let h = hunks("a\n", "a\nb\n");
+        assert_eq!(h.len(), 1);
+        let left_lines = lines("a\n");
+        let right_lines = lines("a\nb\n");
+        let lv = pane_view(&h[0], &left_lines, true);
+        let rv = pane_view(&h[0], &right_lines, false);
+        assert!(!lv.is_empty());
+        assert!(rv.iter().any(|l| l.contains('b') || l.contains("a")));
+    }
+
 }
+

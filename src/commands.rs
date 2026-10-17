@@ -194,6 +194,19 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
             "compare with saved",
             "diff with saved",
         ],
+        "Select for Compare" => vec![
+            label,
+            "select for compare",
+            "compare select",
+            "diff select",
+        ],
+        "Compare with Selected" => vec![
+            label,
+            "compare with selected",
+            "compare selected",
+            "diff with selected",
+            "compare",
+        ],
         "Source Control" => vec![label, "git", "scm", "source control", "version control"],
         "Extensions" => vec![label, "extensions", "extension", "plugins", "marketplace"],
         "Pin Tab" => vec![label, "pin", "unpin", "pin tab", "unpin tab", "pin editor"],
@@ -328,6 +341,8 @@ pub fn groups() -> Vec<CommandGroupSpec> {
                 IconName::FolderOpen,
                 RevealPathInTree,
             ),
+            cmd("Select for Compare", IconName::Copy, SelectForCompare),
+            cmd("Compare with Selected", IconName::Copy, CompareWithSelected),
         ],
     );
 
@@ -694,5 +709,18 @@ mod tests {
         );
         let label = "Outline";
         assert!(label.to_lowercase().contains("outline"));
+    }
+
+    #[test]
+    fn palette_probe14_compare_select() {
+        let groups = groups();
+        let labels: Vec<_> = groups
+            .iter()
+            .flat_map(|g| g.items.iter().map(|i| i.label))
+            .collect();
+        assert!(labels.contains(&"Select for Compare"));
+        assert!(labels.contains(&"Compare with Selected"));
+        assert!(keywords("Select for Compare").contains(&"select for compare"));
+        assert!(keywords("Compare with Selected").contains(&"compare with selected"));
     }
 }
