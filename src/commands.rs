@@ -205,7 +205,7 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Check spelling", IconName::SpellCheck, ToggleSpellCheck),
             cmd("Restore session", IconName::Clock, ToggleRestoreSession),
             cmd("Toggle light and dark", IconName::Moon, ToggleAppearance),
-            cmd("Open terminal", IconName::Terminal, SummonTerminal),
+            cmd("Toggle Terminal", IconName::Terminal, SummonTerminal),
             cmd("Zoom in", IconName::ZoomIn, ZoomIn),
             cmd("Zoom out", IconName::ZoomOut, ZoomOut),
             cmd("Actual size", IconName::ScanText, ZoomReset),

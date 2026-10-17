@@ -33,6 +33,7 @@ mod settings;
 mod single_instance;
 mod smart_edit;
 mod spell;
+mod terminal;
 mod themes;
 mod typst_live;
 mod typst_preview;

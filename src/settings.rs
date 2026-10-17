@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 const RECENT_LIMIT: usize = 10;
-pub const DEFAULT_FONT_SIZE: f32 = 16.;
+pub const DEFAULT_FONT_SIZE: f32 = 17.5;
 pub const MIN_FONT_SIZE: f32 = 12.;
 pub const MAX_FONT_SIZE: f32 = 24.;
 
