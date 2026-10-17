@@ -16,6 +16,7 @@ actions!(
         NewFile,
         Open,
         OpenFolder,
+        CloseFolder,
         OpenRecentPicker,
         SummonTerminal,
         KillTerminal,

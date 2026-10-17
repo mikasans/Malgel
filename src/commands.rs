@@ -194,12 +194,7 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
             "compare with saved",
             "diff with saved",
         ],
-        "Select for Compare" => vec![
-            label,
-            "select for compare",
-            "compare select",
-            "diff select",
-        ],
+        "Select for Compare" => vec![label, "select for compare", "compare select", "diff select"],
         "Compare with Selected" => vec![
             label,
             "compare with selected",
@@ -292,6 +287,7 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("New file", IconName::FilePlus, NewFile),
             cmd("Open file…", IconName::FolderOpen, Open),
             cmd("Open folder…", IconName::FolderOpen, OpenFolder),
+            cmd("Close Folder", IconName::FolderOpen, CloseFolder),
             cmd("Save", IconName::Save, Save),
             cmd("Save as…", IconName::Save, SaveAs),
             cmd("Save All", IconName::Save, SaveAll),

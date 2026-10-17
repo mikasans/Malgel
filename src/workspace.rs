@@ -18,9 +18,9 @@ use std::{
 use gpui_kit::{
     Anchor, App, AppContext as _, Bounds, ClipboardItem, Context, DragMoveEvent, Entity, EntityId,
     ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement as _, PathPromptOptions, Pixels, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    Window, WindowBounds,
+    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, PathPromptOptions, Pixels,
+    Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, Window, WindowBounds,
     assets::IconName,
     base::Disableable as _,
     component::{
@@ -473,6 +473,12 @@ pub struct Workspace {
     /// Whether the invert key is held while a tab drags: the drop then
     /// duplicates the tab instead of moving it, as in VS Code.
     tab_drag_copy: Cell<bool>,
+    /// Index of the tab currently being dragged (for mouse-up edge-split fallback).
+    tab_drag_index: Cell<Option<usize>>,
+    /// Last pointer position while a tab drags (edge detection under Xvfb).
+    tab_drag_last_pos: Cell<Option<Point<Pixels>>>,
+    /// Document/editor body bounds for drag-to-edge hit testing.
+    editor_body_bounds: Cell<Option<Bounds<Pixels>>>,
     _watch_task: Task<()>,
     document_subscriptions: Vec<(EntityId, Vec<Subscription>)>,
     /// Integrated terminal sessions in the bottom panel (Ctrl+`).
@@ -642,6 +648,9 @@ impl Workspace {
             tab_scroll: ScrollHandle::new(),
             tab_revealed: Cell::new(None),
             tab_drag_copy: Cell::new(false),
+            tab_drag_index: Cell::new(None),
+            tab_drag_last_pos: Cell::new(None),
+            editor_body_bounds: Cell::new(None),
             _watch_task: watch_task,
             document_subscriptions: Vec::new(),
             terminals,
@@ -2481,8 +2490,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Explorer selection first; palette / tab context falls back to active doc.
-        let path = self
+        // Probe #15: palette / keyboard bind the focused editor's document
+        // (A2b toasted README while a.md was visible when Explorer still had
+        // a stale selection). Explorer context menu wins only while the tree
+        // actually has focus (right-click selects the entry first).
+        let explorer_path = self
             .file_tree
             .read(cx)
             .single_selection()
@@ -2492,14 +2504,23 @@ impl Workspace {
                 } else {
                     None
                 }
-            })
-            .or_else(|| {
-                self.active_document()
-                    .read(cx)
-                    .path()
-                    .filter(|p| p.is_file())
-                    .cloned()
             });
+        let active_path = self
+            .active_document()
+            .read(cx)
+            .path()
+            .filter(|p| p.is_file())
+            .cloned();
+        let tree_focused = self
+            .file_tree
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        let path = if tree_focused {
+            explorer_path.or(active_path)
+        } else {
+            active_path.or(explorer_path)
+        };
         let Some(path) = path else {
             window.push_notification(Notification::info("Select a file to compare."), cx);
             return;
@@ -2531,7 +2552,7 @@ impl Workspace {
             );
             return;
         };
-        let right = self
+        let explorer_path = self
             .file_tree
             .read(cx)
             .single_selection()
@@ -2541,14 +2562,23 @@ impl Workspace {
                 } else {
                     None
                 }
-            })
-            .or_else(|| {
-                self.active_document()
-                    .read(cx)
-                    .path()
-                    .filter(|p| p.is_file())
-                    .cloned()
             });
+        let active_path = self
+            .active_document()
+            .read(cx)
+            .path()
+            .filter(|p| p.is_file())
+            .cloned();
+        let tree_focused = self
+            .file_tree
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        let right = if tree_focused {
+            explorer_path.or(active_path)
+        } else {
+            active_path.or(explorer_path)
+        };
         let Some(right) = right else {
             window.push_notification(Notification::info("Select a file to compare."), cx);
             return;
@@ -2671,6 +2701,29 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Close the open folder and return to the Welcome CTA, keeping recent
+    /// history so Open Recent stays usable (probe #15).
+    fn close_folder(&mut self, _: &CloseFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_tree.read(cx).root().is_none() {
+            return;
+        }
+        self.file_tree
+            .update(cx, |tree, cx| tree.set_root(None, cx));
+        self.editor_split = None;
+        // Close every tab; remove_document leaves a blank Untitled when empty,
+        // which is enough for shows_welcome_cta (path is None).
+        let ids: Vec<EntityId> = self.documents.iter().map(|d| d.entity_id()).collect();
+        for id in ids {
+            if self.document_index(id).is_some() {
+                self.remove_document(id, window, cx);
+            }
+        }
+        AppSettings::update(cx, |settings| settings.file_sidebar = false);
+        self.save_session(window, cx);
+        self.focus_active(window, cx);
+        cx.notify();
     }
 
     fn close_document(&mut self, _: &CloseDocument, window: &mut Window, cx: &mut Context<Self>) {
@@ -4820,11 +4873,108 @@ impl Workspace {
         }
     }
 
-    /// Land a dropped tab: a move, or with the invert key held a copy
-    /// (duplicate) at the insertion point, as in VS Code.
+    /// Edge strip width (px) for drag-tab → editor group. Wider than the
+    /// probe's ~40px aim so Xvfb mouse releases still land in-zone.
+    const TAB_EDGE_SPLIT_PX: f32 = 120.;
+
+    /// True when `pos` sits in the right or bottom edge zone of the editor body
+    /// (or the window if body bounds are unknown). `Some(false)` = right,
+    /// `Some(true)` = down.
+    fn edge_split_at(pos: Point<Pixels>, body: Option<Bounds<Pixels>>) -> Option<bool> {
+        let bounds = body?;
+        if !bounds.contains(&pos) {
+            // Still accept a release just outside the right/bottom rim.
+            let right = bounds.origin.x + bounds.size.width;
+            let bottom = bounds.origin.y + bounds.size.height;
+            let near_right = pos.x >= right - px(Self::TAB_EDGE_SPLIT_PX)
+                && pos.x <= right + px(8.)
+                && pos.y >= bounds.origin.y
+                && pos.y <= bottom + px(8.);
+            let near_down = pos.y >= bottom - px(Self::TAB_EDGE_SPLIT_PX)
+                && pos.y <= bottom + px(8.)
+                && pos.x >= bounds.origin.x
+                && pos.x <= right + px(8.);
+            return if near_right {
+                Some(false)
+            } else if near_down {
+                Some(true)
+            } else {
+                None
+            };
+        }
+        let local_x = pos.x - bounds.origin.x;
+        let local_y = pos.y - bounds.origin.y;
+        let w = bounds.size.width;
+        let h = bounds.size.height;
+        let right = local_x >= w - px(Self::TAB_EDGE_SPLIT_PX);
+        let down = local_y >= h - px(Self::TAB_EDGE_SPLIT_PX);
+        // Prefer the nearer edge when both qualify (corner).
+        if right && down {
+            let dr = w - local_x;
+            let dd = h - local_y;
+            if dr <= dd { Some(false) } else { Some(true) }
+        } else if right {
+            Some(false)
+        } else if down {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// Track drag position / edge preview while a tab is in flight.
+    fn note_tab_drag_move(&mut self, event: &DragMoveEvent<TabDrag>, cx: &mut Context<Self>) {
+        let idx = event.drag(cx).index;
+        self.tab_drag_index.set(Some(idx));
+        let pos = event.event.position;
+        self.tab_drag_last_pos.set(Some(pos));
+        if let Some(vertical) = Self::edge_split_at(pos, self.editor_body_bounds.get()) {
+            if self.tab_split_preview != Some(vertical) {
+                self.tab_split_preview = Some(vertical);
+                cx.notify();
+            }
+        } else if self.tab_split_preview.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Probe #15: if a tab drag ends near an editor edge (or the edge strip
+    /// already set a preview), create a real second group — same path as
+    /// Split Editor Right. Returns true when a split was committed.
+    fn try_commit_tab_edge_split(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let idx = self
+            .tab_drag_index
+            .get()
+            .or_else(|| self.tab_insertion.map(|i| i.source));
+        let Some(idx) = idx else {
+            return false;
+        };
+        let vertical = self.tab_split_preview.take().or_else(|| {
+            self.tab_drag_last_pos
+                .get()
+                .and_then(|pos| Self::edge_split_at(pos, self.editor_body_bounds.get()))
+        });
+        let Some(vertical) = vertical else {
+            return false;
+        };
+        self.tab_insertion = None;
+        self.tab_drag_index.set(None);
+        self.tab_drag_last_pos.set(None);
+        self.move_tab_into_split(idx, vertical, window, cx);
+        true
+    }
+
+    /// Land a dropped tab: edge → real editor group; otherwise reorder (or
+    /// duplicate with the invert key), as in VS Code.
     fn finish_tab_drop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Edge-split preview is for the editor body; a tab-bar land cancels it.
+        // Probe #15: do NOT clear edge preview first — under Xvfb the release
+        // often hits the tab bar / misses the thin strip; commit split instead.
+        if self.try_commit_tab_edge_split(window, cx) {
+            return;
+        }
         self.tab_split_preview = None;
+        self.tab_drag_index.set(None);
+        self.tab_drag_last_pos.set(None);
         let Some(insertion) = self.tab_insertion.take() else {
             return;
         };
@@ -5565,8 +5715,13 @@ impl Workspace {
             1
         };
         self.editor_split = Some(EditorSplit { other, vertical });
-        // Editor split is independent of Markdown edit|preview layout.
-        AppSettings::update(cx, |settings| settings.focus_mode = false);
+        // Probe #15: nested Layout::Split (edit|preview) inside each group needs
+        // ≥16rem×2 per pane and leaves a blank middle band (D-split.png). Force
+        // Editor layout so dual groups fill cleanly like VS Code.
+        AppSettings::update(cx, |settings| {
+            settings.focus_mode = false;
+            settings.layout = Layout::Editor;
+        });
         self.tab_split_preview = None;
         self.focus_active(window, cx);
         cx.notify();
@@ -5599,9 +5754,14 @@ impl Workspace {
             other: dragged,
             vertical,
         });
-        AppSettings::update(cx, |settings| settings.focus_mode = false);
+        AppSettings::update(cx, |settings| {
+            settings.focus_mode = false;
+            settings.layout = Layout::Editor;
+        });
         self.tab_insertion = None;
         self.tab_split_preview = None;
+        self.tab_drag_index.set(None);
+        self.tab_drag_last_pos.set(None);
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -5660,14 +5820,29 @@ impl Workspace {
                             }),
                     )
                     .child(
+                        // Probe #15: keep the label always visible (disabled
+                        // outline buttons were OCR-invisible on F4b). Enable
+                        // after any same-profile folder/file open fills recents.
                         Button::new("welcome-open-recent")
                             .label("Open Recent…")
                             .outline()
-                            .disabled(!has_recent)
-                            .tooltip("Open Recent")
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(OpenRecentPicker), cx)
-                            }),
+                            .tooltip(if has_recent {
+                                "Open Recent"
+                            } else {
+                                "Open a folder first to enable Open Recent"
+                            })
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                if AppSettings::get(cx).recent_files.is_empty() {
+                                    window.push_notification(
+                                        Notification::info(
+                                            "No recent folders yet. Open a folder first.",
+                                        ),
+                                        cx,
+                                    );
+                                    return;
+                                }
+                                window.dispatch_action(Box::new(OpenRecentPicker), cx);
+                            })),
                     )
                     .child(
                         Button::new("welcome-open-file")
@@ -5881,12 +6056,13 @@ impl Workspace {
             // While a tab drags, remember the bar's bounds, the invert
             // key's state, and, on drop, land the tab at the insertion
             // point the tabs reported.
-            .on_drag_move::<TabDrag>(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _, _| {
+            .on_drag_move::<TabDrag>(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _, cx| {
                 this.tab_bar_bounds.set(Some(event.bounds));
                 let copy = invert_key_held(&event.event.modifiers);
                 if this.tab_drag_copy.get() != copy {
                     this.tab_drag_copy.set(copy);
                 }
+                this.note_tab_drag_move(event, cx);
             }))
             .on_drop(cx.listener(|this, _: &TabDrag, window, cx| {
                 this.finish_tab_drop(window, cx);
@@ -6144,8 +6320,16 @@ impl Workspace {
                                             let ws_other = ws.clone();
                                             let ws_right = ws.clone();
                                             let ws_pin = ws.clone();
+                                            let ws_sel = ws.clone();
+                                            let ws_cmp = ws.clone();
                                             let doc = doc_weak.clone();
+                                            let sel_path = path.clone();
+                                            let cmp_path = path.clone();
+                                            let has_path = path.is_some();
 
+                                            // Probe #15: Select for Compare / Compare with
+                                            // Selected sit near the top (VS Code muscle
+                                            // memory; Dtab-ctx OCR missed them when buried).
                                             let menu = menu
                                                 .item(
                                                     PopupMenuItem::new(if is_pinned {
@@ -6159,6 +6343,113 @@ impl Workspace {
                                                         });
                                                     }),
                                                 )
+                                                .separator()
+                                                .item(
+                                                    PopupMenuItem::new("Select for Compare")
+                                                        .disabled(!has_path)
+                                                        .on_click(move |_, window, cx| {
+                                                            let Some(sel_path) = sel_path.clone() else {
+                                                                return;
+                                                            };
+                                                            _ = ws_sel.update(cx, |this, cx| {
+                                                                this.compare_selection =
+                                                                    Some(sel_path.clone());
+                                                                let name = sel_path
+                                                                    .file_name()
+                                                                    .map(|n| {
+                                                                        n.to_string_lossy()
+                                                                            .into_owned()
+                                                                    })
+                                                                    .unwrap_or_else(|| {
+                                                                        sel_path.display().to_string()
+                                                                    });
+                                                                window.push_notification(
+                                                                    Notification::info(format!(
+                                                                        "Selected {name} for compare. Right-click another file → Compare with Selected."
+                                                                    )),
+                                                                    cx,
+                                                                );
+                                                                cx.notify();
+                                                            });
+                                                        }),
+                                                )
+                                                .item(
+                                                    PopupMenuItem::new("Compare with Selected")
+                                                        .disabled(!has_path)
+                                                        .on_click(move |_, window, cx| {
+                                                            let Some(right) = cmp_path.clone() else {
+                                                                return;
+                                                            };
+                                                            _ = ws_cmp.update(cx, |this, cx| {
+                                                                let Some(left) =
+                                                                    this.compare_selection.clone()
+                                                                else {
+                                                                    window.push_notification(
+                                                                        Notification::info(
+                                                                            "Select for Compare on a file first.",
+                                                                        ),
+                                                                        cx,
+                                                                    );
+                                                                    return;
+                                                                };
+                                                                if left == right {
+                                                                    window.push_notification(
+                                                                        Notification::info(
+                                                                            "Pick a different file to compare.",
+                                                                        ),
+                                                                        cx,
+                                                                    );
+                                                                    return;
+                                                                }
+                                                                let Ok(left_text) =
+                                                                    std::fs::read_to_string(&left)
+                                                                else {
+                                                                    window.push_notification(
+                                                                        Notification::info(
+                                                                            "Couldn’t read the first file.",
+                                                                        ),
+                                                                        cx,
+                                                                    );
+                                                                    return;
+                                                                };
+                                                                let Ok(right_text) =
+                                                                    std::fs::read_to_string(&right)
+                                                                else {
+                                                                    window.push_notification(
+                                                                        Notification::info(
+                                                                            "Couldn’t read the second file.",
+                                                                        ),
+                                                                        cx,
+                                                                    );
+                                                                    return;
+                                                                };
+                                                                let left_name = left
+                                                                    .file_name()
+                                                                    .map(|n| {
+                                                                        n.to_string_lossy().into_owned()
+                                                                    })
+                                                                    .unwrap_or_else(|| "left".into());
+                                                                let right_name = right
+                                                                    .file_name()
+                                                                    .map(|n| {
+                                                                        n.to_string_lossy().into_owned()
+                                                                    })
+                                                                    .unwrap_or_else(|| "right".into());
+                                                                this.open_diff_session(
+                                                                    format!(
+                                                                        "Compare: {left_name} ↔ {right_name}"
+                                                                    ),
+                                                                    left_name,
+                                                                    right_name,
+                                                                    left_text,
+                                                                    right_text,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }),
+                                                )
+                                                .separator()
                                                 .item(PopupMenuItem::new("Close").on_click(
                                                     move |_, window, cx| {
                                                         _ = ws_close.update(cx, |this, cx| {
@@ -6195,144 +6486,30 @@ impl Workspace {
                                                         }),
                                                 );
 
-                                            // The document's file, when it has one. An
-                                            // untitled buffer has nowhere to reveal or
-                                            // copy, so these rows only appear for a
-                                            // saved file, as in VS Code.
                                             match path.clone() {
                                                 Some(path) => {
                                                     let text = path.display().to_string();
                                                     let reveal = path.clone();
-                                                    let ws_sel = ws.clone();
-                                                    let ws_cmp = ws.clone();
-                                                    let sel_path = path.clone();
-                                                    let cmp_path = path.clone();
-                                                    menu.item(
-                                                        PopupMenuItem::new("Select for Compare")
-                                                            .on_click(move |_, window, cx| {
-                                                                _ = ws_sel.update(cx, |this, cx| {
-                                                                    this.compare_selection =
-                                                                        Some(sel_path.clone());
-                                                                    let name = sel_path
-                                                                        .file_name()
-                                                                        .map(|n| {
-                                                                            n.to_string_lossy()
-                                                                                .into_owned()
-                                                                        })
-                                                                        .unwrap_or_else(|| {
-                                                                            sel_path
-                                                                                .display()
-                                                                                .to_string()
-                                                                        });
-                                                                    window.push_notification(
-                                                                        Notification::info(format!(
-                                                                            "Selected {name} for compare. Right-click another file → Compare with Selected."
-                                                                        )),
-                                                                        cx,
-                                                                    );
-                                                                    cx.notify();
-                                                                });
-                                                            }),
-                                                    )
-                                                    .item(
-                                                        PopupMenuItem::new("Compare with Selected")
-                                                            .on_click(move |_, window, cx| {
-                                                                _ = ws_cmp.update(cx, |this, cx| {
-                                                                    // Use this tab as the right side.
-                                                                    let right = cmp_path.clone();
-                                                                    let Some(left) =
-                                                                        this.compare_selection.clone()
-                                                                    else {
-                                                                        window.push_notification(
-                                                                            Notification::info(
-                                                                                "Select for Compare on a file first.",
-                                                                            ),
-                                                                            cx,
-                                                                        );
-                                                                        return;
-                                                                    };
-                                                                    if left == right {
-                                                                        window.push_notification(
-                                                                            Notification::info(
-                                                                                "Pick a different file to compare.",
-                                                                            ),
-                                                                            cx,
-                                                                        );
-                                                                        return;
-                                                                    }
-                                                                    let Ok(left_text) =
-                                                                        std::fs::read_to_string(&left)
-                                                                    else {
-                                                                        window.push_notification(
-                                                                            Notification::info(
-                                                                                "Couldn’t read the first file.",
-                                                                            ),
-                                                                            cx,
-                                                                        );
-                                                                        return;
-                                                                    };
-                                                                    let Ok(right_text) =
-                                                                        std::fs::read_to_string(&right)
-                                                                    else {
-                                                                        window.push_notification(
-                                                                            Notification::info(
-                                                                                "Couldn’t read the second file.",
-                                                                            ),
-                                                                            cx,
-                                                                        );
-                                                                        return;
-                                                                    };
-                                                                    let left_name = left
-                                                                        .file_name()
-                                                                        .map(|n| {
-                                                                            n.to_string_lossy()
-                                                                                .into_owned()
-                                                                        })
-                                                                        .unwrap_or_else(|| {
-                                                                            "left".into()
-                                                                        });
-                                                                    let right_name = right
-                                                                        .file_name()
-                                                                        .map(|n| {
-                                                                            n.to_string_lossy()
-                                                                                .into_owned()
-                                                                        })
-                                                                        .unwrap_or_else(|| {
-                                                                            "right".into()
-                                                                        });
-                                                                    this.open_diff_session(
-                                                                        format!(
-                                                                            "Compare: {left_name} ↔ {right_name}"
+                                                    menu.separator()
+                                                        .item(
+                                                            PopupMenuItem::new("Copy Path").on_click(
+                                                                move |_, _, cx| {
+                                                                    cx.write_to_clipboard(
+                                                                        ClipboardItem::new_string(
+                                                                            text.clone(),
                                                                         ),
-                                                                        left_name,
-                                                                        right_name,
-                                                                        left_text,
-                                                                        right_text,
-                                                                        window,
-                                                                        cx,
                                                                     );
-                                                                });
-                                                            }),
-                                                    )
-                                                    .item(
-                                                        PopupMenuItem::new("Copy Path").on_click(
-                                                            move |_, _, cx| {
-                                                                cx.write_to_clipboard(
-                                                                    ClipboardItem::new_string(
-                                                                        text.clone(),
-                                                                    ),
-                                                                );
-                                                            },
-                                                        ),
-                                                    )
-                                                    .item(
-                                                        PopupMenuItem::new(
-                                                            "Reveal in File Manager",
+                                                                },
+                                                            ),
                                                         )
-                                                        .on_click(move |_, _, cx| {
-                                                            cx.reveal_path(&reveal);
-                                                        }),
-                                                    )
+                                                        .item(
+                                                            PopupMenuItem::new(
+                                                                "Reveal in File Manager",
+                                                            )
+                                                            .on_click(move |_, _, cx| {
+                                                                cx.reveal_path(&reveal);
+                                                            }),
+                                                        )
                                                 }
                                                 None => menu,
                                             }
@@ -7178,6 +7355,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::follow_link))
             .on_action(cx.listener(Self::view_diagram))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::close_folder))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::save_all))
@@ -7456,16 +7634,30 @@ impl Render for Workspace {
             // sits on the content area below, not the whole window, the way
             // VS Code highlights the editor group only.
             .on_drop(cx.listener(Self::on_drop_tree_drag))
-            // While a tab drags, clear the insertion line whenever the
-            // pointer leaves the tab bar; the bar re-sets its bounds and
-            // the hovered tab re-sets the line after this (capture order).
+            // While a tab drags: track pointer for edge-split, clear the
+            // insertion line outside the tab bar, and arm mouse-up fallback.
             .on_drag_move::<TabDrag>(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _, cx| {
+                this.note_tab_drag_move(event, cx);
                 let inside = this
                     .tab_bar_bounds
                     .get()
                     .is_some_and(|bounds| bounds.contains(&event.event.position));
                 if !inside && this.tab_insertion.take().is_some() {
                     cx.notify();
+                }
+            }))
+            // Probe #15: Xvfb often never delivers on_drop to the edge strip.
+            // Mouse-up while an edge preview (or last pos in-zone) is active
+            // commits the same move_tab_into_split as Split Editor Right.
+            .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                if this.tab_drag_index.get().is_some() || this.tab_split_preview.is_some() {
+                    if !this.try_commit_tab_edge_split(window, cx) {
+                        // Drag ended off-edge: drop stale state so a later
+                        // ordinary click cannot invent a split.
+                        this.tab_split_preview = None;
+                        this.tab_drag_index.set(None);
+                        this.tab_drag_last_pos.set(None);
+                    }
                 }
             }))
             .child(self.render_title_bar(cx))
@@ -7546,25 +7738,45 @@ impl Workspace {
         };
 
         let drop_listener = cx.listener(|this, drag: &TabDrag, window, cx| {
-            let ix = drag.index.min(this.documents.len().saturating_sub(1));
-            // Probe #14: edge preview → real second editor group (move, not MD preview).
-            if let Some(vertical) = this.tab_split_preview.take() {
-                this.move_tab_into_split(ix, vertical, window, cx);
+            this.tab_drag_index.set(Some(drag.index));
+            // Probe #15: edge preview / last-pos zone → real second editor group.
+            if this.try_commit_tab_edge_split(window, cx) {
                 return;
             }
-            // Dropping a tab onto an existing split shows it in the secondary pane.
+            let ix = drag.index.min(this.documents.len().saturating_sub(1));
+            // Dropping a tab onto an existing split moves it into the secondary pane
+            // (not a clone): the primary keeps showing a different document.
             if this.editor_split.is_some() {
-                this.editor_split = Some(EditorSplit {
-                    other: ix,
-                    vertical: this.editor_split.map(|s| s.vertical).unwrap_or(false),
-                });
+                let primary = this.active;
+                if ix == primary && this.documents.len() > 1 {
+                    // Dragging the primary's tab into the secondary: swap roles.
+                    let other = this
+                        .editor_split
+                        .map(|s| s.other)
+                        .unwrap_or(primary)
+                        .min(this.documents.len().saturating_sub(1));
+                    this.active = other;
+                    this.editor_split = Some(EditorSplit {
+                        other: ix,
+                        vertical: this.editor_split.map(|s| s.vertical).unwrap_or(false),
+                    });
+                } else {
+                    this.editor_split = Some(EditorSplit {
+                        other: ix,
+                        vertical: this.editor_split.map(|s| s.vertical).unwrap_or(false),
+                    });
+                }
                 this.tab_insertion = None;
+                this.tab_drag_index.set(None);
+                this.tab_drag_last_pos.set(None);
                 cx.notify();
                 return;
             }
             // Center drop: activate only — do not flip Layout::Split (MD preview).
             this.activate(ix, window, cx);
             this.tab_insertion = None;
+            this.tab_drag_index.set(None);
+            this.tab_drag_last_pos.set(None);
             cx.notify();
         });
 
@@ -7574,41 +7786,72 @@ impl Workspace {
                 v_flex()
                     .id("editor-split-vertical")
                     .size_full()
-                    .child(stack(active, "doc-stack-primary"))
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(
+                        stack(active, "doc-stack-primary")
+                            .h_full()
+                            .overflow_hidden(),
+                    )
                     .child(div().h(px(1.)).w_full().bg(cx.theme().border).flex_none())
-                    .child(stack(other, "doc-stack-secondary"))
+                    .child(
+                        stack(other, "doc-stack-secondary")
+                            .h_full()
+                            .overflow_hidden(),
+                    )
                     .into_any_element()
             } else {
                 h_flex()
                     .id("editor-split-horizontal")
                     .size_full()
+                    .min_w_0()
                     .items_stretch()
-                    .child(stack(active, "doc-stack-primary"))
+                    .overflow_hidden()
+                    .child(
+                        stack(active, "doc-stack-primary")
+                            .w_full()
+                            .overflow_hidden(),
+                    )
                     .child(div().w(px(1.)).h_full().bg(cx.theme().border).flex_none())
-                    .child(stack(other, "doc-stack-secondary"))
+                    .child(
+                        stack(other, "doc-stack-secondary")
+                            .w_full()
+                            .overflow_hidden(),
+                    )
                     .into_any_element()
             };
+            let ws_bounds = cx.weak_entity();
             div()
                 .id("document-stack")
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
+                .overflow_hidden()
                 .on_drop(drop_listener)
                 .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+                .on_drag_move::<TabDrag>(move |event: &DragMoveEvent<TabDrag>, _, cx| {
+                    _ = ws_bounds.update(cx, |this, cx| {
+                        this.editor_body_bounds.set(Some(event.bounds));
+                        this.note_tab_drag_move(event, cx);
+                    });
+                })
                 .child(panes)
                 .into_any_element()
         } else {
             let preview = self.tab_split_preview;
             let ws_right = cx.weak_entity();
             let ws_down = cx.weak_entity();
-            // Probe #14: edge strips must accept the drop themselves — GPUI does
-            // not bubble TabDrag drops from a child without on_drop up to the
-            // document-stack parent (D0≡D1 / no second group).
+            let ws_bounds = cx.weak_entity();
+            let edge = px(Self::TAB_EDGE_SPLIT_PX);
+            // Probe #15: wide occluding strips + on_drop. Mouse-up fallback on
+            // the workspace covers Xvfb cases where the strip never gets the drop.
             let drop_right = cx.listener(|this, drag: &TabDrag, window, cx| {
+                this.tab_drag_index.set(Some(drag.index));
                 this.tab_split_preview = Some(false);
                 this.move_tab_into_split(drag.index, false, window, cx);
             });
             let drop_down = cx.listener(|this, drag: &TabDrag, window, cx| {
+                this.tab_drag_index.set(Some(drag.index));
                 this.tab_split_preview = Some(true);
                 this.move_tab_into_split(drag.index, true, window, cx);
             });
@@ -7620,6 +7863,12 @@ impl Workspace {
                 .relative()
                 .on_drop(drop_listener)
                 .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+                .on_drag_move::<TabDrag>(move |event: &DragMoveEvent<TabDrag>, _, cx| {
+                    _ = ws_bounds.update(cx, |this, cx| {
+                        this.editor_body_bounds.set(Some(event.bounds));
+                        this.note_tab_drag_move(event, cx);
+                    });
+                })
                 .children(self.documents.iter().enumerate().map(|(ix, doc)| {
                     let shown = ix == active;
                     div()
@@ -7636,13 +7885,18 @@ impl Workspace {
                         .top_0()
                         .right_0()
                         .bottom_0()
-                        .w(px(40.))
+                        .w(edge)
+                        // Hit-testable during TabDrag via on_drop/on_drag_move;
+                        // mouse-up fallback covers Xvfb misses. No permanent
+                        // occlude — that would steal ordinary editor clicks.
                         .when(preview == Some(false), |this| {
                             this.bg(cx.theme().drop_target)
                         })
                         .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
-                        .on_drag_move::<TabDrag>(move |_: &DragMoveEvent<TabDrag>, _, cx| {
+                        .on_drag_move::<TabDrag>(move |event: &DragMoveEvent<TabDrag>, _, cx| {
                             _ = ws_right.update(cx, |this, cx| {
+                                this.tab_drag_index.set(Some(event.drag(cx).index));
+                                this.tab_drag_last_pos.set(Some(event.event.position));
                                 if this.tab_split_preview != Some(false) {
                                     this.tab_split_preview = Some(false);
                                     cx.notify();
@@ -7658,13 +7912,15 @@ impl Workspace {
                         .left_0()
                         .right_0()
                         .bottom_0()
-                        .h(px(40.))
+                        .h(edge)
                         .when(preview == Some(true), |this| {
                             this.bg(cx.theme().drop_target)
                         })
                         .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
-                        .on_drag_move::<TabDrag>(move |_: &DragMoveEvent<TabDrag>, _, cx| {
+                        .on_drag_move::<TabDrag>(move |event: &DragMoveEvent<TabDrag>, _, cx| {
                             _ = ws_down.update(cx, |this, cx| {
+                                this.tab_drag_index.set(Some(event.drag(cx).index));
+                                this.tab_drag_last_pos.set(Some(event.event.position));
                                 if this.tab_split_preview != Some(true) {
                                     this.tab_split_preview = Some(true);
                                     cx.notify();
@@ -8121,7 +8377,12 @@ impl Workspace {
         let workspace = cx.weak_entity();
         let render_pane = |id: &'static str, label: String, lines: Vec<String>, border_r: bool| {
             let theme = cx.theme();
-            let mut pane = v_flex().id(format!("{id}-pane")).flex_1().h_full().min_w_0().min_h_0();
+            let mut pane = v_flex()
+                .id(format!("{id}-pane"))
+                .flex_1()
+                .h_full()
+                .min_w_0()
+                .min_h_0();
             if border_r {
                 pane = pane.border_r_1().border_color(theme.border);
             }
@@ -8830,5 +9091,64 @@ mod tests {
         assert!(!placeholder_is_safe(Placement::Default, false, false));
         assert!(!placeholder_is_safe(Placement::ReplaceActive, false, true));
         assert!(placeholder_is_safe(Placement::ReplaceActive, true, true));
+    }
+
+    /// Probe #15: drag-tab edge zones must recognize the far-right / bottom
+    /// strips the Xvfb probe aims at (WIDTH-20 mid-height → right split).
+    #[test]
+    fn tab_edge_split_zones_match_probe_drag_target() {
+        use gpui_kit::{Bounds, Point, Size, px};
+        let body = Bounds {
+            origin: Point {
+                x: px(200.),
+                y: px(80.),
+            },
+            size: Size {
+                width: px(1000.),
+                height: px(600.),
+            },
+        };
+        // Far right of editor body (probe: WIDTH-20 at mid height).
+        let right = Point {
+            x: px(200.) + px(1000.) - px(20.),
+            y: px(80.) + px(300.),
+        };
+        assert_eq!(
+            super::Workspace::edge_split_at(right, Some(body)),
+            Some(false),
+            "far-right mid-height must be a right split"
+        );
+        // Center of body: no split.
+        let center = Point {
+            x: px(200.) + px(500.),
+            y: px(80.) + px(300.),
+        };
+        assert_eq!(super::Workspace::edge_split_at(center, Some(body)), None);
+        // Bottom strip → down split.
+        let down = Point {
+            x: px(200.) + px(500.),
+            y: px(80.) + px(600.) - px(20.),
+        };
+        assert_eq!(
+            super::Workspace::edge_split_at(down, Some(body)),
+            Some(true)
+        );
+        // 120px edge width: just inside right zone.
+        let near = Point {
+            x: px(200.) + px(1000.) - px(100.),
+            y: px(80.) + px(300.),
+        };
+        assert_eq!(
+            super::Workspace::edge_split_at(near, Some(body)),
+            Some(false)
+        );
+        // Just outside the 120px zone toward center.
+        let outside = Point {
+            x: px(200.) + px(1000.) - px(130.),
+            y: px(80.) + px(300.),
+        };
+        assert_eq!(super::Workspace::edge_split_at(outside, Some(body)), None);
+        // No body bounds → no split (cannot guess).
+        assert_eq!(super::Workspace::edge_split_at(right, None), None);
     }
 }

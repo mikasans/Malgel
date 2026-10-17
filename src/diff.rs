@@ -178,7 +178,6 @@ fn collapse_hunks(ops: &[Op]) -> Vec<Hunk> {
     hunks
 }
 
-
 /// Format the visible lines for one side of a hunk (with ±2 lines of context).
 /// Always returns at least one row when `lines` is non-empty or the hunk exists,
 /// so Compare panes never paint an empty body when hunk count ≥ 1.
@@ -257,8 +256,14 @@ mod tests {
         let rv = pane_view(&h[0], &right_lines, false);
         assert!(!lv.is_empty(), "left pane lines must be non-empty");
         assert!(!rv.is_empty(), "right pane lines must be non-empty");
-        assert!(lv.iter().any(|l| l.contains("file a") || l.contains("PROBE-A")));
-        assert!(rv.iter().any(|l| l.contains("file b") || l.contains("PROBE-B")));
+        assert!(
+            lv.iter()
+                .any(|l| l.contains("file a") || l.contains("PROBE-A"))
+        );
+        assert!(
+            rv.iter()
+                .any(|l| l.contains("file b") || l.contains("PROBE-B"))
+        );
     }
 
     #[test]
@@ -272,6 +277,4 @@ mod tests {
         assert!(!lv.is_empty());
         assert!(rv.iter().any(|l| l.contains('b') || l.contains("a")));
     }
-
 }
-
