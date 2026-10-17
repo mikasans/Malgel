@@ -527,15 +527,29 @@ sleep 0.6
   || fail "Ctrl+/ twice did not give the line back: $(head -1 "$WS/README.md")"
 pass "Ctrl+/ toggles a line comment in one undo step"
 
-# 5. Ctrl+B in the editor is Bold, as in VS Code (Toggle Side Bar is the same
-#    key outside the editor). Assert on the file, not the pixels.
-xdotool key --clearmodifiers ctrl+a
+# 5. Ctrl+B with editor focus toggles the File sidebar (VS Code). Bold moved
+#    to Ctrl+Shift+B so the side-bar chord is never stolen while typing.
+before_sidebar="$(sidebar_on)"
+[[ -n "$before_sidebar" ]] || before_sidebar=true
 xdotool key --clearmodifiers ctrl+b
+sleep 0.5
+shot 08-sidebar-toggle
+wait_for 5 test "$(sidebar_on)" != "$before_sidebar" \
+  || fail "Ctrl+B in the editor did not toggle the file sidebar (was $before_sidebar)"
+xdotool key --clearmodifiers ctrl+b
+sleep 0.5
+wait_for 5 test "$(sidebar_on)" = "$before_sidebar" \
+  || fail "Ctrl+B did not restore the file sidebar"
+pass "Ctrl+B in the editor toggles the file sidebar"
+
+# 5b. Ctrl+Shift+B still applies Bold.
+xdotool key --clearmodifiers ctrl+a
+xdotool key --clearmodifiers ctrl+shift+b
 sleep 0.3
 xdotool key --clearmodifiers ctrl+s
 shot 08-bold
-wait_for 5 grep -q '\*\*' "$WS/README.md" || fail "Ctrl+B in the editor did not apply bold"
-pass "Ctrl+B in the editor applies bold (Ctrl+S round-trip)"
+wait_for 5 grep -q '\*\*' "$WS/README.md" || fail "Ctrl+Shift+B in the editor did not apply bold"
+pass "Ctrl+Shift+B in the editor applies bold (Ctrl+S round-trip)"
 
 # 6. The Explorer: Ctrl+Shift+E moves the keyboard into the file tree and
 #    picks the file that is open; F2 renames it, and the file on disk follows.
@@ -887,6 +901,42 @@ shot 38-sidebar-shown
 [[ "$(region_differ 37-sidebar-hidden 38-sidebar-shown "$region")" -gt 50000 ]] \
   || fail "bringing the sidebar back left the frame alone"
 pass "the title bar's side bar button folds the Explorer away and back"
+
+# 19b. Ctrl+Shift+V toggles split ↔ editor-only (default open is already split).
+layout_before="$(sed -n 's/.*"layout": *"\([^"]*\)".*/\1/p' "$HOME/.config/malgel/settings.json" 2>/dev/null || true)"
+xdotool key --clearmodifiers ctrl+shift+v
+sleep 0.6
+shot 38b-preview-toggle
+layout_after="$(sed -n 's/.*"layout": *"\([^"]*\)".*/\1/p' "$HOME/.config/malgel/settings.json" 2>/dev/null || true)"
+[[ "$layout_before" != "$layout_after" ]] \
+  || fail "Ctrl+Shift+V did not change layout (was ${layout_before:-unset})"
+xdotool key --clearmodifiers ctrl+shift+v
+sleep 0.6
+layout_restored="$(sed -n 's/.*"layout": *"\([^"]*\)".*/\1/p' "$HOME/.config/malgel/settings.json" 2>/dev/null || true)"
+[[ "$layout_restored" == "$layout_before" ]] \
+  || fail "Ctrl+Shift+V did not restore layout (now ${layout_restored:-unset})"
+pass "Ctrl+Shift+V toggles editor|preview layout"
+
+# 19c. Command palette rows show keybinding chords (OCR when tesseract exists).
+xdotool key --clearmodifiers ctrl+shift+p
+sleep 0.5
+xdotool type --delay 40 'toggle terminal'
+sleep 0.4
+shot 38c-palette-keyhint
+dismiss
+if command -v tesseract >/dev/null 2>&1; then
+  tesseract "$ART_DIR/38c-palette-keyhint.png" "$ART_DIR/38c-palette-keyhint" -l eng --psm 6 >/dev/null 2>&1 || true
+  if [[ -f "$ART_DIR/38c-palette-keyhint.txt" ]]; then
+    grep -qiE 'ctrl|control' "$ART_DIR/38c-palette-keyhint.txt" \
+      || fail "palette OCR found no Ctrl chord beside Toggle Terminal"
+    pass "command palette shows Ctrl keybinding hints (OCR)"
+  else
+    pass "command palette keyhint shot taken (OCR output missing)"
+  fi
+else
+  pass "command palette keyhint shot taken (no tesseract)"
+fi
+
 
 # 20. Layout switch keeps the caret line: scroll down, Editor only, then
 #     Split again; the caret's line must still be on screen (status bar).
@@ -1389,9 +1439,34 @@ assert r >= 4.5, r
 PY
 pass "Tokyo Moon line numbers read at >= 4.5:1"
 
-# 22. Still alive at the end — no crash from any of the above.
-kill -0 "$APP_PID" 2>/dev/null || fail "process died during the run"
-pass "process alive at exit"
+# 22. Ctrl+Q → Don't save: dialog, disk unchanged, then the app exits.
+#     Last so later steps are not stranded without a process.
+printf 'quit-disk\n' >"$WS/notes/quit-final.md"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'quit-final.md'
+xdotool key --clearmodifiers Return
+sleep 0.8
+xdotool type --delay 30 'SHOULD_NOT_SAVE'
+sleep 0.3
+disk_before="$(cat "$WS/notes/quit-final.md")"
+xdotool key --clearmodifiers ctrl+q
+sleep 1.0
+shot 50-quit-dont-save-dialog
+kill -0 "$APP_PID" 2>/dev/null || fail "Ctrl+Q quit before Don't save could be chosen"
+[[ "$(pixels_differ 49-moon-gutter 50-quit-dont-save-dialog)" -gt 1000 ]] \
+  || fail "Ctrl+Q with dirty buffer showed no confirm dialog"
+# Save (primary) → Don't save; one Tab then Enter.
+xdotool key --clearmodifiers Tab
+sleep 0.3
+xdotool key --clearmodifiers Return
+sleep 2.0
+if kill -0 "$APP_PID" 2>/dev/null; then
+  fail "Don't save on Quit left the app alive"
+fi
+[[ "$(cat "$WS/notes/quit-final.md")" == "$disk_before" ]] \
+  || fail "Don't save + Quit mutated quit-final.md: $(head -c 80 "$WS/notes/quit-final.md")"
+pass "Ctrl+Q Don't save: dialog shown, disk unchanged, app exits"
 
 echo
 echo "PASS — artifacts in $ART_DIR"

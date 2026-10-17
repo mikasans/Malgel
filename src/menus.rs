@@ -235,6 +235,7 @@ pub fn build(cx: &App) -> Vec<Menu> {
             .checked(settings.layout == Layout::Split),
         MenuItem::action("Preview", SetLayout(Layout::Preview))
             .checked(settings.layout == Layout::Preview),
+        MenuItem::action("Toggle editor and preview", TogglePreviewLayout),
         MenuItem::action("Focus mode", ToggleFocusMode).checked(settings.focus_mode),
         MenuItem::separator(),
         MenuItem::action("Tabs", ToggleTabs).checked(settings.tabs),

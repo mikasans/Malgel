@@ -237,7 +237,30 @@ fn main() {
         diagram_viewer::bind_keys(cx);
         let app_menu_bar = menus::init(cx);
 
-        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        // Never quit here: that skipped the workspace dirty-buffer confirm
+        // (Save / Don't save / Cancel) when Ctrl+Q or the Quit menu fired at
+        // app scope. Forward to the workspace; only quit if no window exists.
+        cx.on_action(|_: &Quit, cx: &mut App| {
+            let Some(main) = cx.try_global::<MainWindow>() else {
+                cx.quit();
+                return;
+            };
+            if !cx.windows().contains(&main.handle) {
+                cx.quit();
+                return;
+            }
+            let (handle, workspace) = (main.handle, main.workspace.clone());
+            let forwarded = handle.update(cx, |_, window, cx| {
+                let Some(ws) = workspace.upgrade() else {
+                    return false;
+                };
+                ws.update(cx, |ws, cx| ws.request_quit(window, cx));
+                true
+            });
+            if !matches!(forwarded, Ok(true)) {
+                cx.quit();
+            }
+        });
         cx.on_action(|_: &OpenMarkdownGuide, cx: &mut App| cx.open_url(MARKDOWN_GUIDE_URL));
         cx.on_action(|action: &SetAppearance, cx: &mut App| {
             let appearance = action.0;

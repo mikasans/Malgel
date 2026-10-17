@@ -181,6 +181,13 @@ pub fn clamp_font_size(size: f32) -> f32 {
     }
 }
 
+/// UI zoom as a percentage of [`DEFAULT_FONT_SIZE`], for the status bar.
+pub fn zoom_percent(font_size: f32) -> u32 {
+    let size = clamp_font_size(font_size);
+    ((size / DEFAULT_FONT_SIZE) * 100.).round() as u32
+}
+
+
 fn settings_path() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("settings.json"))
 }
@@ -248,5 +255,12 @@ mod tests {
     fn font_size_is_clamped() {
         assert_eq!(clamp_font_size(100.), MAX_FONT_SIZE);
         assert_eq!(clamp_font_size(f32::NAN), DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn zoom_percent_is_relative_to_default() {
+        assert_eq!(zoom_percent(DEFAULT_FONT_SIZE), 100);
+        assert_eq!(zoom_percent(DEFAULT_FONT_SIZE + 1.), 106);
+        assert_eq!(zoom_percent(DEFAULT_FONT_SIZE - 1.), 94);
     }
 }

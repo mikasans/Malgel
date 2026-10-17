@@ -3,8 +3,8 @@
 //!
 //! Every command is already an Action (see [`crate::actions`]), so the palette
 //! adds no new dispatch path — it only groups the commands the way VS Code
-//! does and hands each one to `CommandItem`, which draws the command's current
-//! key binding beside it.
+//! does and hands each one to `CommandItem` (with its Action) so the row can
+//! draw the command's current key binding beside the label.
 //!
 //! The list is built as plain data ([`CommandGroupSpec`]) rather than as
 //! palette widgets directly, because the palette lives in a dialog: an action
@@ -54,7 +54,10 @@ fn group(label: &'static str, items: Vec<CommandSpec>) -> CommandGroupSpec {
     CommandGroupSpec { label, items }
 }
 
-/// The rows the palette draws: labels and icons only.
+/// The rows the palette draws: labels, icons, and each command's Action so
+/// `CommandItem` can resolve and paint the keybinding tip (Ctrl+`, Fold, …).
+/// Confirm still dispatches via [`actions`] from the workspace — the dialog
+/// focus path does not reach the workspace on its own.
 pub fn palette(groups: &[CommandGroupSpec]) -> Vec<CommandGroup> {
     groups
         .iter()
@@ -67,7 +70,8 @@ pub fn palette(groups: &[CommandGroupSpec]) -> Vec<CommandGroup> {
                         CommandItem::new()
                             .label(item.label)
                             .keywords(keywords(item.label))
-                            .icon(Icon::new(item.icon)),
+                            .icon(Icon::new(item.icon))
+                            .action(item.action.boxed_clone()),
                     )
                 })
         })
@@ -187,6 +191,11 @@ pub fn groups() -> Vec<CommandGroupSpec> {
                 SetLayout(Layout::Split),
             ),
             cmd("Preview", IconName::Eye, SetLayout(Layout::Preview)),
+            cmd(
+                "Toggle editor and preview",
+                IconName::Columns2,
+                TogglePreviewLayout,
+            ),
             cmd("Tabs", IconName::ListTree, ToggleTabs),
             cmd("Pin or unpin tab", IconName::Pin, PinTab),
             cmd(
@@ -291,5 +300,27 @@ mod tests {
             .expect("Color theme… is in the palette");
         assert!(item.action.partial_eq(&SelectColorTheme));
         assert!(keywords(item.label).contains(&"theme"));
+    }
+
+    #[test]
+    fn palette_rows_carry_actions_for_keybinding_hints() {
+        let groups = groups();
+        // Building palette widgets must attach each Action so CommandItem can
+        // resolve the chord drawn beside the label.
+        let _rows = palette(&groups);
+        let count = groups.iter().map(|g| g.items.len()).sum::<usize>();
+        assert!(count > 20, "expected many palette commands, got {count}");
+        let toggle = groups
+            .iter()
+            .flat_map(|g| &g.items)
+            .find(|i| i.label == "Toggle editor and preview")
+            .expect("preview toggle in palette");
+        assert!(toggle.action.partial_eq(&TogglePreviewLayout));
+        let sidebar = groups
+            .iter()
+            .flat_map(|g| &g.items)
+            .find(|i| i.label == "File sidebar")
+            .expect("File sidebar in palette");
+        assert!(sidebar.action.partial_eq(&ToggleFileSidebar));
     }
 }

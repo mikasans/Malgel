@@ -49,6 +49,7 @@ actions!(
         TogglePdfThumbnails,
         ToggleSpellCheck,
         ToggleFocusMode,
+        TogglePreviewLayout,
         ToggleRestoreSession,
         OpenSettings,
         CopyRichText,
@@ -237,10 +238,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-pagedown", NextTab, workspace),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-pageup", PreviousTab, workspace),
-        // VS Code's Toggle Side Bar. Bold keeps `secondary-b` too, but only
-        // while the editor has focus (see `EDITOR_CONTEXT` below), so the two
-        // never fire together.
-        KeyBinding::new("secondary-b", ToggleFileSidebar, workspace),
+        // VS Code's Toggle Side Bar: Ctrl+B always, including while the
+        // editor has focus. Markdown Bold moves to Ctrl+Shift+B (below).
+        KeyBinding::new("secondary-b", ToggleFileSidebar, None),
         // VS Code's Explorer: show the sidebar if it is hidden, put the
         // keyboard in the tree, and pick the file that is open.
         KeyBinding::new("secondary-shift-e", FocusExplorer, workspace),
@@ -258,6 +258,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-1", SetLayout(Layout::Editor), None),
         KeyBinding::new("secondary-2", SetLayout(Layout::Split), None),
         KeyBinding::new("secondary-3", SetLayout(Layout::Preview), None),
+        // Toggle editor|preview ↔ editor-only (default open is already split,
+        // so a one-shot "open preview" feels like a no-op without this).
+        KeyBinding::new("secondary-shift-v", TogglePreviewLayout, None),
         // The last binding for an action is the one menus display.
         KeyBinding::new("secondary-+", ZoomIn, None),
         KeyBinding::new("secondary-=", ZoomIn, None),
@@ -291,8 +294,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("home", TreeSelectFirst, Some(FILE_TREE_CONTEXT)),
         KeyBinding::new("end", TreeSelectLast, Some(FILE_TREE_CONTEXT)),
         // Typing commands, scoped to the editor so they mean nothing while the
-        // sidebar has the keyboard.
-        KeyBinding::new("secondary-b", Bold, Some(EDITOR_CONTEXT)),
+        // sidebar has the keyboard. Bold is Ctrl+Shift+B so Ctrl+B can match
+        // VS Code's Toggle Side Bar with the caret in the editor.
+        KeyBinding::new("secondary-shift-b", Bold, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-i", Italic, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-shift-x", Strikethrough, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-e", InlineCode, Some(EDITOR_CONTEXT)),
@@ -351,9 +355,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-up", MoveLineUp, Some(EDITOR_CONTEXT)),
         KeyBinding::new("alt-down", MoveLineDown, Some(EDITOR_CONTEXT)),
         // VS Code Fold / Unfold (Ctrl/Cmd+Shift+[ / ]). GPUI key is `{` / `}`
-        // with Shift stripped — see comment on BulletList above.
+        // with Shift stripped — see comment on BulletList above. Also bind the
+        // naive secondary-shift-[ / ] spellings so Xvfb xdotool chord delivery
+        // matches when it keeps Shift+[ instead of rewriting to {.
         KeyBinding::new("secondary-{", Fold, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-}", Unfold, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-shift-[", Fold, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-shift-]", Unfold, Some(EDITOR_CONTEXT)),
     ]);
 }
 
@@ -384,19 +392,18 @@ mod tests {
         assert_eq!(open.keystrokes().len(), 1);
     }
 
-    /// Ctrl+B is Toggle Side Bar in the workspace and Bold in the editor, the
-    /// way VS Code scopes each to where it belongs. The two bindings share a
-    /// keystroke, so they must live in different key contexts — otherwise the
-    /// deeper one would shadow the other everywhere.
+    /// Ctrl+B is Toggle Side Bar everywhere (VS Code). Bold is Ctrl+Shift+B
+    /// so editor focus never steals the side-bar chord.
     #[test]
-    fn control_b_is_the_sidebar_in_the_workspace_and_bold_in_the_editor() {
-        let sidebar = KeyBinding::new("secondary-b", ToggleFileSidebar, Some(WORKSPACE_CONTEXT));
+    fn control_b_toggles_the_sidebar_and_bold_uses_shift() {
+        let sidebar = KeyBinding::new("secondary-b", ToggleFileSidebar, None);
         assert_eq!(sidebar.keystrokes().len(), 1);
-        let bold = KeyBinding::new("secondary-b", Bold, Some(EDITOR_CONTEXT));
+        let bold = KeyBinding::new("secondary-shift-b", Bold, Some(EDITOR_CONTEXT));
         assert_eq!(bold.keystrokes().len(), 1);
         assert_ne!(
-            WORKSPACE_CONTEXT, EDITOR_CONTEXT,
-            "Bold and Toggle Side Bar cannot share both the key and the context"
+            (sidebar.keystrokes()[0].key(), sidebar.keystrokes()[0].modifiers().shift),
+            (bold.keystrokes()[0].key(), bold.keystrokes()[0].modifiers().shift),
+            "Bold must not share Ctrl+B with Toggle Side Bar"
         );
     }
 

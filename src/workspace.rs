@@ -2662,6 +2662,12 @@ impl Workspace {
     }
 
     fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_quit(window, cx);
+    }
+
+    /// Ask about dirty buffers, then quit. Used by the Quit action and by the
+    /// app-scope Quit handler so Ctrl+Q / the menu never call `cx.quit()` first.
+    pub(crate) fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.confirm_close(AfterConfirm::Quit, window, cx);
     }
 
@@ -3562,6 +3568,24 @@ impl Workspace {
         );
     }
 
+    /// Toggle between editor|preview split and editor-only. Default folder
+    /// open is already split, so Ctrl+Shift+V as a true toggle matches what
+    /// users expect from a preview shortcut.
+    fn toggle_preview_layout(
+        &mut self,
+        _: &TogglePreviewLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = AppSettings::get(cx).layout;
+        let next = if current == Layout::Split {
+            Layout::Editor
+        } else {
+            Layout::Split
+        };
+        self.set_layout(&SetLayout(next), window, cx);
+    }
+
     fn toggle_focus_mode(
         &mut self,
         _: &ToggleFocusMode,
@@ -3801,9 +3825,9 @@ impl Workspace {
         // The palette lives in a dialog, and an action confirmed there is
         // dispatched along the dialog's own focus path — which the window's
         // workspace is not part of, so the widget's own dispatch never
-        // arrives. The rows therefore carry no action at all; confirming one
-        // hands the Action it stands for back to the workspace and dispatches
-        // it from there.
+        // arrives. Rows still carry the Action so CommandItem can paint the
+        // keybinding tip; confirming hands that Action back to the workspace
+        // and dispatches it from there.
         let ws_focus = self.focus_handle.clone();
         let restore = cx.weak_entity();
         // Focus the query once, after the dialog has taken focus. Not in the
@@ -4849,6 +4873,11 @@ impl Workspace {
                                 window.dispatch_action(Box::new(ToggleLineEnding), cx)
                             }),
                     )
+                    // Zoom as a percentage of the default UI font size (Ctrl+= / -).
+                    .child(item(format!(
+                        "{}%",
+                        crate::settings::zoom_percent(settings.font_size)
+                    )))
                     .child(language),
             )
             .into_any_element()
@@ -5437,6 +5466,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::set_layout))
+            .on_action(cx.listener(Self::toggle_preview_layout))
             .on_action(cx.listener(Self::go_to_heading))
             .on_action(cx.listener(Self::show_command_palette))
             .on_action(cx.listener(Self::show_go_to_line))
