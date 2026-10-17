@@ -132,7 +132,15 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
                 "toggle maximized panel",
             ]
         }
-        "Outline" => vec![label, "outline", "table of contents", "headings"],
+        "Outline" => vec![
+            label,
+            "outline",
+            "outline view",
+            "outline pane",
+            "table of contents",
+            "headings",
+            "symbol pane",
+        ],
         // Probe #7: discoverability for markdown / toggle preview phrasing.
         "Preview" => vec![
             label,
@@ -175,7 +183,7 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
             "goto symbol",
             "symbol",
             "symbols",
-            "outline symbol",
+            "go to outline",
         ],
         "Reload Window" => vec![label, "reload window", "reload", "restart window"],
         "Zen Mode" => vec![label, "zen", "zen mode", "distraction free"],
@@ -662,5 +670,18 @@ mod tests {
         assert!(keywords("Show Search").contains(&"show search"));
         assert!(keywords("Source Control").contains(&"scm"));
         assert!(keywords("Extensions").contains(&"extensions"));
+    }
+
+    #[test]
+    fn palette_probe12_outline_ranks_over_bare_outline_symbol() {
+        let o = keywords("Outline");
+        let s = keywords("Go to Symbol…");
+        assert!(o.contains(&"outline"));
+        assert!(o.contains(&"outline view"));
+        assert!(
+            !s.contains(&"outline"),
+            "bare outline must not hit Go to Symbol"
+        );
+        assert!(s.contains(&"go to symbol"));
     }
 }

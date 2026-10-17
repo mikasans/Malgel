@@ -99,6 +99,16 @@ pub const SHORTCUTS: &[ShortcutRow] = &[
         chord: "Ctrl+K Ctrl+O",
     },
     ShortcutRow {
+        command: "Toggle Outline",
+        when: "Workspace · outline pane",
+        chord: "Ctrl+Alt+O  (⌘⌥O)",
+    },
+    ShortcutRow {
+        command: "Go to Symbol",
+        when: "Workspace",
+        chord: "Ctrl+Shift+O  (⌘⇧O)",
+    },
+    ShortcutRow {
         command: "Open File",
         when: "Workspace",
         chord: "Ctrl+O  (⌘O)",

@@ -449,6 +449,10 @@ pub struct Workspace {
     /// Tabs held open: Close Other Tabs and Close All Editors leave them
     /// alone, and their close box becomes a pin, as in VS Code.
     pinned: HashSet<EntityId>,
+    /// Explorer “Select for Compare” left path (probe #12).
+    compare_selection: Option<PathBuf>,
+    /// While dragging a tab: which split edge is hovered for drop preview.
+    tab_split_preview: Option<bool>, // false=right, true=down
     /// The files the window has shown, newest last, and where it is in that
     /// list — Alt+← and Alt+→ walk it, as VS Code's editor history does.
     nav_history: Vec<PathBuf>,
@@ -628,6 +632,8 @@ impl Workspace {
             approved_opens: HashMap::new(),
             closed_documents: Vec::new(),
             pinned: HashSet::new(),
+            compare_selection: None,
+            tab_split_preview: None,
             nav_history: Vec::new(),
             nav_index: 0,
             last_session: None,
@@ -2197,10 +2203,6 @@ impl Workspace {
             );
             return;
         };
-        if !doc.read(cx).is_dirty() {
-            window.push_notification(Notification::info("No unsaved changes to compare."), cx);
-            return;
-        }
         let Ok(disk) = std::fs::read_to_string(&path) else {
             window.push_notification(
                 Notification::info("Couldn’t read the saved file from disk."),
@@ -2213,6 +2215,19 @@ impl Workspace {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".into());
         let buffer = doc.read(cx).text_now(cx).to_string();
+        // Probe #12: compare buffer↔disk even when Auto Save cleared is_dirty.
+        if disk == buffer {
+            let as_on = AppSettings::get(cx).auto_save;
+            window.push_notification(
+                Notification::info(if as_on {
+                    "No differences from disk (Auto Save may already have written this file)."
+                } else {
+                    "No differences from the saved file on disk."
+                }),
+                cx,
+            );
+            return;
+        }
         self.open_diff_session(
             format!("Compare: {name}"),
             "Saved on disk".into(),
@@ -2415,6 +2430,84 @@ impl Workspace {
         }
         self.open_paths(vec![path], Placement::NewTab, window, cx);
         self.open_editor_split(false, window, cx);
+    }
+
+    fn select_for_compare(
+        &mut self,
+        _: &SelectForCompare,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((path, is_dir)) = self.file_tree.read(cx).single_selection() else {
+            return;
+        };
+        if is_dir || !path.is_file() {
+            window.push_notification(Notification::info("Select a file to compare."), cx);
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.compare_selection = Some(path);
+        window.push_notification(
+            Notification::info(format!(
+                "Selected {name} for compare. Right-click another file → Compare with Selected."
+            )),
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn compare_with_selected(
+        &mut self,
+        _: &CompareWithSelected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(left) = self.compare_selection.clone() else {
+            window.push_notification(
+                Notification::info("Select for Compare on a file first."),
+                cx,
+            );
+            return;
+        };
+        let Some((right, is_dir)) = self.file_tree.read(cx).single_selection() else {
+            return;
+        };
+        if is_dir || !right.is_file() {
+            window.push_notification(Notification::info("Select a file to compare."), cx);
+            return;
+        }
+        if left == right {
+            window.push_notification(Notification::info("Pick a different file to compare."), cx);
+            return;
+        }
+        let Ok(left_text) = std::fs::read_to_string(&left) else {
+            window.push_notification(Notification::info("Couldn’t read the first file."), cx);
+            return;
+        };
+        let Ok(right_text) = std::fs::read_to_string(&right) else {
+            window.push_notification(Notification::info("Couldn’t read the second file."), cx);
+            return;
+        };
+        let left_name = left
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "left".into());
+        let right_name = right
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "right".into());
+        self.open_diff_session(
+            format!("Compare: {left_name} ↔ {right_name}"),
+            left_name,
+            right_name,
+            left_text,
+            right_text,
+            window,
+            cx,
+        );
     }
 
     /// After a folder becomes the Explorer root, avoid leaving a pointless
@@ -3430,6 +3523,10 @@ impl Workspace {
         if !AppSettings::get(cx).auto_save {
             return;
         }
+        // Don't flush under a Save/Close dialog — Keep dirty flags for bulk prompts.
+        if window.has_active_dialog(cx) {
+            return;
+        }
         let dirty: Vec<_> = self
             .documents
             .iter()
@@ -3626,34 +3723,26 @@ impl Workspace {
             })
             .collect();
 
-        match dirty.as_slice() {
-            [] => {
-                for id in valid_targets {
-                    self.discarded.remove(&id);
-                    self.remove_document(id, window, cx);
-                }
+        // Probe #11/#12: ≥2 dirty → one Save All / Don't Save All / Cancel.
+        // Use if/else (not slice match) so the bulk path cannot fall through.
+        if dirty.is_empty() {
+            for id in valid_targets {
+                self.discarded.remove(&id);
+                self.remove_document(id, window, cx);
             }
-            // Probe #11: ≥2 dirty targets → one Save All / Don't Save All / Cancel.
-            many if many.len() >= 2 => {
-                self.confirm_unsaved_many(
-                    dirty,
-                    AfterConfirm::CloseDocuments(valid_targets),
-                    window,
-                    cx,
-                );
+        } else if dirty.len() >= 2 {
+            self.confirm_unsaved_many(
+                dirty,
+                AfterConfirm::CloseDocuments(valid_targets),
+                window,
+                cx,
+            );
+        } else {
+            let doc = dirty.into_iter().next().unwrap();
+            if let Some(ix) = self.document_index(doc.entity_id()) {
+                self.activate_inner(ix, false, window, cx);
             }
-            [doc] => {
-                if let Some(ix) = self.document_index(doc.entity_id()) {
-                    self.activate_inner(ix, false, window, cx);
-                }
-                self.confirm_unsaved(
-                    doc.clone(),
-                    AfterConfirm::CloseDocuments(valid_targets),
-                    window,
-                    cx,
-                );
-            }
-            _ => unreachable!(),
+            self.confirm_unsaved(doc, AfterConfirm::CloseDocuments(valid_targets), window, cx);
         }
     }
 
@@ -3720,6 +3809,18 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if window.has_active_dialog(cx) {
+            // Palette/other dialog may still be tearing down after defer —
+            // retry once so Close All never silently drops the bulk prompt.
+            let dirty = dirty.clone();
+            let next = next.clone();
+            let ws = cx.weak_entity();
+            window.defer(cx, move |window, cx| {
+                if let Some(this) = ws.upgrade() {
+                    this.update(cx, |this, cx| {
+                        this.confirm_unsaved_many(dirty, next, window, cx);
+                    });
+                }
+            });
             return;
         }
         let names: Vec<String> = dirty.iter().map(|doc| doc.read(cx).name()).collect();
@@ -3835,6 +3936,16 @@ impl Workspace {
             return;
         }
         if window.has_active_dialog(cx) {
+            let doc = doc.clone();
+            let next = next.clone();
+            let ws = cx.weak_entity();
+            window.defer(cx, move |window, cx| {
+                if let Some(this) = ws.upgrade() {
+                    this.update(cx, |this, cx| {
+                        this.confirm_unsaved(doc, next, window, cx);
+                    });
+                }
+            });
             return;
         }
 
@@ -5385,44 +5496,68 @@ impl Workspace {
     }
 
     fn render_welcome_cta(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+        let theme = cx.theme();
+        let has_recent = !AppSettings::get(cx).recent_files.is_empty();
+        v_flex()
             .id("welcome-cta")
             .w_full()
-            .gap_2()
-            .px_3()
-            .py_2()
+            .gap_3()
+            .px_4()
+            .py_4()
             .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
-            .items_center()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Welcome to Malgel"),
+            )
             .child(
                 div()
                     .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Start:"),
+                    .text_color(theme.muted_foreground)
+                    .child("Open a folder to browse files, or start from a recent workspace."),
             )
             .child(
-                Button::new("welcome-open-folder")
-                    .small()
-                    .label("Open folder…")
-                    .tooltip("Open folder (Ctrl+K Ctrl+O)")
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenFolder), cx)),
-            )
-            .child(
-                Button::new("welcome-open-file")
-                    .small()
-                    .outline()
-                    .label("Open…")
-                    .tooltip("Open file (Ctrl+O)")
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(Open), cx)),
-            )
-            .child(
-                Button::new("welcome-new-file")
-                    .small()
-                    .outline()
-                    .label("New file")
-                    .tooltip("New file (Ctrl+N)")
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(NewFile), cx)),
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("welcome-open-folder")
+                            .label("Open Folder…")
+                            .primary()
+                            .tooltip("Open folder (Ctrl+K Ctrl+O)")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenFolder), cx)
+                            }),
+                    )
+                    .child(
+                        Button::new("welcome-open-recent")
+                            .label("Open Recent…")
+                            .outline()
+                            .disabled(!has_recent)
+                            .tooltip("Open Recent")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenRecentPicker), cx)
+                            }),
+                    )
+                    .child(
+                        Button::new("welcome-open-file")
+                            .label("Open File…")
+                            .outline()
+                            .tooltip("Open file (Ctrl+O)")
+                            .on_click(|_, window, cx| window.dispatch_action(Box::new(Open), cx)),
+                    )
+                    .child(
+                        Button::new("welcome-new-file")
+                            .label("New File")
+                            .ghost()
+                            .tooltip("New file (Ctrl+N)")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(NewFile), cx)
+                            }),
+                    ),
             )
     }
 
@@ -5754,7 +5889,7 @@ impl Workspace {
                                                 this.child(
                                                     Icon::new(IconName::Pin)
                                                         .xsmall()
-                                                        .text_color(theme.muted_foreground),
+                                                        .text_color(theme.primary),
                                                 )
                                             })
                                             .when(!is_pinned, |this| {
@@ -6805,6 +6940,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::tree_reveal_path))
             .on_action(cx.listener(Self::tree_open))
             .on_action(cx.listener(Self::tree_open_to_side))
+            .on_action(cx.listener(Self::select_for_compare))
+            .on_action(cx.listener(Self::compare_with_selected))
             .on_action(cx.listener(Self::tree_select_up))
             .on_action(cx.listener(Self::tree_select_down))
             .on_action(cx.listener(Self::tree_select_left))
@@ -7138,6 +7275,18 @@ impl Workspace {
 
         let drop_listener = cx.listener(|this, drag: &TabDrag, window, cx| {
             let ix = drag.index.min(this.documents.len().saturating_sub(1));
+            // Probe #12: drop on edge preview creates/moves a split group.
+            if let Some(vertical) = this.tab_split_preview.take() {
+                this.activate(ix, window, cx);
+                this.editor_split = Some(EditorSplit {
+                    other: ix,
+                    vertical,
+                });
+                AppSettings::update(cx, |settings| settings.focus_mode = false);
+                this.tab_insertion = None;
+                cx.notify();
+                return;
+            }
             // Dropping a tab onto the right/bottom half of a split group opens
             // that tab in the secondary pane; otherwise activate + edit|preview.
             if this.editor_split.is_some() {
@@ -7187,15 +7336,16 @@ impl Workspace {
                 .child(panes)
                 .into_any_element()
         } else {
+            let preview = self.tab_split_preview;
+            let ws_right = cx.weak_entity();
+            let ws_down = cx.weak_entity();
             div()
                 .id("document-stack")
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
                 .relative()
-                // Dropping a tab onto the editor opens editor|preview side by
-                // side (Malgel's Split layout) and activates that tab — the
-                // closest VS Code "drag to split" without multi-group editors.
+                // Edge strips set tab_split_preview; drop creates Split Right/Down.
                 .on_drop(drop_listener)
                 .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
                 .children(self.documents.iter().enumerate().map(|(ix, doc)| {
@@ -7207,6 +7357,46 @@ impl Workspace {
                         .when(!shown, |this| this.invisible())
                         .child(doc.clone())
                 }))
+                .child(
+                    div()
+                        .id("tab-drop-right")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .w(px(28.))
+                        .when(preview == Some(false), |this| {
+                            this.bg(cx.theme().drop_target)
+                        })
+                        .on_drag_move::<TabDrag>(move |_: &DragMoveEvent<TabDrag>, _, cx| {
+                            _ = ws_right.update(cx, |this, cx| {
+                                if this.tab_split_preview != Some(false) {
+                                    this.tab_split_preview = Some(false);
+                                    cx.notify();
+                                }
+                            });
+                        }),
+                )
+                .child(
+                    div()
+                        .id("tab-drop-down")
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(28.))
+                        .when(preview == Some(true), |this| {
+                            this.bg(cx.theme().drop_target)
+                        })
+                        .on_drag_move::<TabDrag>(move |_: &DragMoveEvent<TabDrag>, _, cx| {
+                            _ = ws_down.update(cx, |this, cx| {
+                                if this.tab_split_preview != Some(true) {
+                                    this.tab_split_preview = Some(true);
+                                    cx.notify();
+                                }
+                            });
+                        }),
+                )
                 .into_any_element()
         }
     }
@@ -7350,14 +7540,14 @@ impl Workspace {
             ActivityView::SourceControl => self
                 .render_stub_sidebar(
                     "SOURCE CONTROL",
-                    "Source Control is not available yet — on the roadmap.",
+                    "Track changes when Git support lands.",
                     cx,
                 )
                 .into_any_element(),
             ActivityView::Extensions => self
                 .render_stub_sidebar(
                     "EXTENSIONS",
-                    "Extensions are not available yet — on the roadmap.",
+                    "Install add-ons when the marketplace lands.",
                     cx,
                 )
                 .into_any_element(),
@@ -7371,6 +7561,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
+        let is_scm = title.starts_with("SOURCE");
         v_flex()
             .id(title)
             .size_full()
@@ -7388,11 +7579,42 @@ impl Workspace {
                     .child(title),
             )
             .child(
-                div()
+                v_flex()
+                    .gap_3()
                     .p_3()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(message),
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(message),
+                    )
+                    .child(if is_scm {
+                        Button::new("scm-open-folder")
+                            .label("Open Folder…")
+                            .primary()
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenFolder), cx)
+                            })
+                            .into_any_element()
+                    } else {
+                        Button::new("ext-learn-more")
+                            .label("Open Settings…")
+                            .primary()
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenSettings), cx)
+                            })
+                            .into_any_element()
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(if is_scm {
+                                "Git source control is on the roadmap. Open a folder to browse files meanwhile."
+                            } else {
+                                "Extensions marketplace is on the roadmap. Configure Malgel in Settings."
+                            }),
+                    ),
             )
     }
 

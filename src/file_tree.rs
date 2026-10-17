@@ -1515,6 +1515,16 @@ impl FileTree {
                                         .disabled(at_root)
                                         .action(Box::new(crate::actions::OpenToSideInTree)),
                                 )
+                                .item(
+                                    PopupMenuItem::new("Select for Compare")
+                                        .disabled(at_root)
+                                        .action(Box::new(crate::actions::SelectForCompare)),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Compare with Selected")
+                                        .disabled(at_root)
+                                        .action(Box::new(crate::actions::CompareWithSelected)),
+                                )
                                 .separator()
                                 .item(
                                     PopupMenuItem::new("Rename…")

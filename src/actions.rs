@@ -103,6 +103,8 @@ actions!(
         RevealPathInTree,
         OpenInTree,
         OpenToSideInTree,
+        SelectForCompare,
+        CompareWithSelected,
         FocusExplorer,
         TreeSelectUp,
         TreeSelectDown,

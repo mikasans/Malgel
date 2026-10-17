@@ -1,8 +1,8 @@
 //! Settings dialog with a VS Code-like search filter (probe #11).
 
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _, Render,
-    Styled as _, Window,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, FontWeight, IntoElement,
+    ParentElement as _, Render, Styled as _, Window,
     assets::IconName,
     component::{
         ActiveTheme as _, Icon, Sizable as _, WindowExt as _,
@@ -203,10 +203,16 @@ impl SettingsView {
             query: String::new(),
         }
     }
+
+    fn filter_focus(&self, cx: &App) -> FocusHandle {
+        self.filter.read(cx).focus_handle(cx)
+    }
 }
 
 impl Render for SettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Live filter: always read the input so typing narrows even if an event was missed.
+        self.query = self.filter.read(cx).value().to_string();
         let settings = AppSettings::get(cx).clone();
         let default_status = default_app::status(cx);
         let matched: Vec<&SettingRow> = ROWS
@@ -458,6 +464,9 @@ pub fn open(window: &mut Window, cx: &mut App) {
     default_app::refresh(cx);
     window.open_dialog(cx, |dialog, window, cx| {
         let view = cx.new(|cx| SettingsView::new(window, cx));
+        // Probe #12: auto-focus the filter so typing `wrap` / `autosave` works immediately.
+        let focus = view.read(cx).filter_focus(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
         dialog.title("Settings").child(view)
     });
 }
