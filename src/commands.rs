@@ -188,6 +188,9 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
         ],
         "Source Control" => vec![label, "git", "scm", "source control", "version control"],
         "Extensions" => vec![label, "extensions", "extension", "plugins", "marketplace"],
+        "Pin Tab" => vec![label, "pin", "unpin", "pin tab", "unpin tab", "pin editor"],
+        "Show Explorer" => vec![label, "explorer", "show explorer", "files"],
+        "Show Search" => vec![label, "search", "show search", "find in files view"],
         // Probe #10: Close Others / Close Saved / group close discoverability.
         "Close Others" => vec![
             label,
@@ -367,7 +370,7 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Split Editor Right", IconName::Columns2, SplitEditorRight),
             cmd("Split Editor Down", IconName::Rows2, SplitEditorDown),
             cmd("Tabs", IconName::ListTree, ToggleTabs),
-            cmd("Pin or unpin tab", IconName::Pin, PinTab),
+            cmd("Pin Tab", IconName::Pin, PinTab),
             cmd(
                 "PDF page thumbnails",
                 IconName::PanelLeft,
@@ -454,8 +457,8 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Toggle Auto Save", IconName::Save, ToggleAutoSave),
             cmd("Reload Window", IconName::RefreshCw, ReloadWindow),
             cmd("Compare with Saved", IconName::Copy, CompareWithSaved),
-            cmd("Source Control", IconName::Folder, ShowSourceControl),
-            cmd("Extensions", IconName::Info, ShowExtensions),
+            cmd("Source Control", IconName::GitBranch, ShowSourceControl),
+            cmd("Extensions", IconName::Puzzle, ShowExtensions),
             cmd("Color theme…", IconName::Sun, SelectColorTheme),
             cmd(
                 "Appearance: follow the system",
@@ -635,5 +638,29 @@ mod tests {
         assert!(keywords("Keyboard Shortcuts").contains(&"help"));
         assert!(keywords("About Malgel").contains(&"help"));
         assert!(keywords("Markdown guide").contains(&"help"));
+    }
+
+    #[test]
+    fn palette_probe11_pin_search_scm_extensions() {
+        let groups = groups();
+        let labels: Vec<_> = groups
+            .iter()
+            .flat_map(|g| g.items.iter().map(|i| i.label))
+            .collect();
+        for need in [
+            "Pin Tab",
+            "Show Explorer",
+            "Show Search",
+            "Source Control",
+            "Extensions",
+            "Outline",
+            "Compare with Saved",
+        ] {
+            assert!(labels.contains(&need), "missing {need}");
+        }
+        assert!(keywords("Pin Tab").contains(&"pin tab"));
+        assert!(keywords("Show Search").contains(&"show search"));
+        assert!(keywords("Source Control").contains(&"scm"));
+        assert!(keywords("Extensions").contains(&"extensions"));
     }
 }

@@ -35,12 +35,10 @@ use gpui_kit::{
         link::Link,
         menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
         notification::Notification,
-        radio::RadioGroup,
         resizable::{h_resizable, resizable_panel, v_resizable},
         scroll::ScrollableElement as _,
         spinner::Spinner,
         status_bar::StatusBar,
-        switch::Switch,
         v_flex,
     },
     div,
@@ -51,7 +49,7 @@ use gpui_kit::{
 use crate::{
     actions::*,
     analysis::{Analysis, content_hash},
-    commands, default_app, diagram_viewer,
+    commands, diagram_viewer,
     document::{self, LineEnding, display_name},
     document_view::{DocumentEvent, DocumentView},
     docx, export,
@@ -106,11 +104,24 @@ enum KeyboardTarget {
     Preview,
 }
 
-/// Left activity-bar landmark: Explorer vs Search (probe #10).
+/// Left activity-bar landmark (probe #10/#11).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActivityView {
     Explorer,
     Search,
+    SourceControl,
+    Extensions,
+}
+
+/// Active Compare / diff editor session (two-pane + hunks).
+struct DiffSession {
+    title: String,
+    left_label: String,
+    right_label: String,
+    left: String,
+    right: String,
+    hunks: Vec<crate::diff::Hunk>,
+    current: usize,
 }
 
 /// A PDF or an image is rendered *instead of* the editor and the preview, so
@@ -408,8 +419,16 @@ pub struct Workspace {
     last_find: String,
     /// The replacement text Replace in Files last used.
     last_replace: String,
-    /// Explorer vs Search landmark for the activity bar.
+    /// Activity-bar landmark (Explorer / Search / SCM / Extensions).
     activity_view: ActivityView,
+    /// Find field in the Search activity sidebar.
+    search_find: Entity<InputState>,
+    /// Replace field in the Search activity sidebar.
+    search_replace: Entity<InputState>,
+    /// Hits shown in the Search activity sidebar (separate from dialog Find).
+    sidebar_hits: Option<Vec<Hit>>,
+    /// Open Compare / diff session, if any.
+    diff_session: Option<DiffSession>,
     /// Focus for the "Searching…" dialog, so its keys reach it.
     find_focus: FocusHandle,
     file_tree: Entity<FileTree>,
@@ -494,6 +513,8 @@ impl Workspace {
         let tree_prompt = cx.new(|cx| CommandState::new(window, cx));
         let find_query = cx.new(|cx| CommandState::new(window, cx));
         let find_results = cx.new(|cx| CommandState::new(window, cx));
+        let search_find = cx.new(|cx| InputState::new(window, cx).placeholder("Find"));
+        let search_replace = cx.new(|cx| InputState::new(window, cx).placeholder("Replace"));
         let file_tree = cx.new(FileTree::new);
         let terminals = vec![cx.new(|cx| TerminalPanel::new(window, cx))];
 
@@ -593,6 +614,10 @@ impl Workspace {
             last_find: String::new(),
             last_replace: String::new(),
             activity_view: ActivityView::Explorer,
+            search_find,
+            search_replace,
+            sidebar_hits: None,
+            diff_session: None,
             find_focus: cx.focus_handle(),
             file_tree,
             app_menu_bar,
@@ -2187,7 +2212,16 @@ impl Workspace {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".into());
-        self.open_compare_buffer(disk, format!("{name} (saved)"), window, cx);
+        let buffer = doc.read(cx).text_now(cx).to_string();
+        self.open_diff_session(
+            format!("Compare: {name}"),
+            "Saved on disk".into(),
+            "Your edits".into(),
+            disk,
+            buffer,
+            window,
+            cx,
+        );
     }
 
     fn show_source_control(
@@ -2196,17 +2230,21 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.push_notification(
-            Notification::info("Source Control is not available yet — on the roadmap."),
-            cx,
-        );
+        self.activity_view = ActivityView::SourceControl;
+        if !AppSettings::get(cx).file_sidebar {
+            AppSettings::update(cx, |settings| settings.file_sidebar = true);
+        }
+        cx.notify();
+        let _ = window;
     }
 
     fn show_extensions(&mut self, _: &ShowExtensions, window: &mut Window, cx: &mut Context<Self>) {
-        window.push_notification(
-            Notification::info("Extensions are not available yet — on the roadmap."),
-            cx,
-        );
+        self.activity_view = ActivityView::Extensions;
+        if !AppSettings::get(cx).file_sidebar {
+            AppSettings::update(cx, |settings| settings.file_sidebar = true);
+        }
+        cx.notify();
+        let _ = window;
     }
 
     /// Toggle Maximized Panel (VS Code): enlarge the terminal when it is open.
@@ -2286,21 +2324,80 @@ impl Workspace {
         });
     }
 
-    /// Disk-conflict Compare: open the on-disk snapshot as an untitled tab.
+    /// Disk-conflict Compare: two-pane diff with navigable hunks (probe #11).
     fn open_compare_buffer(
         &mut self,
         text: String,
-        _label: String,
+        label: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ending = LineEnding::detect(&text);
-        let doc = cx.new(|cx| DocumentView::new(text, None, ending, window, cx));
-        self.add_document(doc, true, window, cx);
-        window.push_notification(
-            Notification::info("Opened on-disk copy in a new tab for comparison."),
+        let buffer = self.active_document().read(cx).text_now(cx).to_string();
+        self.open_diff_session(
+            label,
+            "On disk".into(),
+            "Your buffer".into(),
+            text,
+            buffer,
+            window,
             cx,
         );
+    }
+
+    fn open_diff_session(
+        &mut self,
+        title: String,
+        left_label: String,
+        right_label: String,
+        left: String,
+        right: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hunks = crate::diff::hunks(&left, &right);
+        if hunks.is_empty() {
+            window.push_notification(Notification::info("No differences."), cx);
+            self.diff_session = None;
+            cx.notify();
+            return;
+        }
+        self.diff_session = Some(DiffSession {
+            title,
+            left_label,
+            right_label,
+            left,
+            right,
+            hunks,
+            current: 0,
+        });
+        cx.notify();
+    }
+
+    fn close_diff_session(&mut self, cx: &mut Context<Self>) {
+        self.diff_session = None;
+        cx.notify();
+    }
+
+    fn diff_next_hunk(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.diff_session.as_mut()
+            && !session.hunks.is_empty()
+        {
+            session.current = (session.current + 1) % session.hunks.len();
+            cx.notify();
+        }
+    }
+
+    fn diff_prev_hunk(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.diff_session.as_mut()
+            && !session.hunks.is_empty()
+        {
+            session.current = if session.current == 0 {
+                session.hunks.len() - 1
+            } else {
+                session.current - 1
+            };
+            cx.notify();
+        }
     }
 
     /// Explorer: open the selected file in a split to the side.
@@ -2853,6 +2950,10 @@ impl Workspace {
         if self.file_tree.read(cx).root().is_none() {
             window.push_notification(Notification::info("Open a folder to search its files."), cx);
             return;
+        }
+        self.activity_view = ActivityView::Search;
+        if !AppSettings::get(cx).file_sidebar {
+            AppSettings::update(cx, |settings| settings.file_sidebar = true);
         }
         // Ctrl+Shift+F over the results (or while searching) starts over:
         // the results give way to the question, asked again with the last
@@ -3460,8 +3561,15 @@ impl Workspace {
         if !AppSettings::get(cx).file_sidebar {
             AppSettings::update(cx, |settings| settings.file_sidebar = true);
         }
+        // Prefill Find from last search; focus the sidebar field (probe #11).
+        let last = self.last_find.clone();
+        if !last.is_empty() {
+            self.search_find
+                .update(cx, |input, cx| input.set_value(last, window, cx));
+        }
+        let focus = self.search_find.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
         cx.notify();
-        self.find_in_files(&FindInFiles, window, cx);
     }
 
     /// Carry out the name a tree prompt collected. `target` names the folder
@@ -3504,28 +3612,48 @@ impl Workspace {
             return;
         }
 
-        let pending = valid_targets.iter().find_map(|id| {
-            self.document_index(*id).and_then(|ix| {
-                let doc = &self.documents[ix];
-                if doc.read(cx).is_dirty() && !self.discarded.contains(id) {
-                    Some((ix, doc.clone()))
-                } else {
-                    None
-                }
+        let dirty: Vec<Entity<DocumentView>> = valid_targets
+            .iter()
+            .filter_map(|id| {
+                self.document_index(*id).and_then(|ix| {
+                    let doc = &self.documents[ix];
+                    if doc.read(cx).is_dirty() && !self.discarded.contains(id) {
+                        Some(doc.clone())
+                    } else {
+                        None
+                    }
+                })
             })
-        });
+            .collect();
 
-        match pending {
-            Some((ix, doc)) => {
-                self.activate_inner(ix, false, window, cx);
-                self.confirm_unsaved(doc, AfterConfirm::CloseDocuments(valid_targets), window, cx);
-            }
-            None => {
+        match dirty.as_slice() {
+            [] => {
                 for id in valid_targets {
                     self.discarded.remove(&id);
                     self.remove_document(id, window, cx);
                 }
             }
+            // Probe #11: ≥2 dirty targets → one Save All / Don't Save All / Cancel.
+            many if many.len() >= 2 => {
+                self.confirm_unsaved_many(
+                    dirty,
+                    AfterConfirm::CloseDocuments(valid_targets),
+                    window,
+                    cx,
+                );
+            }
+            [doc] => {
+                if let Some(ix) = self.document_index(doc.entity_id()) {
+                    self.activate_inner(ix, false, window, cx);
+                }
+                self.confirm_unsaved(
+                    doc.clone(),
+                    AfterConfirm::CloseDocuments(valid_targets),
+                    window,
+                    cx,
+                );
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -3601,6 +3729,7 @@ impl Workspace {
             .collect::<Vec<_>>()
             .join("\n");
         let count = dirty.len();
+        let dirty_ids: Vec<EntityId> = dirty.iter().map(|d| d.entity_id()).collect();
         let workspace = cx.weak_entity();
         let focus = self.alert_focus.clone();
         focus.focus_primary_soon(window, cx);
@@ -3610,6 +3739,7 @@ impl Workspace {
             let cancel_esc = cancel.clone();
             let save_ok = save.clone();
             let save_ok_next = next.clone();
+            let discard_ids = dirty_ids.clone();
             alert
                 .title(format!("Save changes to {count} files?"))
                 .description(format!(
@@ -3639,18 +3769,13 @@ impl Workspace {
                             .justify_end()
                             .child(
                                 Button::new("discard-all")
-                                    .label("Don’t Save")
+                                    .label("Don’t Save All")
                                     .outline()
                                     .on_click(move |_, window, cx| {
                                         window.close_dialog(cx);
                                         let next = discard_next.clone();
+                                        let ids = discard_ids.clone();
                                         _ = discard.update(cx, |this, cx| {
-                                            let ids: Vec<_> = this
-                                                .documents
-                                                .iter()
-                                                .filter(|d| d.read(cx).is_dirty())
-                                                .map(|d| d.entity_id())
-                                                .collect();
                                             for id in ids {
                                                 if let Some(ix) = this.document_index(id) {
                                                     this.documents[ix].update(cx, |doc, _| {
@@ -5102,7 +5227,9 @@ impl Workspace {
                     }
                 }
             };
-            let (on_esc, on_close) = (restore.clone(), restore);
+            let on_esc = restore.clone();
+            let on_close = restore.clone();
+            let on_cancel = restore;
             let kept = kept.clone();
             let confirm_ws = workspace.clone();
             dialog
@@ -5138,6 +5265,10 @@ impl Workspace {
                                     if let Some(this) = confirm_ws.upgrade() {
                                         this.update(cx, |this, cx| this.focus_active(window, cx));
                                     }
+                                })
+                                .on_cancel(move |window, cx| {
+                                    on_cancel(window, cx);
+                                    window.close_dialog(cx);
                                 }),
                         ),
                 )
@@ -5891,13 +6022,31 @@ impl Workspace {
     fn render_outline(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let doc = self.active_document().read(cx);
-        let outline = doc.analysis().outline.clone();
-        let current = doc.current_heading(cx);
-        let min_level = outline
-            .iter()
-            .map(|heading| heading.level)
-            .min()
-            .unwrap_or(1);
+        // Prefer code fold symbols (sample.py etc.); fall back to Markdown headings.
+        let symbols: Vec<(String, usize, u8)> = {
+            let text = doc.text_now(cx);
+            let text = text.as_ref();
+            let editor = doc.editor().read(cx);
+            let rope = editor.text();
+            let mut items = Vec::new();
+            for fold in editor.fold_candidates() {
+                let line = fold.start_line;
+                let start = rope.line_start_offset(line).min(text.len());
+                let end = rope.line_end_offset(line).min(text.len());
+                let label = text.get(start..end).unwrap_or("").trim();
+                if !label.is_empty() {
+                    items.push((label.to_string(), line + 1, 1u8));
+                }
+            }
+            if items.is_empty() {
+                for heading in &doc.analysis().outline {
+                    items.push((heading.text.to_string(), heading.line + 1, heading.level));
+                }
+            }
+            items
+        };
+        let current_line = doc.editor().read(cx).cursor_position().line as usize + 1;
+        let min_level = symbols.iter().map(|(_, _, l)| *l).min().unwrap_or(1);
         v_flex()
             .size_full()
             .bg(theme.sidebar)
@@ -5921,47 +6070,50 @@ impl Workspace {
                     .px_1()
                     .pb_2()
                     .overflow_y_scrollbar()
-                    .when(outline.is_empty(), |this| {
+                    .when(symbols.is_empty(), |this| {
                         this.child(
                             div()
                                 .p_3()
                                 .text_sm()
                                 .text_color(theme.muted_foreground)
-                                .child("No headings yet"),
+                                .child("No symbols yet"),
                         )
                     })
-                    .children(outline.into_iter().enumerate().map(|(ix, heading)| {
-                        let theme = cx.theme();
-                        let active = Some(ix) == current;
-                        div()
-                            .id(("heading", ix))
-                            .flex_none()
-                            .py_1()
-                            .pr_2()
-                            .pl(px(
-                                10. + 12. * f32::from(heading.level.saturating_sub(min_level))
-                            ))
-                            .rounded_md()
-                            .text_sm()
-                            .truncate()
-                            .cursor_pointer()
-                            .when(heading.level <= min_level, |this| {
-                                this.font_weight(FontWeight::MEDIUM)
-                            })
-                            .when(active, |this| {
-                                this.bg(theme.list_active).text_color(theme.foreground)
-                            })
-                            .when(!active, |this| {
-                                this.text_color(theme.muted_foreground)
-                                    .hover(|style| style.bg(theme.list_hover))
-                            })
-                            .child(heading.text.clone())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.with_active(window, cx, |doc, window, cx| {
-                                    doc.reveal_heading(ix, window, cx)
-                                });
-                            }))
-                    })),
+                    .children(
+                        symbols
+                            .into_iter()
+                            .enumerate()
+                            .map(|(ix, (label, line, level))| {
+                                let theme = cx.theme();
+                                let active = line == current_line;
+                                div()
+                                    .id(("outline-sym", ix))
+                                    .flex_none()
+                                    .py_1()
+                                    .pr_2()
+                                    .pl(px(10. + 12. * f32::from(level.saturating_sub(min_level))))
+                                    .rounded_md()
+                                    .text_sm()
+                                    .truncate()
+                                    .cursor_pointer()
+                                    .when(level <= min_level, |this| {
+                                        this.font_weight(FontWeight::MEDIUM)
+                                    })
+                                    .when(active, |this| {
+                                        this.bg(theme.list_active).text_color(theme.foreground)
+                                    })
+                                    .when(!active, |this| {
+                                        this.text_color(theme.muted_foreground)
+                                            .hover(|style| style.bg(theme.list_hover))
+                                    })
+                                    .child(label)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.with_active(window, cx, |doc, window, cx| {
+                                            doc.go_to_line(line, window, cx)
+                                        });
+                                    }))
+                            }),
+                    ),
             )
     }
 
@@ -6087,11 +6239,44 @@ impl Workspace {
                                 menu
                             })
                     })
-                    .child(item(if settings.soft_wrap {
-                        "Wrap".to_string()
-                    } else {
-                        "No Wrap".to_string()
-                    }))
+                    .child({
+                        let ws = workspace.clone();
+                        let label = if settings.soft_wrap {
+                            "Wrap"
+                        } else {
+                            "No Wrap"
+                        };
+                        Button::new("status-wrap")
+                            .ghost()
+                            .xsmall()
+                            .compact()
+                            .label(label)
+                            .tooltip("Toggle Word Wrap")
+                            .on_click(move |_, _, cx| {
+                                _ = ws.update(cx, |this, cx| {
+                                    this.toggle(
+                                        |settings| settings.soft_wrap = !settings.soft_wrap,
+                                        cx,
+                                    );
+                                });
+                            })
+                    })
+                    .when(settings.auto_save, |this| {
+                        let ws = workspace.clone();
+                        this.child(
+                            Button::new("status-autosave")
+                                .ghost()
+                                .xsmall()
+                                .compact()
+                                .label("Auto Save")
+                                .tooltip("Disable Auto Save")
+                                .on_click(move |_, window, cx| {
+                                    _ = ws.update(cx, |this, cx| {
+                                        this.toggle_auto_save(&ToggleAutoSave, window, cx);
+                                    });
+                                }),
+                        )
+                    })
                     .children(doc.encoding().label().map(|label| item(label.to_string())))
                     // EOL picker: LF / CRLF (VS Code-like).
                     .child(
@@ -6166,29 +6351,40 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Light breadcrumbs under the tab strip: folder › file (probe #6).
+    /// Light breadcrumbs under the tab strip: clickable path segments (probe #6/#11).
     fn render_breadcrumbs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let doc = self.active_document().read(cx);
-        let crumbs = match doc.path() {
+        // (label, absolute path to reveal — None for untitled / file leaf opens nothing extra)
+        let crumbs: Vec<(String, Option<PathBuf>)> = match doc.path() {
             Some(path) => {
-                let mut parts: Vec<String> = Vec::new();
+                let mut out = Vec::new();
                 if let Some(root) = self.file_tree.read(cx).root()
                     && let Ok(rel) = path.strip_prefix(root)
                 {
-                    for c in rel.components() {
-                        parts.push(c.as_os_str().to_string_lossy().into_owned());
+                    let mut acc = root.to_path_buf();
+                    let comps: Vec<_> = rel.components().collect();
+                    for (i, c) in comps.iter().enumerate() {
+                        acc.push(c);
+                        let label = c.as_os_str().to_string_lossy().into_owned();
+                        let is_last = i + 1 == comps.len();
+                        out.push((label, if is_last { None } else { Some(acc.clone()) }));
                     }
                 }
-                if parts.is_empty() {
-                    parts.push(display_name(Some(path)));
-                    if let Some(parent) = path.parent().and_then(|p| p.file_name()) {
-                        parts.insert(0, parent.to_string_lossy().into_owned());
+                if out.is_empty() {
+                    let name = display_name(Some(path));
+                    if let Some(parent) = path.parent() {
+                        let parent_name = parent
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| parent.display().to_string());
+                        out.push((parent_name, Some(parent.to_path_buf())));
                     }
+                    out.push((name, None));
                 }
-                parts
+                out
             }
-            None => vec!["Untitled".into()],
+            None => vec![("Untitled".into(), None)],
         };
         h_flex()
             .id("breadcrumbs")
@@ -6202,19 +6398,50 @@ impl Workspace {
             .bg(theme.background)
             .text_xs()
             .text_color(theme.muted_foreground)
-            .children(crumbs.into_iter().enumerate().flat_map(|(i, part)| {
-                let mut row = Vec::new();
-                if i > 0 {
-                    row.push(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child("›")
-                            .into_any_element(),
-                    );
-                }
-                row.push(div().child(part).into_any_element());
-                row
-            }))
+            .children(
+                crumbs
+                    .into_iter()
+                    .enumerate()
+                    .flat_map(|(i, (part, target))| {
+                        let theme = cx.theme();
+                        let mut row = Vec::new();
+                        if i > 0 {
+                            row.push(
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child("›")
+                                    .into_any_element(),
+                            );
+                        }
+                        let crumb = if let Some(path) = target {
+                            div()
+                                .id(("crumb", i))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme.foreground).underline())
+                                .child(part)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    // Reveal folder in Explorer.
+                                    this.activity_view = ActivityView::Explorer;
+                                    if !AppSettings::get(cx).file_sidebar {
+                                        AppSettings::update(cx, |s| s.file_sidebar = true);
+                                    }
+                                    this.file_tree.update(cx, |tree, cx| {
+                                        tree.set_active(Some(path.clone()), cx);
+                                    });
+                                    this.focus_explorer(&FocusExplorer, window, cx);
+                                    cx.notify();
+                                }))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .text_color(theme.foreground)
+                                .child(part)
+                                .into_any_element()
+                        };
+                        row.push(crumb);
+                        row
+                    }),
+            )
     }
 }
 
@@ -6240,286 +6467,7 @@ const STATUS_LANGUAGE_MODES: &[(&str, &str)] = &[
 
 /// The settings dialog: Malgel's optional features and how it behaves.
 pub fn open_settings(window: &mut Window, cx: &mut App) {
-    if window.has_active_dialog(cx) {
-        return;
-    }
-    // Ask the system afresh each time, as the user may have changed the
-    // default app elsewhere.
-    default_app::refresh(cx);
-    window.open_dialog(cx, |dialog, _, cx| {
-        let settings = AppSettings::get(cx).clone();
-        let default_status = default_app::status(cx);
-        let row = |id: &'static str,
-                   title: &'static str,
-                   description: &'static str,
-                   checked: bool,
-                   update: fn(&mut crate::settings::Settings, bool),
-                   cx: &App| {
-            h_flex()
-                .gap_4()
-                .py_2()
-                .justify_between()
-                .child(
-                    v_flex()
-                        .gap_0p5()
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(description),
-                        ),
-                )
-                .child(
-                    Switch::new(id)
-                        .checked(checked)
-                        .on_click(move |checked, _, cx| {
-                            let checked = *checked;
-                            AppSettings::update(cx, |settings| update(settings, checked));
-                        }),
-                )
-        };
-        let section = |title: &'static str| {
-            div()
-                .pt_3()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(cx.theme().muted_foreground)
-                .child(title)
-        };
-        dialog.title("Settings").w(px(560.)).child(
-            v_flex()
-                .child(section("WORKSPACE"))
-                .child(row(
-                    "tabs",
-                    "Tabs",
-                    "Open documents side by side in tabs instead of one at a time.",
-                    settings.tabs,
-                    |settings, on| settings.tabs = on,
-                    cx,
-                ))
-                .child(row(
-                    "file-sidebar",
-                    "File sidebar",
-                    "Browse a folder’s Markdown files beside the editor.",
-                    settings.file_sidebar,
-                    |settings, on| settings.file_sidebar = on,
-                    cx,
-                ))
-                .child(row(
-                    "outline",
-                    "Outline",
-                    "List the document’s headings beside the editor.",
-                    settings.outline_sidebar,
-                    |settings, on| settings.outline_sidebar = on,
-                    cx,
-                ))
-                .child(row(
-                    "problems",
-                    "Problems",
-                    "List diagnostics and spell issues in a panel (VS Code Problems).",
-                    settings.problems_panel,
-                    |settings, on| settings.problems_panel = on,
-                    cx,
-                ))
-                .child(row(
-                    "minimap",
-                    "Minimap",
-                    "Show a code overview strip beside the editor.",
-                    settings.minimap,
-                    |settings, on| settings.minimap = on,
-                    cx,
-                ))
-                .child(row(
-                    "restore-session",
-                    "Reopen last session",
-                    "Start with the documents, folder and window you had open.",
-                    settings.restore_session,
-                    |settings, on| settings.restore_session = on,
-                    cx,
-                ))
-                .child(section("WRITING"))
-                .child(row(
-                    "spell-check",
-                    "Check spelling",
-                    "Underline unknown words; right-click one for suggestions.",
-                    settings.spell_check,
-                    |settings, on| settings.spell_check = on,
-                    cx,
-                ))
-                .child(row(
-                    "scroll-sync",
-                    "Sync scrolling",
-                    "Keep the preview on the part of the document being edited.",
-                    settings.scroll_sync,
-                    |settings, on| settings.scroll_sync = on,
-                    cx,
-                ))
-                .child(row(
-                    "soft-wrap",
-                    "Wrap lines",
-                    "Wrap long lines in the editor instead of scrolling sideways.",
-                    settings.soft_wrap,
-                    |settings, on| settings.soft_wrap = on,
-                    cx,
-                ))
-                .child(row(
-                    "auto-save",
-                    "Auto Save",
-                    "Automatically save dirty editors after a short delay.",
-                    settings.auto_save,
-                    |settings, on| settings.auto_save = on,
-                    cx,
-                ))
-                .child(row(
-                    "gfm-breaks",
-                    "Preview soft line breaks",
-                    "Show single newlines in a paragraph as line breaks in the preview (GFM breaks).",
-                    settings.gfm_breaks,
-                    |settings, on| settings.gfm_breaks = on,
-                    cx,
-                ))
-                .child(row(
-                    "line-numbers",
-                    "Line numbers",
-                    "Number the lines in the editor.",
-                    settings.line_numbers,
-                    |settings, on| settings.line_numbers = on,
-                    cx,
-                ))
-                .child(section("LINKS"))
-                .child(
-                    h_flex()
-                        .gap_4()
-                        .py_2()
-                        .justify_between()
-                        .child(
-                            v_flex()
-                                .gap_0p5()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child("Open linked documents in"),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(if cfg!(target_os = "macos") {
-                                            "Command-click a link to do the opposite."
-                                        } else {
-                                            "Ctrl-click a link to do the opposite."
-                                        }),
-                                ),
-                        )
-                        .child(
-                            RadioGroup::horizontal("open-links-in")
-                                .flex_none()
-                                .child("A new tab")
-                                .child("The same tab")
-                                .selected_index(Some(match settings.open_links_in {
-                                    LinkPlacement::NewTab => 0,
-                                    LinkPlacement::SameTab => 1,
-                                }))
-                                .on_click(|ix, _, cx| {
-                                    let placement = if *ix == 0 {
-                                        LinkPlacement::NewTab
-                                    } else {
-                                        LinkPlacement::SameTab
-                                    };
-                                    AppSettings::update(cx, |settings| {
-                                        settings.open_links_in = placement
-                                    });
-                                }),
-                        ),
-                )
-                .child(row(
-                    "confirm-web-links",
-                    "Ask before opening web links",
-                    "Show where a link leads before it opens in your browser.",
-                    settings.confirm_web_links,
-                    |settings, on| settings.confirm_web_links = on,
-                    cx,
-                ))
-                .child(row(
-                    "confirm-drag-and-drop",
-                    "Ask before moving files dragged in the sidebar",
-                    "Confirm where a dragged file lands before it moves; holding Ctrl (Option on macOS) copies instead.",
-                    settings.confirm_drag_and_drop,
-                    |settings, on| settings.confirm_drag_and_drop = on,
-                    cx,
-                ))
-                .child(section("FILES"))
-                .child(default_app_row(default_status, cx)),
-        )
-    });
-}
-
-/// The settings row that makes Malgel the app for Markdown files.
-fn default_app_row(status: default_app::Status, cx: &App) -> impl IntoElement {
-    let is_default = status == default_app::Status::Default;
-    let description = if is_default {
-        "Markdown files you open from your desktop open in Malgel."
-    } else if default_app::CHOSEN_IN_SYSTEM_SETTINGS {
-        "Choose Malgel for Markdown files in Windows Settings."
-    } else {
-        "Open Markdown files from your desktop in Malgel."
-    };
-    let action = if is_default {
-        h_flex()
-            .gap_1()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(Icon::new(IconName::Check).small())
-            .child("Default")
-            .into_any_element()
-    } else {
-        let label = if default_app::CHOSEN_IN_SYSTEM_SETTINGS {
-            "Open Settings…"
-        } else {
-            "Make Default"
-        };
-        Button::new("make-default")
-            .label(label)
-            .small()
-            .outline()
-            .on_click(|_, window, cx| {
-                let note = match default_app::make_default(cx) {
-                    Ok(default_app::Outcome::Done) => {
-                        Notification::success("Malgel now opens Markdown files.")
-                    }
-                    Ok(default_app::Outcome::SettingsOpened) => {
-                        Notification::info("In Settings, set Malgel as the default for .md files.")
-                    }
-                    Err(message) => Notification::error(message),
-                };
-                window.push_notification(note, cx);
-                window.refresh();
-            })
-            .into_any_element()
-    };
-    h_flex()
-        .gap_4()
-        .py_2()
-        .justify_between()
-        .child(
-            v_flex()
-                .gap_0p5()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child("Default app for Markdown"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(description),
-                ),
-        )
-        .child(action)
+    crate::settings_ui::open(window, cx);
 }
 
 /// Malgel's website, linked from the About dialog.
@@ -6780,7 +6728,7 @@ impl Render for Workspace {
                 resizable_panel()
                     .size(files_width)
                     .size_range(sidebar_range.clone())
-                    .child(self.file_tree.clone()),
+                    .child(self.render_activity_sidebar(cx)),
             );
         }
         main = main.child(
@@ -6794,7 +6742,11 @@ impl Render for Workspace {
                         .when(self.shows_welcome_cta(cx), |this| {
                             this.child(self.render_welcome_cta(cx))
                         })
-                        .child(self.render_document_stack(cx)),
+                        .child(if self.diff_session.is_some() {
+                            self.render_diff_editor(cx).into_any_element()
+                        } else {
+                            self.render_document_stack(cx).into_any_element()
+                        }),
                 ),
         );
         if show_outline {
@@ -7391,13 +7343,415 @@ impl Workspace {
         }
     }
 
-    /// Thin VS Code-like activity bar: Explorer vs Search landmark (probe #10).
+    fn render_activity_sidebar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        match self.activity_view {
+            ActivityView::Explorer => self.file_tree.clone().into_any_element(),
+            ActivityView::Search => self.render_search_sidebar(cx).into_any_element(),
+            ActivityView::SourceControl => self
+                .render_stub_sidebar(
+                    "SOURCE CONTROL",
+                    "Source Control is not available yet — on the roadmap.",
+                    cx,
+                )
+                .into_any_element(),
+            ActivityView::Extensions => self
+                .render_stub_sidebar(
+                    "EXTENSIONS",
+                    "Extensions are not available yet — on the roadmap.",
+                    cx,
+                )
+                .into_any_element(),
+        }
+    }
+
+    fn render_stub_sidebar(
+        &self,
+        title: &'static str,
+        message: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        v_flex()
+            .id(title)
+            .size_full()
+            .bg(theme.sidebar)
+            .child(
+                div()
+                    .h(px(32.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .p_3()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(message),
+            )
+    }
+
+    /// Search activity: Find + Replace fields and results (probe #11).
+    fn render_search_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let workspace = cx.weak_entity();
+        let hits = self.sidebar_hits.clone().unwrap_or_default();
+        v_flex()
+            .id("search-sidebar")
+            .size_full()
+            .bg(theme.sidebar)
+            .child(
+                div()
+                    .h(px(32.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .child("SEARCH"),
+            )
+            .child(
+                v_flex()
+                    .flex_none()
+                    .gap_1()
+                    .px_2()
+                    .pb_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("Find"),
+                    )
+                    .child(Input::new(&self.search_find))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("Replace"),
+                    )
+                    .child(Input::new(&self.search_replace))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child({
+                                let ws = workspace.clone();
+                                Button::new("sidebar-find")
+                                    .label("Find")
+                                    .xsmall()
+                                    .outline()
+                                    .on_click(move |_, window, cx| {
+                                        _ = ws.update(cx, |this, cx| {
+                                            this.sidebar_run_find(window, cx);
+                                        });
+                                    })
+                            })
+                            .child({
+                                let ws = workspace.clone();
+                                Button::new("sidebar-replace")
+                                    .label("Replace")
+                                    .xsmall()
+                                    .outline()
+                                    .on_click(move |_, window, cx| {
+                                        _ = ws.update(cx, |this, cx| {
+                                            this.sidebar_run_replace(false, window, cx);
+                                        });
+                                    })
+                            })
+                            .child({
+                                let ws = workspace.clone();
+                                Button::new("sidebar-replace-all")
+                                    .label("Replace All")
+                                    .xsmall()
+                                    .primary()
+                                    .on_click(move |_, window, cx| {
+                                        _ = ws.update(cx, |this, cx| {
+                                            this.sidebar_run_replace(true, window, cx);
+                                        });
+                                    })
+                            }),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("search-sidebar-hits")
+                    .flex_1()
+                    .min_h_0()
+                    .px_1()
+                    .pb_2()
+                    .overflow_y_scrollbar()
+                    .when(hits.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .p_3()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child("No results yet — Find to search the folder."),
+                        )
+                    })
+                    .children(hits.into_iter().enumerate().map(|(ix, hit)| {
+                        let theme = cx.theme();
+                        let path = hit.path.clone();
+                        let line = hit.line;
+                        let label = format!(
+                            "{}:{}  {}",
+                            hit.path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| hit.path.display().to_string()),
+                            hit.line,
+                            hit.text
+                        );
+                        div()
+                            .id(("sidebar-hit", ix))
+                            .flex_none()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .truncate()
+                            .cursor_pointer()
+                            .text_color(theme.muted_foreground)
+                            .hover(|s| s.bg(theme.list_hover).text_color(theme.foreground))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_paths(vec![path.clone()], Placement::Default, window, cx);
+                                this.with_active(window, cx, |doc, window, cx| {
+                                    doc.go_to_line(line, window, cx);
+                                });
+                            }))
+                    })),
+            )
+    }
+
+    fn sidebar_run_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let find = self.search_find.read(cx).value().to_string();
+        if find.is_empty() {
+            window.push_notification(Notification::info("Enter text to find."), cx);
+            return;
+        }
+        let Some(root) = self.file_tree.read(cx).root().map(Path::to_path_buf) else {
+            window.push_notification(Notification::info("Open a folder to search its files."), cx);
+            return;
+        };
+        self.last_find = find.clone();
+        let show_hidden = AppSettings::get(cx).show_hidden_entries;
+        let opened = self.file_tree.read(cx).expanded_folders();
+        let wanted = find;
+        let listing = cx.background_executor().spawn(async move {
+            let files = quick_open::files_under(&root, show_hidden, &opened, quick_open::MAX_FILES);
+            search::search_files_until(
+                &files,
+                &wanted,
+                search::MAX_HITS,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let hits = listing.await;
+            _ = this.update(cx, |this, cx| {
+                this.sidebar_hits = Some(hits);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn sidebar_run_replace(&mut self, all: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let find = self.search_find.read(cx).value().to_string();
+        let replace = self.search_replace.read(cx).value().to_string();
+        if find.is_empty() {
+            window.push_notification(Notification::info("Enter text to find."), cx);
+            return;
+        }
+        self.last_find = find.clone();
+        self.last_replace = replace.clone();
+        if all {
+            self.confirm_replace_in_files(find, replace, window, cx);
+        } else {
+            // Preview via the same confirm dialog (single Replace still confirms).
+            self.confirm_replace_in_files(find, replace, window, cx);
+        }
+    }
+
+    fn render_diff_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let Some(session) = self.diff_session.as_ref() else {
+            return div().into_any_element();
+        };
+        let hunk_n = session.hunks.len();
+        let current = session.current.min(hunk_n.saturating_sub(1));
+        let hunk = session.hunks.get(current);
+        let left_lines = crate::diff::lines(&session.left);
+        let right_lines = crate::diff::lines(&session.right);
+        let left_view = hunk
+            .map(|h| {
+                let start = h.left_start.saturating_sub(2);
+                let end = (h.left_start + h.left_count + 2).min(left_lines.len());
+                left_lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| format!("{:>4} │ {}", start + i + 1, line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| "(no hunk)".into());
+        let right_view = hunk
+            .map(|h| {
+                let start = h.right_start.saturating_sub(2);
+                let end = (h.right_start + h.right_count + 2).min(right_lines.len());
+                right_lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| format!("{:>4} │ {}", start + i + 1, line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| "(no hunk)".into());
+        let workspace = cx.weak_entity();
+        v_flex()
+            .id("diff-editor")
+            .size_full()
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .h(px(36.))
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(session.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("Hunk {} of {}", current + 1, hunk_n)),
+                    )
+                    .child({
+                        let ws = workspace.clone();
+                        Button::new("diff-prev")
+                            .label("Previous")
+                            .xsmall()
+                            .outline()
+                            .on_click(move |_, _, cx| {
+                                _ = ws.update(cx, |this, cx| this.diff_prev_hunk(cx));
+                            })
+                    })
+                    .child({
+                        let ws = workspace.clone();
+                        Button::new("diff-next")
+                            .label("Next")
+                            .xsmall()
+                            .outline()
+                            .on_click(move |_, _, cx| {
+                                _ = ws.update(cx, |this, cx| this.diff_next_hunk(cx));
+                            })
+                    })
+                    .child({
+                        let ws = workspace.clone();
+                        Button::new("diff-close").label("Close").xsmall().on_click(
+                            move |_, _, cx| {
+                                _ = ws.update(cx, |this, cx| this.close_diff_session(cx));
+                            },
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .border_r_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.muted_foreground)
+                                    .bg(theme.sidebar)
+                                    .child(session.left_label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id("diff-left")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .p_2()
+                                    .font_family(theme.mono_font_family.clone())
+                                    .text_xs()
+                                    .overflow_y_scrollbar()
+                                    .child(left_view),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.muted_foreground)
+                                    .bg(theme.sidebar)
+                                    .child(session.right_label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id("diff-right")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .p_2()
+                                    .font_family(theme.mono_font_family.clone())
+                                    .text_xs()
+                                    .overflow_y_scrollbar()
+                                    .child(right_view),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Thin VS Code-like activity bar: Explorer / Search / SCM / Extensions.
     fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let active = self.activity_view;
-        let explorer_on = active == ActivityView::Explorer;
-        let search_on = active == ActivityView::Search;
         let workspace = cx.weak_entity();
+        let btn = |id: &'static str,
+                   icon: IconName,
+                   tip: &'static str,
+                   on: bool,
+                   click: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+            let ws = workspace.clone();
+            Button::new(id)
+                .ghost()
+                .icon(Icon::new(icon))
+                .tooltip(tip)
+                .selected(on)
+                .on_click(move |_, window, cx| {
+                    _ = ws.update(cx, |this, cx| click(this, window, cx));
+                })
+        };
         v_flex()
             .id("activity-bar")
             .w(px(48.))
@@ -7409,36 +7763,34 @@ impl Workspace {
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.border)
-            .child(
-                Button::new("activity-explorer")
-                    .ghost()
-                    .icon(Icon::new(IconName::Files))
-                    .tooltip("Explorer (Ctrl+Shift+E)")
-                    .selected(explorer_on)
-                    .on_click({
-                        let ws = workspace.clone();
-                        move |_, window, cx| {
-                            _ = ws.update(cx, |this, cx| {
-                                this.show_explorer_view(&ShowExplorerView, window, cx);
-                            });
-                        }
-                    }),
-            )
-            .child(
-                Button::new("activity-search")
-                    .ghost()
-                    .icon(Icon::new(IconName::Search))
-                    .tooltip("Search (Ctrl+Shift+F)")
-                    .selected(search_on)
-                    .on_click({
-                        let ws = workspace.clone();
-                        move |_, window, cx| {
-                            _ = ws.update(cx, |this, cx| {
-                                this.show_search_view(&ShowSearchView, window, cx);
-                            });
-                        }
-                    }),
-            )
+            .child(btn(
+                "activity-explorer",
+                IconName::Files,
+                "Explorer (Ctrl+Shift+E)",
+                active == ActivityView::Explorer,
+                |this, window, cx| this.show_explorer_view(&ShowExplorerView, window, cx),
+            ))
+            .child(btn(
+                "activity-search",
+                IconName::Search,
+                "Search (Ctrl+Shift+F)",
+                active == ActivityView::Search,
+                |this, window, cx| this.show_search_view(&ShowSearchView, window, cx),
+            ))
+            .child(btn(
+                "activity-scm",
+                IconName::GitBranch,
+                "Source Control",
+                active == ActivityView::SourceControl,
+                |this, window, cx| this.show_source_control(&ShowSourceControl, window, cx),
+            ))
+            .child(btn(
+                "activity-extensions",
+                IconName::Puzzle,
+                "Extensions",
+                active == ActivityView::Extensions,
+                |this, window, cx| this.show_extensions(&ShowExtensions, window, cx),
+            ))
     }
 
     /// Editor panes, with Problems and/or the integrated terminal underneath.

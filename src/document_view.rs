@@ -2436,6 +2436,7 @@ impl DocumentView {
     }
 
     /// The outline entry the caret is in (the last heading above it).
+    #[allow(dead_code)]
     pub fn current_heading(&self, cx: &App) -> Option<usize> {
         let editor = self.editor.read(cx);
         let line = if Self::shows_editor(cx) {
