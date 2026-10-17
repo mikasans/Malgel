@@ -35,7 +35,7 @@ use gpui_kit::{
         menu::{AppMenuBar, ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
         notification::Notification,
         radio::RadioGroup,
-        resizable::{h_resizable, resizable_panel},
+        resizable::{h_resizable, resizable_panel, v_resizable},
         scroll::ScrollableElement as _,
         spinner::Spinner,
         status_bar::StatusBar,
@@ -67,6 +67,7 @@ use crate::{
     session::{self, DiskStamp, Session, SessionDocument, WindowPlacement},
     settings::{Appearance, Layout, LinkPlacement, clamp_font_size},
     spell,
+    terminal::{self, TerminalPanel},
     themes::{self, AppSettings},
 };
 
@@ -435,6 +436,9 @@ pub struct Workspace {
     tab_drag_copy: Cell<bool>,
     _watch_task: Task<()>,
     document_subscriptions: Vec<(EntityId, Vec<Subscription>)>,
+    /// Integrated terminal in the bottom panel (Ctrl+`).
+    terminal: Entity<TerminalPanel>,
+    terminal_visible: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -457,6 +461,7 @@ impl Workspace {
         let find_query = cx.new(|cx| CommandState::new(window, cx));
         let find_results = cx.new(|cx| CommandState::new(window, cx));
         let file_tree = cx.new(FileTree::new);
+        let terminal = cx.new(|cx| TerminalPanel::new(window, cx));
 
         let subscriptions = vec![
             cx.subscribe_in(
@@ -569,6 +574,8 @@ impl Workspace {
             tab_drag_copy: Cell::new(false),
             _watch_task: watch_task,
             document_subscriptions: Vec::new(),
+            terminal,
+            terminal_visible: false,
             _subscriptions: subscriptions,
         };
         this.restore(paths, &settings, window, cx);
@@ -1890,61 +1897,20 @@ impl Workspace {
         self.open_paths(vec![path], Placement::Default, window, cx);
     }
 
-    /// Open a system terminal in the current folder (VS Code Ctrl+`).
-    fn summon_terminal(&mut self, cx: &mut Context<Self>) {
-        let doc_dir = self
-            .active_document()
-            .read(cx)
-            .path()
-            .and_then(|path| path.parent().map(|parent| parent.to_path_buf()));
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .ok()
-            .map(PathBuf::from);
-        let dir = self
-            .file_tree
-            .read(cx)
-            .root()
-            .map(Path::to_path_buf)
-            .or(doc_dir)
-            .or(home);
-        let Some(dir) = dir else {
-            return;
-        };
-        #[cfg(target_os = "windows")]
-        {
-            if std::process::Command::new("wt")
-                .arg("-d")
-                .arg(&dir)
-                .spawn()
-                .is_err()
-            {
-                let _ = std::process::Command::new("cmd")
-                    .args(["/C", "start", "", "/D"])
-                    .arg(&dir)
-                    .spawn();
-            }
+    /// Toggle the integrated terminal panel (VS Code Ctrl+`).
+    fn summon_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_visible = !self.terminal_visible;
+        if self.terminal_visible {
+            let cwd = terminal::terminal_cwd(
+                self.file_tree.read(cx).root(),
+                self.active_document().read(cx).path().map(|p| p.as_path()),
+            );
+            self.terminal.update(cx, |term, cx| {
+                term.set_cwd(cwd, cx);
+                term.ensure_running(window, cx);
+            });
         }
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("open")
-                .arg("-a")
-                .arg("Terminal")
-                .arg(&dir)
-                .spawn();
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            let spawned = std::process::Command::new("x-terminal-emulator")
-                .current_dir(&dir)
-                .spawn()
-                .or_else(|_| {
-                    std::process::Command::new("xterm")
-                        .current_dir(&dir)
-                        .spawn()
-                });
-            let _ = spawned;
-        }
+        cx.notify();
     }
 
     fn open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
@@ -4155,12 +4121,18 @@ impl Workspace {
             )
             .child(
                 // The document name, centered on the window like native title bars.
+                // Click copies the absolute path; a toast confirms.
                 h_flex()
+                    .id("title-bar-path")
                     .absolute()
                     .inset_0()
                     .justify_center()
                     .gap_1p5()
                     .text_sm()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.copy_title_path(window, cx);
+                    }))
                     .child(
                         div()
                             .font_weight(FontWeight::MEDIUM)
@@ -5357,7 +5329,6 @@ impl Render for Workspace {
         let focus_mode = settings.focus_mode;
         let show_files = settings.file_sidebar && !focus_mode;
         let show_outline = settings.outline_sidebar && !focus_mode;
-        let document = self.active_document().clone();
         let rem = window.rem_size();
         let sidebar_range = rems(12.).to_pixels(rem)..rems(28.).to_pixels(rem);
         let files_width = rems(15.).to_pixels(rem);
@@ -5392,7 +5363,7 @@ impl Render for Workspace {
                     v_flex()
                         .size_full()
                         .when(self.shows_tabs(cx), |this| this.child(self.render_tabs(cx)))
-                        .child(div().flex_1().min_h_0().min_w_0().child(document)),
+                        .child(self.render_document_stack(cx)),
                 ),
         );
         if show_outline {
@@ -5497,7 +5468,11 @@ impl Render for Workspace {
                     cx,
                 )
             }))
-            .on_action(cx.listener(|this, _: &SummonTerminal, _, cx| this.summon_terminal(cx)))
+            .on_action(
+                cx.listener(|this, _: &SummonTerminal, window, cx| {
+                    this.summon_terminal(window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &ToggleTabs, _, cx| {
                 this.toggle(|settings| settings.tabs = !settings.tabs, cx)
             }))
@@ -5660,19 +5635,100 @@ impl Render for Workspace {
                 }
             }))
             .child(self.render_title_bar(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .drag_over::<TreeDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
-                    .child(main),
-            )
+            .child(self.render_center(main, focus_mode, rem, cx))
             .when(!focus_mode, |this| this.child(self.render_status_bar(cx)))
     }
 }
 
 impl Workspace {
+    /// Absolute path of the active document onto the clipboard, with a toast.
+    fn copy_title_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.active_document().read(cx).path().cloned() else {
+            window.push_notification(
+                Notification::info("Save the document to give it a location."),
+                cx,
+            );
+            return;
+        };
+        let abs = path
+            .canonicalize()
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        cx.write_to_clipboard(ClipboardItem::new_string(abs.clone()));
+        window.push_notification(Notification::info(format!("Copied {abs}")), cx);
+    }
+
+    /// Keep every open document mounted so tab switches do not remount the
+    /// preview/editor (scroll and preview state stay put, VS Code-like).
+    fn render_document_stack(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.active;
+        div()
+            .id("document-stack")
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .relative()
+            // Dropping a tab onto the editor opens editor|preview side by
+            // side (Malgel's Split layout) and activates that tab — the
+            // closest VS Code "drag to split" without multi-group editors.
+            .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
+                let ix = drag.index.min(this.documents.len().saturating_sub(1));
+                this.activate(ix, window, cx);
+                AppSettings::update(cx, |settings| {
+                    settings.layout = Layout::Split;
+                    settings.focus_mode = false;
+                });
+                this.tab_insertion = None;
+                cx.notify();
+            }))
+            .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+            .children(self.documents.iter().enumerate().map(|(ix, doc)| {
+                let shown = ix == active;
+                div()
+                    .id(("doc-pane", ix))
+                    .absolute()
+                    .inset_0()
+                    .when(!shown, |this| this.invisible())
+                    .child(doc.clone())
+            }))
+    }
+
+    /// Editor panes, with the integrated terminal docked underneath when open.
+    fn render_center(
+        &self,
+        main: impl IntoElement,
+        focus_mode: bool,
+        rem: Pixels,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let body = div()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .drag_over::<TreeDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+            .child(main);
+
+        if self.terminal_visible && !focus_mode {
+            let term_h = rems(12.).to_pixels(rem);
+            v_resizable("center-with-terminal")
+                .child(
+                    resizable_panel()
+                        .size_range(rems(12.).to_pixels(rem)..Pixels::MAX)
+                        .child(body),
+                )
+                .child(
+                    resizable_panel()
+                        .size(term_h)
+                        .size_range(rems(6.).to_pixels(rem)..rems(28.).to_pixels(rem))
+                        .child(self.terminal.clone()),
+                )
+                .into_any_element()
+        } else {
+            body.into_any_element()
+        }
+    }
+
     /// Open files handed over by the system while running (macOS "Open
     /// with", a second launch).
     pub fn open_external(

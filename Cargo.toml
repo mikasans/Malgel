@@ -1,6 +1,6 @@
 [package]
 name = "malgel"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2024"
 description = "Malgel — a fast, native Markdown editor and previewer built with GPUI Kit."
 license = "Apache-2.0"
@@ -99,6 +99,8 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 # the global git ignore, so the palette does not offer build output or a
 # vendored tree. Typst already pulls it in, so the lockfile does not move.
 ignore = "0.4.33"
+# Integrated terminal (Ctrl+`): a real shell in a bottom panel via a PTY.
+portable-pty = "0.9"
 # Math rendering, all pure Rust: LaTeX is translated to Typst math, laid out
 # by the Typst compiler with its bundled math fonts, and drawn as SVG (or PNG
 # for Word). PDF export compiles whole documents with the same compiler.
