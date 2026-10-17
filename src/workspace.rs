@@ -352,6 +352,20 @@ enum DiskChange {
     Touched(Option<DiskStamp>),
 }
 
+
+/// Labels near the top of the editor-tab context menu (probe #15/#16).
+/// Kept as a pure list so tests can prove Select for Compare is registered
+/// even when Xvfb hit-testing is involved.
+fn tab_context_menu_labels(pinned: bool) -> [&'static str; 5] {
+    [
+        if pinned { "Unpin" } else { "Pin" },
+        "Select for Compare",
+        "Compare with Selected",
+        "Close",
+        "Close Other Tabs",
+    ]
+}
+
 /// A tab being dragged to a new position, the way tabs reorder in VS Code.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TabDrag {
@@ -3897,6 +3911,13 @@ impl Workspace {
         if self.closing {
             return true;
         }
+        // Probe #16: with Auto Save on, flush path-backed dirty buffers first
+        // so close is not a confusing silent no-op racing the timer. With Auto
+        // Save off, dirty flags stay and the Save / Don't Save / Cancel dialog
+        // must appear (Esc cancels via confirm_unsaved).
+        if AppSettings::get(cx).auto_save {
+            self.auto_save_dirty(window, cx);
+        }
         let unsaved = self
             .documents
             .iter()
@@ -4123,7 +4144,7 @@ impl Workspace {
                             .justify_end()
                             .child(
                                 Button::new("discard")
-                                    .label("Don’t save")
+                                    .label("Don’t Save")
                                     .outline()
                                     .on_click(move |_, window, cx| {
                                         window.close_dialog(cx);
@@ -4982,6 +5003,45 @@ impl Workspace {
             self.duplicate_tab(insertion.source, insertion.gap, window, cx);
         } else {
             self.move_tab(insertion.source, insertion.gap, window, cx);
+        }
+    }
+
+
+    /// After a cross-group tab drop: `(new_active, new_other)`. Never leaves
+    /// both panes on the same document when more than one tab exists (move,
+    /// not clone — probe #16).
+    fn split_panes_after_cross_group_move(
+        dragged: usize,
+        active: usize,
+        other: usize,
+        len: usize,
+        into_secondary: bool,
+    ) -> (usize, usize) {
+        if len == 0 {
+            return (0, 0);
+        }
+        let dragged = dragged.min(len - 1);
+        let active = active.min(len - 1);
+        let other = other.min(len - 1);
+        if len == 1 {
+            return (0, 0);
+        }
+        if into_secondary {
+            // Drop into secondary: secondary shows dragged; primary keeps a
+            // different document (prefer prior primary, else prior other).
+            let mut primary = if active != dragged { active } else { other };
+            if primary == dragged {
+                primary = (0..len).find(|&i| i != dragged).unwrap_or(0);
+            }
+            (primary, dragged)
+        } else {
+            // Drop into primary: primary shows dragged; secondary keeps a
+            // different document.
+            let mut secondary = if other != dragged { other } else { active };
+            if secondary == dragged {
+                secondary = (0..len).find(|&i| i != dragged).unwrap_or(0);
+            }
+            (dragged, secondary)
         }
     }
 
@@ -6086,12 +6146,17 @@ impl Workspace {
                 )
             })
             .child(
+                // Probe #16: do NOT attach `.horizontal_scrollbar` here. That
+                // helper overlays an absolute inset_0 Scrollbar whose full-area
+                // hitbox calls stop_propagation on mouse-down when "visible",
+                // which swallows right-clicks before `.context_menu()` can open
+                // (Explorer has no such overlay — Select for Compare works).
+                // overflow_x_scroll + the prev/next chevrons are enough.
                 div()
                     .relative()
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .horizontal_scrollbar(&tab_scroll)
                     .child(
                         h_flex()
                             .id("tabs-scroll-area")
@@ -6285,6 +6350,18 @@ impl Workspace {
                                         },
                                     )
                                     .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(
+                                            move |this, _: &MouseDownEvent, window, cx| {
+                                                // Probe #16: pick the tab before the
+                                                // context menu opens (Explorer does
+                                                // the same). Menu still comes from
+                                                // `.context_menu` below.
+                                                this.activate(ix, window, cx);
+                                            },
+                                        ),
+                                    )
+                                    .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(
                                             move |this, event: &MouseDownEvent, window, cx| {
@@ -6327,16 +6404,13 @@ impl Workspace {
                                             let cmp_path = path.clone();
                                             let has_path = path.is_some();
 
-                                            // Probe #15: Select for Compare / Compare with
-                                            // Selected sit near the top (VS Code muscle
-                                            // memory; Dtab-ctx OCR missed them when buried).
+                                            // Probe #15/#16: Select for Compare / Compare
+                                            // with Selected sit near the top. Labels match
+                                            // `tab_context_menu_labels` (unit-tested).
+                                            let pin_label = tab_context_menu_labels(is_pinned)[0];
                                             let menu = menu
                                                 .item(
-                                                    PopupMenuItem::new(if is_pinned {
-                                                        "Unpin"
-                                                    } else {
-                                                        "Pin"
-                                                    })
+                                                    PopupMenuItem::new(pin_label)
                                                     .on_click(move |_, _, cx| {
                                                         _ = ws_pin.update(cx, |this, cx| {
                                                             this.toggle_pin_by_id(doc_id, cx);
@@ -7744,31 +7818,26 @@ impl Workspace {
                 return;
             }
             let ix = drag.index.min(this.documents.len().saturating_sub(1));
-            // Dropping a tab onto an existing split moves it into the secondary pane
-            // (not a clone): the primary keeps showing a different document.
-            if this.editor_split.is_some() {
-                let primary = this.active;
-                if ix == primary && this.documents.len() > 1 {
-                    // Dragging the primary's tab into the secondary: swap roles.
-                    let other = this
-                        .editor_split
-                        .map(|s| s.other)
-                        .unwrap_or(primary)
-                        .min(this.documents.len().saturating_sub(1));
-                    this.active = other;
-                    this.editor_split = Some(EditorSplit {
-                        other: ix,
-                        vertical: this.editor_split.map(|s| s.vertical).unwrap_or(false),
-                    });
-                } else {
-                    this.editor_split = Some(EditorSplit {
-                        other: ix,
-                        vertical: this.editor_split.map(|s| s.vertical).unwrap_or(false),
-                    });
-                }
+            // Probe #16: drop onto an existing split = move into that pane, never
+            // clone (invert-key duplicate only applies to tab-bar reorder).
+            if let Some(split) = this.editor_split {
+                let len = this.documents.len();
+                let (active, other) = Self::split_panes_after_cross_group_move(
+                    ix,
+                    this.active,
+                    split.other,
+                    len,
+                    true, // body drop targets the secondary pane
+                );
+                this.active = active;
+                this.editor_split = Some(EditorSplit {
+                    other,
+                    vertical: split.vertical,
+                });
                 this.tab_insertion = None;
                 this.tab_drag_index.set(None);
                 this.tab_drag_last_pos.set(None);
+                this.tab_drag_copy.set(false);
                 cx.notify();
                 return;
             }
@@ -9150,5 +9219,41 @@ mod tests {
         assert_eq!(super::Workspace::edge_split_at(outside, Some(body)), None);
         // No body bounds → no split (cannot guess).
         assert_eq!(super::Workspace::edge_split_at(right, None), None);
+    }
+
+    /// Probe #16: tab context menu must expose Pin / Select for Compare /
+    /// Compare with Selected near the top (items claimed in #15 but unreachable
+    /// under Xvfb until the scrollbar overlay stop_propagation was removed).
+    #[test]
+    fn tab_context_menu_registers_compare_items() {
+        let labels = super::tab_context_menu_labels(false);
+        assert_eq!(labels[0], "Pin");
+        assert!(labels.contains(&"Select for Compare"));
+        assert!(labels.contains(&"Compare with Selected"));
+        assert_eq!(super::tab_context_menu_labels(true)[0], "Unpin");
+    }
+
+    /// Probe #16: cross-group drag moves the tab into the destination pane
+    /// without leaving both panes on the same document (no clone).
+    #[test]
+    fn cross_group_tab_drop_moves_not_clones() {
+        // active=0, other=1, drag 0 into secondary → swap
+        assert_eq!(
+            Workspace::split_panes_after_cross_group_move(0, 0, 1, 3, true),
+            (1, 0)
+        );
+        // active=0, other=1, drag 2 into secondary → primary stays 0, other=2
+        assert_eq!(
+            Workspace::split_panes_after_cross_group_move(2, 0, 1, 3, true),
+            (0, 2)
+        );
+        // Never the same index when len > 1
+        let (a, b) = Workspace::split_panes_after_cross_group_move(1, 1, 1, 2, true);
+        assert_ne!(a, b);
+        // Into primary
+        assert_eq!(
+            Workspace::split_panes_after_cross_group_move(2, 0, 1, 3, false),
+            (2, 1)
+        );
     }
 }
