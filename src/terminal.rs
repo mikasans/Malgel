@@ -211,7 +211,7 @@ impl TerminalPanel {
         }
     }
 
-    fn append(&mut self, text: &str, cx: &mut Context<Self>) {
+    pub fn append(&mut self, text: &str, cx: &mut Context<Self>) {
         self.output.push_str(text);
         self.trim_output();
         cx.notify();

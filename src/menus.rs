@@ -165,6 +165,7 @@ pub fn build(cx: &App) -> Vec<Menu> {
         MenuItem::separator(),
         MenuItem::action("Go to file…", QuickOpen),
         MenuItem::action("Go to heading…", GoToHeading),
+        MenuItem::action("Go to Symbol…", GoToSymbol),
         MenuItem::action("Go to line…", GoToLine),
         MenuItem::action("Go to Definition", GoToDefinition),
         MenuItem::separator(),

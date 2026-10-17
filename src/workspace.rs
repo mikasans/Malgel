@@ -24,7 +24,8 @@ use gpui_kit::{
     assets::IconName,
     base::Disableable as _,
     component::{
-        ActiveTheme as _, Icon, IndexPath, Selectable as _, Sizable as _, TitleBar, WindowExt as _,
+        ActiveTheme as _, Icon, IndexPath, RopeExt as _, Selectable as _, Sizable as _, TitleBar,
+        WindowExt as _,
         button::{Button, ButtonGroup, ButtonVariants as _},
         checkbox::Checkbox,
         command::{Command, CommandGroup, CommandItem, CommandState},
@@ -440,8 +441,11 @@ pub struct Workspace {
     tab_drag_copy: Cell<bool>,
     _watch_task: Task<()>,
     document_subscriptions: Vec<(EntityId, Vec<Subscription>)>,
-    /// Integrated terminal in the bottom panel (Ctrl+`).
-    terminal: Entity<TerminalPanel>,
+    /// Integrated terminal sessions in the bottom panel (Ctrl+`).
+    terminals: Vec<Entity<TerminalPanel>>,
+    terminal_active: usize,
+    /// Side-by-side dual session when two or more terminals exist.
+    terminal_split: bool,
     terminal_visible: bool,
     /// When true, the terminal panel takes most of the center (VS Code Maximize Panel).
     terminal_maximized: bool,
@@ -480,7 +484,7 @@ impl Workspace {
         let find_query = cx.new(|cx| CommandState::new(window, cx));
         let find_results = cx.new(|cx| CommandState::new(window, cx));
         let file_tree = cx.new(FileTree::new);
-        let terminal = cx.new(|cx| TerminalPanel::new(window, cx));
+        let terminals = vec![cx.new(|cx| TerminalPanel::new(window, cx))];
 
         let subscriptions = vec![
             cx.subscribe_in(
@@ -593,7 +597,9 @@ impl Workspace {
             tab_drag_copy: Cell::new(false),
             _watch_task: watch_task,
             document_subscriptions: Vec::new(),
-            terminal,
+            terminals,
+            terminal_active: 0,
+            terminal_split: false,
             terminal_visible: false,
             terminal_maximized: false,
             editor_split: None,
@@ -1954,22 +1960,243 @@ impl Workspace {
         self.open_paths(vec![path], Placement::Default, window, cx);
     }
 
+
+    fn active_terminal(&self) -> &Entity<TerminalPanel> {
+        &self.terminals[self.terminal_active.min(self.terminals.len().saturating_sub(1))]
+    }
+
+    fn ensure_terminal_visible(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_visible = true;
+        let cwd = terminal::terminal_cwd(
+            self.file_tree.read(cx).root(),
+            self.active_document().read(cx).path().map(|p| p.as_path()),
+        );
+        let term = self.active_terminal().clone();
+        term.update(cx, |term, cx| {
+            term.set_cwd(cwd, cx);
+            term.ensure_running(window, cx);
+        });
+    }
+
     /// Toggle the integrated terminal panel (VS Code Ctrl+`).
     fn summon_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal_visible = !self.terminal_visible;
         if self.terminal_visible {
-            let cwd = terminal::terminal_cwd(
-                self.file_tree.read(cx).root(),
-                self.active_document().read(cx).path().map(|p| p.as_path()),
-            );
-            self.terminal.update(cx, |term, cx| {
-                term.set_cwd(cwd, cx);
-                term.ensure_running(window, cx);
-            });
+            self.ensure_terminal_visible(window, cx);
         } else {
             self.terminal_maximized = false;
+            self.terminal_split = false;
         }
         cx.notify();
+    }
+
+
+    fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        let term = cx.new(|cx| TerminalPanel::new(window, cx));
+        self.terminals.push(term);
+        self.terminal_active = self.terminals.len() - 1;
+        self.ensure_terminal_visible(window, cx);
+        cx.notify();
+    }
+
+    fn kill_terminal(&mut self, _: &KillTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminals.is_empty() {
+            return;
+        }
+        let ix = self.terminal_active.min(self.terminals.len() - 1);
+        self.terminals[ix].update(cx, |term, cx| {
+            term.stop_shell();
+            term.append("— shell stopped\n", cx);
+        });
+        if self.terminals.len() > 1 {
+            self.terminals.remove(ix);
+            self.terminal_active = ix.saturating_sub(1).min(self.terminals.len() - 1);
+            if self.terminals.len() < 2 {
+                self.terminal_split = false;
+            }
+        }
+        if self.terminal_visible {
+            self.active_terminal().update(cx, |term, cx| term.focus_input(window, cx));
+        }
+        cx.notify();
+    }
+
+    fn clear_terminal(&mut self, _: &ClearTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        if self.terminals.is_empty() {
+            return;
+        }
+        self.active_terminal().update(cx, |term, cx| term.clear(cx));
+    }
+
+    fn split_terminal(&mut self, _: &SplitTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminals.len() < 2 {
+            let term = cx.new(|cx| TerminalPanel::new(window, cx));
+            self.terminals.push(term);
+        }
+        self.terminal_split = true;
+        self.ensure_terminal_visible(window, cx);
+        // Ensure the second session is running too.
+        let cwd = terminal::terminal_cwd(
+            self.file_tree.read(cx).root(),
+            self.active_document().read(cx).path().map(|p| p.as_path()),
+        );
+        for term in &self.terminals {
+            term.update(cx, |term, cx| {
+                term.set_cwd(cwd.clone(), cx);
+                term.ensure_running(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn go_to_symbol(&mut self, _: &GoToSymbol, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let doc = self.active_document().clone();
+        // Prefer fold candidates (code); fall back to Markdown headings.
+        let symbols: Vec<(String, usize)> = {
+            let d = doc.read(cx);
+            let text = d.text_now(cx);
+            let editor = d.editor().read(cx);
+            let rope = editor.text();
+            let mut items = Vec::new();
+            for fold in editor.fold_candidates() {
+                let line = fold.start_line;
+                let start = rope.line_start_offset(line).min(text.len());
+                let end = rope.line_end_offset(line).min(text.len());
+                let label = text.get(start..end).unwrap_or("").trim();
+                if !label.is_empty() {
+                    items.push((label.to_string(), line + 1));
+                }
+            }
+            if items.is_empty() {
+                for heading in &d.analysis().outline {
+                    items.push((heading.text.to_string(), heading.line + 1));
+                }
+            }
+            items
+        };
+        self.headings
+            .update(cx, |state, cx| state.set_query("", window, cx));
+        let picker = self.headings.clone();
+        let focus = picker.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        let confirm_doc = doc.clone();
+        let rows = symbols.clone();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let items = rows.iter().map(|(label, line)| {
+                CommandItem::new()
+                    .label(format!("{label}  :{line}"))
+                    .keywords([label.clone(), format!("line {line}")])
+                    .icon(Icon::new(IconName::ListTree))
+            });
+            let jump_rows = rows.clone();
+            dialog.close_button(false).p_0().child(esc_closes(
+                Command::new(&picker)
+                    .bordered(false)
+                    .placeholder("Go to Symbol")
+                    .max_h(rems(24.))
+                    .items(items)
+                    .empty(|_, _, _| "No symbols in this document")
+                    .on_confirm({
+                        let confirm_doc = confirm_doc.clone();
+                        move |index: IndexPath, window, cx| {
+                            window.close_dialog(cx);
+                            if let Some((_, line)) = jump_rows.get(index.row) {
+                                let line = *line;
+                                confirm_doc.update(cx, |doc, cx| {
+                                    doc.go_to_line(line, window, cx)
+                                });
+                            }
+                        }
+                    })
+                    .on_cancel(|window, cx| window.close_dialog(cx)),
+            ))
+        });
+    }
+
+    fn reload_window(&mut self, _: &ReloadWindow, window: &mut Window, cx: &mut Context<Self>) {
+        // Soft UI refresh: reload settings from disk, re-apply theme, notify.
+        // No data-loss prompt when buffers are clean (and we never discard dirty ones).
+        let loaded = crate::settings::Settings::load();
+        cx.set_global(AppSettings(loaded));
+        themes::apply(Some(window), cx);
+        for doc in &self.documents {
+            doc.update(cx, |_, cx| cx.notify());
+        }
+        self.file_tree.update(cx, |tree, cx| tree.refresh(cx));
+        window.push_notification(Notification::info("Window reloaded."), cx);
+        cx.notify();
+    }
+
+    fn toggle_zen_mode(&mut self, _: &ToggleZenMode, window: &mut Window, cx: &mut Context<Self>) {
+        // Zen = focus mode chrome hide (Escape already restores focus mode).
+        let entering = !AppSettings::get(cx).focus_mode;
+        self.toggle(|settings| settings.focus_mode = !settings.focus_mode, cx);
+        if entering {
+            self.terminal_visible = false;
+            self.terminal_maximized = false;
+            self.terminal_split = false;
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn compare_with_saved(
+        &mut self,
+        _: &CompareWithSaved,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let doc = self.active_document().clone();
+        let Some(path) = doc.read(cx).path().map(|p| p.to_path_buf()) else {
+            window.push_notification(
+                Notification::info("Save the file first to compare with disk."),
+                cx,
+            );
+            return;
+        };
+        if !doc.read(cx).is_dirty() {
+            window.push_notification(Notification::info("No unsaved changes to compare."), cx);
+            return;
+        }
+        let Ok(disk) = std::fs::read_to_string(&path) else {
+            window.push_notification(
+                Notification::info("Couldn’t read the saved file from disk."),
+                cx,
+            );
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        self.open_compare_buffer(disk, format!("{name} (saved)"), window, cx);
+    }
+
+    fn show_source_control(
+        &mut self,
+        _: &ShowSourceControl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.push_notification(
+            Notification::info("Source Control is not available yet — on the roadmap."),
+            cx,
+        );
+    }
+
+    fn show_extensions(
+        &mut self,
+        _: &ShowExtensions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.push_notification(
+            Notification::info("Extensions are not available yet — on the roadmap."),
+            cx,
+        );
     }
 
     /// Toggle Maximized Panel (VS Code): enlarge the terminal when it is open.
@@ -1980,16 +2207,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if !self.terminal_visible {
-            self.terminal_visible = true;
             self.terminal_maximized = true;
-            let cwd = terminal::terminal_cwd(
-                self.file_tree.read(cx).root(),
-                self.active_document().read(cx).path().map(|p| p.as_path()),
-            );
-            self.terminal.update(cx, |term, cx| {
-                term.set_cwd(cwd, cx);
-                term.ensure_running(window, cx);
-            });
+            self.ensure_terminal_visible(window, cx);
         } else {
             self.terminal_maximized = !self.terminal_maximized;
         }
@@ -6261,6 +6480,16 @@ impl Render for Workspace {
                     this.summon_terminal(window, cx)
                 }),
             )
+            .on_action(cx.listener(Self::new_terminal))
+            .on_action(cx.listener(Self::kill_terminal))
+            .on_action(cx.listener(Self::clear_terminal))
+            .on_action(cx.listener(Self::split_terminal))
+            .on_action(cx.listener(Self::go_to_symbol))
+            .on_action(cx.listener(Self::reload_window))
+            .on_action(cx.listener(Self::toggle_zen_mode))
+            .on_action(cx.listener(Self::compare_with_saved))
+            .on_action(cx.listener(Self::show_source_control))
+            .on_action(cx.listener(Self::show_extensions))
             .on_action(cx.listener(|this, _: &ToggleTabs, _, cx| {
                 this.toggle(|settings| settings.tabs = !settings.tabs, cx)
             }))
@@ -6670,6 +6899,23 @@ impl Workspace {
             )
     }
 
+
+    fn render_terminal_area(&self, _cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        if self.terminal_split && self.terminals.len() >= 2 {
+            let a = self.terminal_active.min(self.terminals.len() - 1);
+            let b = if a + 1 < self.terminals.len() { a + 1 } else { a.saturating_sub(1) };
+            h_flex()
+                .id("terminal-split")
+                .size_full()
+                .gap_px()
+                .child(div().flex_1().min_w_0().size_full().child(self.terminals[a].clone()))
+                .child(div().flex_1().min_w_0().size_full().child(self.terminals[b].clone()))
+                .into_any_element()
+        } else {
+            self.active_terminal().clone().into_any_element()
+        }
+    }
+
     /// Editor panes, with Problems and/or the integrated terminal underneath.
     fn render_center(
         &self,
@@ -6718,7 +6964,7 @@ impl Workspace {
                     .child(
                         resizable_panel()
                             .size_range(rems(12.).to_pixels(rem)..Pixels::MAX)
-                            .child(self.terminal.clone()),
+                            .child(self.render_terminal_area(cx)),
                     )
                     .into_any_element()
             } else {
@@ -6733,7 +6979,7 @@ impl Workspace {
                         resizable_panel()
                             .size(term_h)
                             .size_range(rems(6.).to_pixels(rem)..rems(28.).to_pixels(rem))
-                            .child(self.terminal.clone()),
+                            .child(self.render_terminal_area(cx)),
                     )
                     .into_any_element()
             }

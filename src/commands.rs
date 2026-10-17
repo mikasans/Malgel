@@ -156,6 +156,36 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
         ],
         "Problems" => vec![label, "problems", "diagnostics", "errors", "warnings"],
         "Toggle Minimap" => vec![label, "minimap", "toggle minimap", "code minimap"],
+        "Settings…" => vec![
+            label,
+            "settings",
+            "open settings",
+            "preferences",
+            "open preferences",
+        ],
+        "Kill Terminal" => vec![label, "kill terminal", "kill", "stop terminal"],
+        "New Terminal" => vec![label, "new terminal", "create terminal"],
+        "Clear Terminal" => vec![label, "clear", "clear terminal", "clear output"],
+        "Split Terminal" => vec![label, "split terminal", "terminal split"],
+        "Go to Symbol…" => vec![
+            label,
+            "go to symbol",
+            "goto symbol",
+            "symbol",
+            "symbols",
+            "outline symbol",
+        ],
+        "Reload Window" => vec![label, "reload window", "reload", "restart window"],
+        "Zen Mode" => vec![label, "zen", "zen mode", "distraction free"],
+        "Compare with Saved" => vec![
+            label,
+            "compare",
+            "diff",
+            "compare with saved",
+            "diff with saved",
+        ],
+        "Source Control" => vec![label, "git", "scm", "source control", "version control"],
+        "Extensions" => vec![label, "extensions", "extension", "plugins", "marketplace"],
         _ => vec![label],
     }
 }
@@ -254,6 +284,7 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Show all commands", IconName::Command, CommandPalette),
             cmd("Go to file…", IconName::FileText, QuickOpen),
             cmd("Go to heading…", IconName::Heading1, GoToHeading),
+            cmd("Go to Symbol…", IconName::ListTree, GoToSymbol),
             cmd("Go to line…", IconName::ArrowRight, GoToLine),
             cmd("Go to Definition", IconName::ArrowRight, GoToDefinition),
             cmd("Go back", IconName::ArrowLeft, GoBack),
@@ -304,11 +335,16 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Restore session", IconName::Clock, ToggleRestoreSession),
             cmd("Toggle light and dark", IconName::Moon, ToggleAppearance),
             cmd("Toggle Terminal", IconName::Terminal, SummonTerminal),
+            cmd("New Terminal", IconName::Terminal, NewTerminal),
+            cmd("Kill Terminal", IconName::X, KillTerminal),
+            cmd("Clear Terminal", IconName::Trash, ClearTerminal),
+            cmd("Split Terminal", IconName::Columns2, SplitTerminal),
             cmd(
                 "Toggle Maximized Panel",
                 IconName::Maximize2,
                 ToggleMaximizedPanel,
             ),
+            cmd("Zen Mode", IconName::Maximize2, ToggleZenMode),
             cmd("Zoom in", IconName::ZoomIn, ZoomIn),
             cmd("Zoom out", IconName::ZoomOut, ZoomOut),
             cmd("Actual size", IconName::ScanText, ZoomReset),
@@ -350,6 +386,10 @@ pub fn groups() -> Vec<CommandGroupSpec> {
         "Settings",
         vec![
             cmd("Settings…", IconName::Settings, OpenSettings),
+            cmd("Reload Window", IconName::RefreshCw, ReloadWindow),
+            cmd("Compare with Saved", IconName::Copy, CompareWithSaved),
+            cmd("Source Control", IconName::Folder, ShowSourceControl),
+            cmd("Extensions", IconName::Info, ShowExtensions),
             cmd("Color theme…", IconName::Sun, SelectColorTheme),
             cmd(
                 "Appearance: follow the system",
@@ -468,5 +508,36 @@ mod tests {
         assert!(keywords("Toggle editor and preview").contains(&"toggle preview"));
         assert!(keywords("Problems").contains(&"problems"));
         assert!(keywords("Toggle Minimap").contains(&"minimap"));
+    }
+
+    #[test]
+    fn palette_probe8_terminal_symbol_aliases() {
+        let groups = groups();
+        let labels: Vec<_> = groups
+            .iter()
+            .flat_map(|g| g.items.iter().map(|i| i.label))
+            .collect();
+        for need in [
+            "Kill Terminal",
+            "New Terminal",
+            "Clear Terminal",
+            "Split Terminal",
+            "Go to Symbol…",
+            "Reload Window",
+            "Zen Mode",
+            "Compare with Saved",
+            "Source Control",
+            "Extensions",
+        ] {
+            assert!(labels.contains(&need), "missing {need}");
+        }
+        assert!(keywords("Settings…").contains(&"open settings"));
+        assert!(keywords("Kill Terminal").contains(&"kill terminal"));
+        assert!(keywords("Clear Terminal").contains(&"clear"));
+        assert!(keywords("Go to Symbol…").contains(&"go to symbol"));
+        assert!(keywords("Zen Mode").contains(&"zen"));
+        assert!(keywords("Compare with Saved").contains(&"diff"));
+        assert!(keywords("Source Control").contains(&"git"));
+        assert!(keywords("Extensions").contains(&"extensions"));
     }
 }

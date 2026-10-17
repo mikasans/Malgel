@@ -18,6 +18,16 @@ actions!(
         OpenFolder,
         OpenRecentPicker,
         SummonTerminal,
+        KillTerminal,
+        NewTerminal,
+        ClearTerminal,
+        SplitTerminal,
+        GoToSymbol,
+        ReloadWindow,
+        ToggleZenMode,
+        CompareWithSaved,
+        ShowSourceControl,
+        ShowExtensions,
         Save,
         SaveAs,
         SaveAll,
@@ -314,7 +324,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-0", ZoomReset, None),
         // Appearance lives in the View menu only: VS Code gives Ctrl+Shift+L
         // to "select all occurrences".
-        KeyBinding::new("secondary-shift-o", GoToHeading, None),
+        // VS Code: Ctrl+Shift+O = Go to Symbol in Editor (headings via palette / Outline).
+        KeyBinding::new("secondary-shift-o", GoToSymbol, None),
+        KeyBinding::new("secondary-shift-.", GoToHeading, None),
         KeyBinding::new("secondary-g", GoToLine, None),
         // Typst (and later other languages): jump to the definition under the caret.
         KeyBinding::new("f12", GoToDefinition, Some(EDITOR_CONTEXT)),
@@ -322,6 +334,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-p", QuickOpen, None),
         // VS Code's Toggle Word Wrap.
         KeyBinding::new("alt-z", ToggleSoftWrap, None),
+        // VS Code Zen Mode: Ctrl+K Z
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("secondary-k z", ToggleZenMode, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-k z", ToggleZenMode, None),
         // The Explorer's keys, scoped to the file tree: Del, F2 and
         // Ctrl+X/C/V are what VS Code binds them to, and they only reach the
         // tree while it has the keyboard — in the editor the same keys keep
