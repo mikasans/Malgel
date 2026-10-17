@@ -101,6 +101,7 @@ pub fn build(cx: &App) -> Vec<Menu> {
         MenuItem::action("Save", Save),
         MenuItem::action("Save as…", SaveAs),
         MenuItem::action("Save All", SaveAll),
+        MenuItem::action("Auto Save", ToggleAutoSave).checked(settings.auto_save),
         MenuItem::separator(),
         // The three exports share one submenu so the File menu still reads in
         // one screen, as VS Code's does.
@@ -122,10 +123,18 @@ pub fn build(cx: &App) -> Vec<Menu> {
             RevealInFolder,
         ),
         MenuItem::separator(),
-        MenuItem::action("Close", CloseDocument),
-        // VS Code's File menu carries the close-all and the reopen; the
-        // per-tab closes live on a tab's own menu.
-        MenuItem::action("Close all editors", CloseAllTabs),
+        // Close* live in a submenu so File stays within MAX_MENU_ITEMS while
+        // exposing Close Others / Close Saved (probe #10) next to Close All.
+        submenu(
+            "Close",
+            vec![
+                MenuItem::action("Close", CloseDocument),
+                MenuItem::action("Close Others", CloseOtherTabs),
+                MenuItem::action("Close Saved", CloseSavedEditors),
+                MenuItem::action("Close Editors in Group", CloseEditorsInGroup),
+                MenuItem::action("Close all editors", CloseAllTabs),
+            ],
+        ),
         MenuItem::action("Reopen closed editor", ReopenClosedEditor),
         MenuItem::action("Close window", CloseWindow),
     ];
@@ -155,6 +164,7 @@ pub fn build(cx: &App) -> Vec<Menu> {
         MenuItem::separator(),
         MenuItem::action("Find…", Search),
         MenuItem::action("Find in files…", FindInFiles),
+        MenuItem::action("Replace in Files…", ReplaceInFiles),
         MenuItem::action("Replace…", Replace),
     ];
 
@@ -174,6 +184,13 @@ pub fn build(cx: &App) -> Vec<Menu> {
     ];
 
     let format = vec![
+        submenu(
+            "Document",
+            vec![
+                MenuItem::action("Format Document", FormatDocument),
+                MenuItem::action("Trim Trailing Whitespace", TrimTrailingWhitespace),
+            ],
+        ),
         MenuItem::action("Bold", Bold),
         MenuItem::action("Italic", Italic),
         MenuItem::action("Strikethrough", Strikethrough),

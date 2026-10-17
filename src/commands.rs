@@ -108,6 +108,8 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
                 "shortcuts",
                 "keybindings",
                 "hotkeys",
+                "help",
+                "help keyboard",
             ]
         }
         // Probe #6: chords work; palette queries must too.
@@ -186,6 +188,58 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
         ],
         "Source Control" => vec![label, "git", "scm", "source control", "version control"],
         "Extensions" => vec![label, "extensions", "extension", "plugins", "marketplace"],
+        // Probe #10: Close Others / Close Saved / group close discoverability.
+        "Close Others" => vec![
+            label,
+            "close others",
+            "close other",
+            "close other tabs",
+            "close other editors",
+            "closeothers",
+        ],
+        "Close Saved" => vec![
+            label,
+            "close saved",
+            "close saved editors",
+            "close saved tabs",
+            "closesaved",
+        ],
+        "Close Editors in Group" => vec![
+            label,
+            "close editors in group",
+            "close group",
+            "close editors group",
+            "close editor group",
+        ],
+        "Replace in Files…" => vec![
+            label,
+            "replace in files",
+            "replace in file",
+            "search replace files",
+            "workspace replace",
+            "rif",
+        ],
+        "Toggle Auto Save" => vec![
+            label,
+            "auto save",
+            "autosave",
+            "auto-save",
+            "toggle auto save",
+        ],
+        "Format Document" => {
+            vec![label, "format", "format document", "prettier", "beautify"]
+        }
+        "Trim Trailing Whitespace" => vec![
+            label,
+            "trim",
+            "trim trailing",
+            "trim whitespace",
+            "trailing",
+            "trailing whitespace",
+            "trim trailing whitespace",
+        ],
+        "Markdown guide" => vec![label, "help", "markdown", "guide", "help markdown"],
+        "About Malgel" => vec![label, "help", "about", "version", "help about"],
         _ => vec![label],
     }
 }
@@ -228,12 +282,14 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Export as Word document…", IconName::FileOutput, ExportDocx),
             cmd("Close editor", IconName::X, CloseDocument),
             cmd("Close all editors", IconName::X, CloseAllTabs),
+            cmd("Close Others", IconName::X, CloseOtherTabs),
+            cmd("Close Saved", IconName::X, CloseSavedEditors),
+            cmd("Close Editors in Group", IconName::X, CloseEditorsInGroup),
             cmd(
                 "Reopen closed editor",
                 IconName::RotateCcw,
                 ReopenClosedEditor,
             ),
-            cmd("Close other tabs", IconName::X, CloseOtherTabs),
             cmd("Close tabs to the right", IconName::X, CloseTabsToTheRight),
             cmd("Close window", IconName::X, CloseWindow),
             cmd("Quit Malgel", IconName::LogOut, Quit),
@@ -268,6 +324,7 @@ pub fn groups() -> Vec<CommandGroupSpec> {
         "Edit",
         vec![
             cmd("Find in files…", IconName::Search, FindInFiles),
+            cmd("Replace in Files…", IconName::Replace, ReplaceInFiles),
             cmd(
                 "Replace…",
                 IconName::Replace,
@@ -317,6 +374,8 @@ pub fn groups() -> Vec<CommandGroupSpec> {
                 TogglePdfThumbnails,
             ),
             cmd("File sidebar", IconName::PanelLeft, ToggleFileSidebar),
+            cmd("Show Explorer", IconName::Files, ShowExplorerView),
+            cmd("Show Search", IconName::Search, ShowSearchView),
             cmd("Outline", IconName::ListTree, ToggleOutline),
             cmd("Problems", IconName::TriangleAlert, ToggleProblems),
             cmd("Toggle Minimap", IconName::PanelRight, ToggleMinimap),
@@ -354,6 +413,12 @@ pub fn groups() -> Vec<CommandGroupSpec> {
     let format = group(
         "Format",
         vec![
+            cmd("Format Document", IconName::Wand, FormatDocument),
+            cmd(
+                "Trim Trailing Whitespace",
+                IconName::Eraser,
+                TrimTrailingWhitespace,
+            ),
             cmd("Bold", IconName::Bold, Bold),
             cmd("Italic", IconName::Italic, Italic),
             cmd("Strikethrough", IconName::Strikethrough, Strikethrough),
@@ -386,6 +451,7 @@ pub fn groups() -> Vec<CommandGroupSpec> {
         "Settings",
         vec![
             cmd("Settings…", IconName::Settings, OpenSettings),
+            cmd("Toggle Auto Save", IconName::Save, ToggleAutoSave),
             cmd("Reload Window", IconName::RefreshCw, ReloadWindow),
             cmd("Compare with Saved", IconName::Copy, CompareWithSaved),
             cmd("Source Control", IconName::Folder, ShowSourceControl),
@@ -539,5 +605,35 @@ mod tests {
         assert!(keywords("Compare with Saved").contains(&"diff"));
         assert!(keywords("Source Control").contains(&"git"));
         assert!(keywords("Extensions").contains(&"extensions"));
+    }
+
+    #[test]
+    fn palette_probe10_close_replace_autosave_format_help() {
+        let groups = groups();
+        let labels: Vec<_> = groups
+            .iter()
+            .flat_map(|g| g.items.iter().map(|i| i.label))
+            .collect();
+        for need in [
+            "Close Others",
+            "Close Saved",
+            "Close Editors in Group",
+            "Replace in Files…",
+            "Toggle Auto Save",
+            "Format Document",
+            "Trim Trailing Whitespace",
+        ] {
+            assert!(labels.contains(&need), "missing {need}");
+        }
+        assert!(keywords("Close Others").contains(&"close others"));
+        assert!(keywords("Close Saved").contains(&"close saved"));
+        assert!(keywords("Close Editors in Group").contains(&"close group"));
+        assert!(keywords("Replace in Files…").contains(&"replace in files"));
+        assert!(keywords("Toggle Auto Save").contains(&"autosave"));
+        assert!(keywords("Format Document").contains(&"format"));
+        assert!(keywords("Trim Trailing Whitespace").contains(&"trailing"));
+        assert!(keywords("Keyboard Shortcuts").contains(&"help"));
+        assert!(keywords("About Malgel").contains(&"help"));
+        assert!(keywords("Markdown guide").contains(&"help"));
     }
 }

@@ -58,6 +58,8 @@ pub struct Settings {
     pub font_size: f32,
     pub layout: Layout,
     pub soft_wrap: bool,
+    /// Save dirty editors after a short delay (VS Code Auto Save: afterDelay).
+    pub auto_save: bool,
     /// Treat single newlines in paragraphs as hard breaks in the preview (GFM breaks).
     pub gfm_breaks: bool,
     pub line_numbers: bool,
@@ -114,6 +116,7 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             layout: Layout::Split,
             soft_wrap: true,
+            auto_save: false,
             gfm_breaks: false,
             line_numbers: true,
             scroll_sync: true,

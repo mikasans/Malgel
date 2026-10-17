@@ -38,6 +38,8 @@ actions!(
         CloseDocument,
         CloseAllTabs,
         CloseOtherTabs,
+        CloseSavedEditors,
+        CloseEditorsInGroup,
         CloseTabsToTheRight,
         CloseWindow,
         ReopenClosedEditor,
@@ -83,6 +85,12 @@ actions!(
         CommandPalette,
         QuickOpen,
         FindInFiles,
+        ReplaceInFiles,
+        ToggleAutoSave,
+        FormatDocument,
+        TrimTrailingWhitespace,
+        ShowExplorerView,
+        ShowSearchView,
         NewFileInTree,
         NewFolderInTree,
         RenameInTree,
@@ -288,6 +296,8 @@ pub fn bind_keys(cx: &mut App) {
         // so the key is free for it.
         KeyBinding::new("secondary-alt-f", ToggleFocusMode, None),
         KeyBinding::new("secondary-shift-f", FindInFiles, None),
+        // VS Code Replace in Files.
+        KeyBinding::new("secondary-shift-h", ReplaceInFiles, None),
         KeyBinding::new("secondary-alt-c", CopyRichText, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
         // No key-context: the command palette resolves chords only for

@@ -106,6 +106,13 @@ enum KeyboardTarget {
     Preview,
 }
 
+/// Left activity-bar landmark: Explorer vs Search (probe #10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivityView {
+    Explorer,
+    Search,
+}
+
 /// A PDF or an image is rendered *instead of* the editor and the preview, so
 /// the keyboard has to go to that viewer. Focusing a view that is not in the
 /// render tree leaves every shortcut and title-bar `dispatch_action` dead —
@@ -399,6 +406,10 @@ pub struct Workspace {
     find_progress: Option<FindProgress>,
     /// The text Find in Files last looked for, offered again next time.
     last_find: String,
+    /// The replacement text Replace in Files last used.
+    last_replace: String,
+    /// Explorer vs Search landmark for the activity bar.
+    activity_view: ActivityView,
     /// Focus for the "Searching…" dialog, so its keys reach it.
     find_focus: FocusHandle,
     file_tree: Entity<FileTree>,
@@ -552,7 +563,10 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(WATCH_INTERVAL).await;
                 if this
-                    .update_in(cx, |this, window, cx| this.check_disk(window, cx))
+                    .update_in(cx, |this, window, cx| {
+                        this.check_disk(window, cx);
+                        this.auto_save_dirty(window, cx);
+                    })
                     .is_err()
                 {
                     break;
@@ -577,6 +591,8 @@ impl Workspace {
             find_results,
             find_progress: None,
             last_find: String::new(),
+            last_replace: String::new(),
+            activity_view: ActivityView::Explorer,
             find_focus: cx.focus_handle(),
             file_tree,
             app_menu_bar,
@@ -2470,6 +2486,51 @@ impl Workspace {
         self.confirm_close_documents(targets, window, cx);
     }
 
+    /// Close editors that have no unsaved changes (VS Code Close Saved).
+    fn close_saved_editors(
+        &mut self,
+        _: &CloseSavedEditors,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets: Vec<EntityId> = self
+            .documents
+            .iter()
+            .filter(|doc| {
+                let id = doc.entity_id();
+                !self.pinned.contains(&id)
+                    && !doc.read(cx).is_dirty()
+                    && !self.discarded.contains(&id)
+            })
+            .map(|doc| doc.entity_id())
+            .collect();
+        self.confirm_close_documents(targets, window, cx);
+    }
+
+    /// Close tabs in the focused editor group. With a split, the other pane's
+    /// document is kept; without a split this matches Close All.
+    fn close_editors_in_group(
+        &mut self,
+        _: &CloseEditorsInGroup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keep = self.editor_split.map(|split| {
+            let ix = split.other.min(self.documents.len().saturating_sub(1));
+            self.documents[ix].entity_id()
+        });
+        let targets: Vec<EntityId> = self
+            .documents
+            .iter()
+            .map(|doc| doc.entity_id())
+            .filter(|id| !self.pinned.contains(id) && keep != Some(*id))
+            .collect();
+        if keep.is_some() {
+            self.editor_split = None;
+        }
+        self.confirm_close_documents(targets, window, cx);
+    }
+
     /// Pin a tab, or let it go: Close Other Tabs and Close All Editors leave
     /// a pinned tab alone, and its close box turns into a pin.
     fn toggle_pin_by_id(&mut self, id: EntityId, cx: &mut Context<Self>) {
@@ -2565,6 +2626,7 @@ impl Workspace {
     /// in the tree, and pick the file that is open, so F2, Del and the arrow
     /// keys act on something.
     fn focus_explorer(&mut self, _: &FocusExplorer, window: &mut Window, cx: &mut Context<Self>) {
+        self.activity_view = ActivityView::Explorer;
         if !AppSettings::get(cx).file_sidebar || AppSettings::get(cx).focus_mode {
             self.toggle(
                 |settings| {
@@ -3033,6 +3095,373 @@ impl Workspace {
             return;
         }
         self.load_path(path, Placement::Default, Target::Line(hit.line), window, cx);
+    }
+
+    /// Ask for find text, then replacement, then preview and apply across the
+    /// open folder (VS Code Replace in Files / Ctrl+Shift+H).
+    fn replace_in_files(
+        &mut self,
+        _: &ReplaceInFiles,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.file_tree.read(cx).root().is_none() {
+            window.push_notification(
+                Notification::info("Open a folder to replace in its files."),
+                cx,
+            );
+            return;
+        }
+        if window.has_active_dialog(cx) {
+            if let Some(progress) = self.find_progress.take() {
+                progress.cancel.store(true, Ordering::Relaxed);
+                window.close_dialog(cx);
+            } else {
+                return;
+            }
+        }
+        self.activity_view = ActivityView::Search;
+        let last = self.last_find.clone();
+        Self::prompt_line(
+            &self.find_query.clone(),
+            "Replace in files".into(),
+            "Text to find".into(),
+            &last,
+            window,
+            cx,
+            |this, query, window, cx| this.prompt_replace_with(query, window, cx),
+        );
+    }
+
+    fn prompt_replace_with(&mut self, find: String, window: &mut Window, cx: &mut Context<Self>) {
+        if find.is_empty() {
+            return;
+        }
+        self.last_find = find.clone();
+        let last = self.last_replace.clone();
+        Self::prompt_line(
+            &self.tree_prompt.clone(),
+            "Replace with".into(),
+            "Replacement text".into(),
+            &last,
+            window,
+            cx,
+            move |this, replace, window, cx| {
+                this.confirm_replace_in_files(find.clone(), replace, window, cx)
+            },
+        );
+    }
+
+    fn confirm_replace_in_files(
+        &mut self,
+        find: String,
+        replace: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.last_replace = replace.clone();
+        let Some(root) = self.file_tree.read(cx).root().map(Path::to_path_buf) else {
+            return;
+        };
+        let show_hidden = AppSettings::get(cx).show_hidden_entries;
+        let opened = self.file_tree.read(cx).expanded_folders();
+        let walk_root = root;
+        let wanted = find.clone();
+        let listing = cx.background_executor().spawn(async move {
+            let files =
+                quick_open::files_under(&walk_root, show_hidden, &opened, quick_open::MAX_FILES);
+            let hits = search::search_files_until(
+                &files,
+                &wanted,
+                search::MAX_HITS,
+                &std::sync::atomic::AtomicBool::new(false),
+            );
+            (files, hits)
+        });
+        let workspace = cx.weak_entity();
+        cx.spawn_in(window, async move |this, cx| {
+            let (files, hits) = listing.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                if hits.is_empty() {
+                    window.push_notification(
+                        Notification::info(format!(
+                            "No matches for \u{201c}{find}\u{201d}."
+                        )),
+                        cx,
+                    );
+                    this.focus_active(window, cx);
+                    return;
+                }
+                let count = hits.len();
+                let file_count = {
+                    let mut seen = std::collections::HashSet::new();
+                    for hit in &hits {
+                        seen.insert(hit.path.clone());
+                    }
+                    seen.len()
+                };
+                let description = format!(
+                    "Replace {count} occurrence(s) in {file_count} file(s)?\n\nFind: {find}\nReplace: {replace}"
+                );
+                let find2 = find.clone();
+                let replace2 = replace.clone();
+                let files2 = files.clone();
+                let ws = workspace.clone();
+                let focus = this.alert_focus.clone();
+                focus.focus_primary_soon(window, cx);
+                window.open_alert_dialog(cx, move |alert, window, cx| {
+                    let ws_ok = ws.clone();
+                    let ws_cancel = ws.clone();
+                    let find_ok = find2.clone();
+                    let replace_ok = replace2.clone();
+                    let files_ok = files2.clone();
+                    alert
+                        .title("Replace in Files")
+                        .description(description.clone())
+                        .keyboard(true)
+                        .on_cancel(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            _ = ws_cancel.update(cx, |this, cx| this.focus_active(window, cx));
+                            true
+                        })
+                        .on_ok(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let n = search::replace_in_files(&files_ok, &find_ok, &replace_ok);
+                            _ = ws_ok.update(cx, |this, cx| {
+                                this.reload_replaced_files(&files_ok, window, cx);
+                                window.push_notification(
+                                    Notification::info(format!(
+                                        "Replaced {n} occurrence(s)."
+                                    )),
+                                    cx,
+                                );
+                                this.focus_active(window, cx);
+                            });
+                            true
+                        })
+                        .footer(
+                            focus.trap(
+                                DialogFooter::new()
+                                    .justify_end()
+                                    .child(
+                                        Button::new("rif-cancel")
+                                            .label("Cancel")
+                                            .outline()
+                                            .on_click({
+                                                let ws = ws.clone();
+                                                move |_, window, cx| {
+                                                    window.close_dialog(cx);
+                                                    _ = ws.update(cx, |this, cx| {
+                                                        this.focus_active(window, cx)
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                    .child(focus.primary(
+                                        Button::new("rif-replace-all")
+                                            .label("Replace All")
+                                            .primary()
+                                            .on_click({
+                                                let ws = ws.clone();
+                                                let find2 = find2.clone();
+                                                let replace2 = replace2.clone();
+                                                let files2 = files2.clone();
+                                                move |_, window, cx| {
+                                                    window.close_dialog(cx);
+                                                    let n = search::replace_in_files(
+                                                        &files2, &find2, &replace2,
+                                                    );
+                                                    _ = ws.update(cx, |this, cx| {
+                                                        this.reload_replaced_files(
+                                                            &files2, window, cx,
+                                                        );
+                                                        window.push_notification(
+                                                            Notification::info(format!(
+                                                                "Replaced {n} occurrence(s)."
+                                                            )),
+                                                            cx,
+                                                        );
+                                                        this.focus_active(window, cx);
+                                                    });
+                                                }
+                                            }),
+                                        window,
+                                        cx,
+                                    )),
+                            )
+                        )
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Reload open editors whose paths were rewritten by Replace in Files.
+    fn reload_replaced_files(
+        &mut self,
+        files: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let wanted: std::collections::HashSet<_> = files.iter().cloned().collect();
+        for doc in self.documents.clone() {
+            let Some(path) = doc.read(cx).path().cloned() else {
+                continue;
+            };
+            if !wanted.contains(&path) {
+                continue;
+            }
+            if doc.read(cx).is_dirty() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let ending = LineEnding::detect(&text);
+            doc.update(cx, |doc, cx| {
+                doc.reload(text, ending, window, cx);
+            });
+        }
+    }
+
+    /// Persist dirty editors that already have a path when Auto Save is on.
+    fn auto_save_dirty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !AppSettings::get(cx).auto_save {
+            return;
+        }
+        let dirty: Vec<_> = self
+            .documents
+            .iter()
+            .filter(|doc| {
+                let d = doc.read(cx);
+                d.is_dirty() && d.path().is_some() && !self.discarded.contains(&doc.entity_id())
+            })
+            .cloned()
+            .collect();
+        for doc in dirty {
+            self.save_document(doc, None, window, cx);
+        }
+    }
+
+    fn toggle_auto_save(
+        &mut self,
+        _: &ToggleAutoSave,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut enabled = false;
+        self.toggle(
+            |settings| {
+                settings.auto_save = !settings.auto_save;
+                enabled = settings.auto_save;
+            },
+            cx,
+        );
+        window.push_notification(
+            Notification::info(if enabled {
+                "Auto Save: on (after delay)"
+            } else {
+                "Auto Save: off"
+            }),
+            cx,
+        );
+        if enabled {
+            self.auto_save_dirty(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn format_document(&mut self, _: &FormatDocument, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = self.active_document().clone();
+        if doc.read(cx).is_media() {
+            window.push_notification(
+                Notification::info("No formatter available for this file type."),
+                cx,
+            );
+            return;
+        }
+        doc.update(cx, |doc, cx| {
+            let before = doc.text_now(cx).to_string();
+            let after = format::format_document(&before);
+            if after == before {
+                cx.emit(DocumentEvent::Notify("Document already formatted.".into()));
+                return;
+            }
+            doc.apply_edit(
+                |text, _| {
+                    let next = format::format_document(text);
+                    let end = next.len();
+                    format::Edit {
+                        range: 0..text.len(),
+                        text: next,
+                        selection: end..end,
+                    }
+                },
+                window,
+                cx,
+            );
+        });
+    }
+
+    fn trim_trailing_whitespace(
+        &mut self,
+        _: &TrimTrailingWhitespace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let doc = self.active_document().clone();
+        if doc.read(cx).is_media() {
+            window.push_notification(Notification::info("Nothing to trim in this view."), cx);
+            return;
+        }
+        doc.update(cx, |doc, cx| {
+            let before = doc.text_now(cx).to_string();
+            let after = format::trim_trailing_whitespace(&before);
+            if after == before {
+                cx.emit(DocumentEvent::Notify("No trailing whitespace.".into()));
+                return;
+            }
+            doc.apply_edit(
+                |text, _| {
+                    let next = format::trim_trailing_whitespace(text);
+                    format::Edit {
+                        range: 0..text.len(),
+                        text: next,
+                        selection: 0..0,
+                    }
+                },
+                window,
+                cx,
+            );
+        });
+    }
+
+    fn show_explorer_view(
+        &mut self,
+        _: &ShowExplorerView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activity_view = ActivityView::Explorer;
+        if !AppSettings::get(cx).file_sidebar {
+            AppSettings::update(cx, |settings| settings.file_sidebar = true);
+        }
+        self.focus_explorer(&FocusExplorer, window, cx);
+        cx.notify();
+    }
+
+    fn show_search_view(
+        &mut self,
+        _: &ShowSearchView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activity_view = ActivityView::Search;
+        if !AppSettings::get(cx).file_sidebar {
+            AppSettings::update(cx, |settings| settings.file_sidebar = true);
+        }
+        cx.notify();
+        self.find_in_files(&FindInFiles, window, cx);
     }
 
     /// Carry out the name a tree prompt collected. `target` names the folder
@@ -5658,6 +6087,11 @@ impl Workspace {
                                 menu
                             })
                     })
+                    .child(item(if settings.soft_wrap {
+                        "Wrap".to_string()
+                    } else {
+                        "No Wrap".to_string()
+                    }))
                     .children(doc.encoding().label().map(|label| item(label.to_string())))
                     // EOL picker: LF / CRLF (VS Code-like).
                     .child(
@@ -5927,6 +6361,14 @@ pub fn open_settings(window: &mut Window, cx: &mut App) {
                     "Wrap long lines in the editor instead of scrolling sideways.",
                     settings.soft_wrap,
                     |settings, on| settings.soft_wrap = on,
+                    cx,
+                ))
+                .child(row(
+                    "auto-save",
+                    "Auto Save",
+                    "Automatically save dirty editors after a short delay.",
+                    settings.auto_save,
+                    |settings, on| settings.auto_save = on,
                     cx,
                 ))
                 .child(row(
@@ -6395,6 +6837,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
             .on_action(cx.listener(Self::close_other_tabs))
+            .on_action(cx.listener(Self::close_saved_editors))
+            .on_action(cx.listener(Self::close_editors_in_group))
             .on_action(cx.listener(Self::close_tabs_to_the_right))
             .on_action(cx.listener(Self::tree_new_file))
             .on_action(cx.listener(Self::focus_explorer))
@@ -6427,6 +6871,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_quick_open))
             .on_action(cx.listener(Self::open_quick_path))
             .on_action(cx.listener(Self::find_in_files))
+            .on_action(cx.listener(Self::replace_in_files))
+            .on_action(cx.listener(Self::toggle_auto_save))
+            .on_action(cx.listener(Self::format_document))
+            .on_action(cx.listener(Self::trim_trailing_whitespace))
+            .on_action(cx.listener(Self::show_explorer_view))
+            .on_action(cx.listener(Self::show_search_view))
             .on_action(cx.listener(Self::toggle_appearance))
             .on_action(cx.listener(Self::show_theme_picker))
             .on_action(cx.listener(Self::toggle_focus_mode))
@@ -6658,7 +7108,28 @@ impl Render for Workspace {
                 }
             }))
             .child(self.render_title_bar(cx))
-            .child(self.render_center(main, focus_mode, rem, cx))
+            .child(self.render_center(
+                if focus_mode {
+                    main.into_any_element()
+                } else {
+                    h_flex()
+                        .id("workspace-with-activity")
+                        .size_full()
+                        .child(self.render_activity_bar(cx))
+                        .child(
+                            div()
+                                .id("workspace-panes")
+                                .flex_1()
+                                .min_w_0()
+                                .size_full()
+                                .child(main),
+                        )
+                        .into_any_element()
+                },
+                focus_mode,
+                rem,
+                cx,
+            ))
             .when(!focus_mode, |this| this.child(self.render_status_bar(cx)))
     }
 }
@@ -6918,6 +7389,56 @@ impl Workspace {
         } else {
             self.active_terminal().clone().into_any_element()
         }
+    }
+
+    /// Thin VS Code-like activity bar: Explorer vs Search landmark (probe #10).
+    fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let active = self.activity_view;
+        let explorer_on = active == ActivityView::Explorer;
+        let search_on = active == ActivityView::Search;
+        let workspace = cx.weak_entity();
+        v_flex()
+            .id("activity-bar")
+            .w(px(48.))
+            .h_full()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .py_2()
+            .bg(theme.sidebar)
+            .border_r_1()
+            .border_color(theme.border)
+            .child(
+                Button::new("activity-explorer")
+                    .ghost()
+                    .icon(Icon::new(IconName::Files))
+                    .tooltip("Explorer (Ctrl+Shift+E)")
+                    .selected(explorer_on)
+                    .on_click({
+                        let ws = workspace.clone();
+                        move |_, window, cx| {
+                            _ = ws.update(cx, |this, cx| {
+                                this.show_explorer_view(&ShowExplorerView, window, cx);
+                            });
+                        }
+                    }),
+            )
+            .child(
+                Button::new("activity-search")
+                    .ghost()
+                    .icon(Icon::new(IconName::Search))
+                    .tooltip("Search (Ctrl+Shift+F)")
+                    .selected(search_on)
+                    .on_click({
+                        let ws = workspace.clone();
+                        move |_, window, cx| {
+                            _ = ws.update(cx, |this, cx| {
+                                this.show_search_view(&ShowSearchView, window, cx);
+                            });
+                        }
+                    }),
+            )
     }
 
     /// Editor panes, with Problems and/or the integrated terminal underneath.

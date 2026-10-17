@@ -129,6 +129,66 @@ pub fn search_files_until(
     hits
 }
 
+/// Replace every occurrence of `find` in `text` with `replace`, using the same
+/// smart-case rule as [`search_text`]. Returns `(new_text, replacements)`.
+pub fn replace_in_text(text: &str, find: &str, replace: &str) -> (String, usize) {
+    if find.is_empty() {
+        return (text.to_string(), 0);
+    }
+    let sensitive = case_sensitive(find);
+    if sensitive {
+        let count = text.matches(find).count();
+        return (text.replace(find, replace), count);
+    }
+    // Case-insensitive: walk character-wise so columns stay coherent.
+    let needle: Vec<char> = find.chars().collect();
+    let hay: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut count = 0;
+    let mut i = 0;
+    while i < hay.len() {
+        if i + needle.len() <= hay.len()
+            && hay[i..i + needle.len()]
+                .iter()
+                .zip(&needle)
+                .all(|(a, b)| a.to_lowercase().eq(b.to_lowercase()))
+        {
+            out.push_str(replace);
+            count += 1;
+            i += needle.len();
+        } else {
+            out.push(hay[i]);
+            i += 1;
+        }
+    }
+    (out, count)
+}
+
+/// Apply [`replace_in_text`] to each path that can be read as UTF-8 text.
+/// Returns total replacements across files that were written.
+pub fn replace_in_files(files: &[PathBuf], find: &str, replace: &str) -> usize {
+    let mut total = 0;
+    for path in files {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let (next, n) = replace_in_text(&text, find, replace);
+        if n == 0 {
+            continue;
+        }
+        if std::fs::write(path, next.as_bytes()).is_ok() {
+            total += n;
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +283,15 @@ mod tests {
         assert!(search_files(&[dir.join("gone.md")], "needle", 10).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_in_text_respects_smart_case() {
+        let (out, n) = replace_in_text("Foo foo FOO", "foo", "bar");
+        assert_eq!(n, 3);
+        assert_eq!(out, "bar bar bar");
+        let (out, n) = replace_in_text("Foo foo FOO", "Foo", "Bar");
+        assert_eq!(n, 1);
+        assert_eq!(out, "Bar foo FOO");
     }
 }

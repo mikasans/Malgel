@@ -657,6 +657,41 @@ fn clamp(text: &str, range: Range<usize>) -> Range<usize> {
     start..end
 }
 
+/// Remove trailing spaces and tabs from every line. Line endings are kept as
+/// LF in the returned string; callers that care about CRLF re-apply the
+/// document's ending on save.
+pub fn trim_trailing_whitespace(text: &str) -> String {
+    let ends_with_newline = text.ends_with('\n');
+    let mut out = String::with_capacity(text.len());
+    for (ix, line) in text.lines().enumerate() {
+        if ix > 0 {
+            out.push('\n');
+        }
+        out.push_str(line.trim_end_matches([' ', '\t']));
+    }
+    if ends_with_newline && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Lightweight document format: trim trailing whitespace and ensure the file
+/// ends with exactly one newline (empty documents stay empty).
+pub fn format_document(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut out = trim_trailing_whitespace(text);
+    while out.ends_with('\n') {
+        out.pop();
+        if out.ends_with('\r') {
+            out.pop();
+        }
+    }
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -916,5 +951,20 @@ mod tests {
         let edit = move_lines("a\nb", 2..2, LineMove::Up).expect("room above");
         assert_eq!(apply("a\nb", &edit), "b\na");
         assert_eq!(edit.selection, 0..0);
+    }
+
+    #[test]
+    fn trim_trailing_whitespace_clears_eol_spaces() {
+        let text = "keep  \n\ttab\t  \nok\n";
+        assert_eq!(trim_trailing_whitespace(text), "keep\n\ttab\nok\n");
+        assert_eq!(trim_trailing_whitespace("a  "), "a");
+        assert_eq!(trim_trailing_whitespace(""), "");
+    }
+
+    #[test]
+    fn format_document_trims_and_ends_with_one_newline() {
+        assert_eq!(format_document("hi  \n\n"), "hi\n");
+        assert_eq!(format_document(""), "");
+        assert_eq!(format_document("a"), "a\n");
     }
 }

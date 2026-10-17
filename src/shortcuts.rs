@@ -49,6 +49,11 @@ pub const SHORTCUTS: &[ShortcutRow] = &[
         chord: "Ctrl+Shift+F  (⌘⇧F)",
     },
     ShortcutRow {
+        command: "Replace in Files",
+        when: "Workspace · search",
+        chord: "Ctrl+Shift+H  (⌘⇧H)",
+    },
+    ShortcutRow {
         command: "Find",
         when: "Editor",
         chord: "Ctrl+F  (⌘F)",
