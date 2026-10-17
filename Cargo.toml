@@ -153,3 +153,12 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 strip = true
+
+# gpui-base 0.7.0 paints fold chevrons but only registers their click handlers
+# when the icon is painted (hover / current line / already folded). Clicks on a
+# just-revealed chevron often miss that window, and EditorState exposed no Fold
+# / Unfold API for the command palette. This patch (fork of longbridge/gpui-kit
+# @ v0.7.0) arms chevron hit targets every frame and adds toggle_fold / fold_at
+# / unfold_line_at. Remove when upstream ships the same.
+[patch.crates-io]
+gpui-base = { git = "https://github.com/mikasans/gpui-kit", branch = "malgel-fold-0.7.0" }

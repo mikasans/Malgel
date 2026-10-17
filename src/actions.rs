@@ -95,6 +95,8 @@ actions!(
         ToggleLineComment,
         SelectNextOccurrence,
         DeleteLine,
+        Fold,
+        Unfold,
     ]
 );
 
@@ -344,6 +346,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-k", DeleteLine, Some(EDITOR_CONTEXT)),
         KeyBinding::new("alt-up", MoveLineUp, Some(EDITOR_CONTEXT)),
         KeyBinding::new("alt-down", MoveLineDown, Some(EDITOR_CONTEXT)),
+        // VS Code Fold / Unfold.
+        KeyBinding::new("secondary-shift-[", Fold, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-shift-]", Unfold, Some(EDITOR_CONTEXT)),
     ]);
 }
 
