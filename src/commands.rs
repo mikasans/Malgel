@@ -322,5 +322,17 @@ mod tests {
             .find(|i| i.label == "File sidebar")
             .expect("File sidebar in palette");
         assert!(sidebar.action.partial_eq(&ToggleFileSidebar));
+        let fold = groups
+            .iter()
+            .flat_map(|g| &g.items)
+            .find(|i| i.label == "Fold")
+            .expect("Fold in palette");
+        assert!(fold.action.partial_eq(&Fold));
+        let terminal = groups
+            .iter()
+            .flat_map(|g| &g.items)
+            .find(|i| i.label == "Toggle Terminal")
+            .expect("Toggle Terminal in palette");
+        assert!(terminal.action.partial_eq(&SummonTerminal));
     }
 }

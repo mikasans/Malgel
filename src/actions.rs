@@ -208,12 +208,12 @@ pub fn bind_keys(cx: &mut App) {
         #[cfg(target_os = "macos")]
         KeyBinding::new("secondary-ctrl-o", OpenFolder, workspace),
         KeyBinding::new("secondary-r", OpenRecent(0), workspace),
-        KeyBinding::new("secondary-s", Save, workspace),
-        KeyBinding::new("secondary-shift-s", SaveAs, workspace),
+        KeyBinding::new("secondary-s", Save, None),
+        KeyBinding::new("secondary-shift-s", SaveAs, None),
         // Export lives in the File menu only: VS Code gives Ctrl+Shift+E to
         // the Explorer, and Malgel's sidebar is close enough to want the key
         // free for it.
-        KeyBinding::new("secondary-w", CloseDocument, workspace),
+        KeyBinding::new("secondary-w", CloseDocument, None),
         KeyBinding::new("secondary-alt-w", CloseOtherTabs, workspace),
         // VS Code's Close All Editors and Reopen Closed Editor.
         KeyBinding::new("secondary-k secondary-w", CloseAllTabs, workspace),
@@ -222,12 +222,12 @@ pub fn bind_keys(cx: &mut App) {
         // it from anywhere.
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("secondary-k secondary-t", SelectColorTheme, workspace),
-        KeyBinding::new("secondary-shift-t", ReopenClosedEditor, workspace),
+        KeyBinding::new("secondary-shift-t", ReopenClosedEditor, None),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("alt-left", GoBack, workspace),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("alt-right", GoForward, workspace),
-        KeyBinding::new("secondary-shift-w", CloseWindow, workspace),
+        KeyBinding::new("secondary-shift-w", CloseWindow, None),
         KeyBinding::new("ctrl-tab", NextTab, workspace),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, workspace),
         #[cfg(target_os = "macos")]
@@ -243,15 +243,19 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-b", ToggleFileSidebar, None),
         // VS Code's Explorer: show the sidebar if it is hidden, put the
         // keyboard in the tree, and pick the file that is open.
-        KeyBinding::new("secondary-shift-e", FocusExplorer, workspace),
-        KeyBinding::new("secondary-alt-o", ToggleOutline, workspace),
+        KeyBinding::new("secondary-shift-e", FocusExplorer, None),
+        KeyBinding::new("secondary-alt-o", ToggleOutline, None),
         // VS Code gives Ctrl+Shift+F to Find in Files; focus mode moves aside
         // so the key is free for it.
-        KeyBinding::new("secondary-alt-f", ToggleFocusMode, workspace),
-        KeyBinding::new("secondary-shift-f", FindInFiles, workspace),
-        KeyBinding::new("secondary-alt-c", CopyRichText, workspace),
+        KeyBinding::new("secondary-alt-f", ToggleFocusMode, None),
+        KeyBinding::new("secondary-shift-f", FindInFiles, None),
+        KeyBinding::new("secondary-alt-c", CopyRichText, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
-        KeyBinding::new("secondary-`", SummonTerminal, workspace),
+        // No key-context: the command palette resolves chords only for
+        // global (or currently focused) bindings; Workspace is not in the
+        // palette dialog's context stack, so Toggle Terminal would otherwise
+        // show no tip. Same pattern as Toggle Side Bar / preview.
+        KeyBinding::new("secondary-`", SummonTerminal, None),
         KeyBinding::new("secondary-q", Quit, None),
         // No key-context: layout must switch even when the Typst/PDF viewer or
         // Markdown preview holds focus (those entities do not inherit Workspace).
@@ -268,14 +272,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-0", ZoomReset, None),
         // Appearance lives in the View menu only: VS Code gives Ctrl+Shift+L
         // to "select all occurrences".
-        KeyBinding::new("secondary-shift-o", GoToHeading, workspace),
-        KeyBinding::new("secondary-g", GoToLine, workspace),
+        KeyBinding::new("secondary-shift-o", GoToHeading, None),
+        KeyBinding::new("secondary-g", GoToLine, None),
         // Typst (and later other languages): jump to the definition under the caret.
         KeyBinding::new("f12", GoToDefinition, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-shift-p", CommandPalette, workspace),
-        KeyBinding::new("secondary-p", QuickOpen, workspace),
+        KeyBinding::new("secondary-shift-p", CommandPalette, None),
+        KeyBinding::new("secondary-p", QuickOpen, None),
         // VS Code's Toggle Word Wrap.
-        KeyBinding::new("alt-z", ToggleSoftWrap, workspace),
+        KeyBinding::new("alt-z", ToggleSoftWrap, None),
         // The Explorer's keys, scoped to the file tree: Del, F2 and
         // Ctrl+X/C/V are what VS Code binds them to, and they only reach the
         // tree while it has the keyboard — in the editor the same keys keep
@@ -296,10 +300,10 @@ pub fn bind_keys(cx: &mut App) {
         // Typing commands, scoped to the editor so they mean nothing while the
         // sidebar has the keyboard. Bold is Ctrl+Shift+B so Ctrl+B can match
         // VS Code's Toggle Side Bar with the caret in the editor.
-        KeyBinding::new("secondary-shift-b", Bold, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-i", Italic, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-shift-x", Strikethrough, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-e", InlineCode, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-shift-b", Bold, None),
+        KeyBinding::new("secondary-i", Italic, None),
+        KeyBinding::new("secondary-shift-x", Strikethrough, None),
+        KeyBinding::new("secondary-e", InlineCode, None),
         KeyBinding::new("secondary-k", InsertLink, Some(EDITOR_CONTEXT)),
         // The workspace's Ctrl+K chords, again in the editor: its single-key
         // Link sits deeper and would otherwise take the first Ctrl+K before
@@ -327,41 +331,43 @@ pub fn bind_keys(cx: &mut App) {
             gpui_kit::component::input::Redo,
             Some(INPUT_CONTEXT),
         ),
-        KeyBinding::new("secondary-shift-c", CodeBlock, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-shift-c", CodeBlock, None),
         // Shifted punctuation/numbers: on Linux/Windows GPUI reports the
         // produced character and strips Shift (Shift+[ → `{`, Shift+8 → `*`).
         // Bind that character without a shift- modifier, or the shortcut never
         // matches. Letters still use secondary-shift-x (Shift stays for a–z).
-        KeyBinding::new("secondary-shift-.", Quote, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-*", BulletList, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-&", NumberedList, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-(", TaskList, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-alt-1", Heading(1), Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-alt-2", Heading(2), Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-alt-3", Heading(3), Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-alt-4", Heading(4), Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-alt-5", Heading(5), Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-alt-6", Heading(6), Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-shift-.", Quote, None),
+        KeyBinding::new("secondary-*", BulletList, None),
+        KeyBinding::new("secondary-&", NumberedList, None),
+        KeyBinding::new("secondary-(", TaskList, None),
+        KeyBinding::new("secondary-alt-1", Heading(1), None),
+        KeyBinding::new("secondary-alt-2", Heading(2), None),
+        KeyBinding::new("secondary-alt-3", Heading(3), None),
+        KeyBinding::new("secondary-alt-4", Heading(4), None),
+        KeyBinding::new("secondary-alt-5", Heading(5), None),
+        KeyBinding::new("secondary-alt-6", Heading(6), None),
         // VS Code's Move Line Up / Down. Plain Alt with an arrow is free:
         // the editor library binds Ctrl+Alt+↑/↓ (and Shift+Alt+↑/↓) to adding
         // a cursor above and below, and Alt+←/→ to moving by word, so this
         // pair does not fight either.
         // VS Code's Toggle Line Comment.
-        KeyBinding::new("secondary-/", ToggleLineComment, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-/", ToggleLineComment, None),
         // VS Code's Add Selection To Next Find Match (one selection here: it
         // moves to the next match) and Delete Line.
-        KeyBinding::new("secondary-d", SelectNextOccurrence, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-shift-k", DeleteLine, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("alt-up", MoveLineUp, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("alt-down", MoveLineDown, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-d", SelectNextOccurrence, None),
+        KeyBinding::new("secondary-shift-k", DeleteLine, None),
+        KeyBinding::new("alt-up", MoveLineUp, None),
+        KeyBinding::new("alt-down", MoveLineDown, None),
         // VS Code Fold / Unfold (Ctrl/Cmd+Shift+[ / ]). GPUI key is `{` / `}`
         // with Shift stripped — see comment on BulletList above. Also bind the
         // naive secondary-shift-[ / ] spellings so Xvfb xdotool chord delivery
         // matches when it keeps Shift+[ instead of rewriting to {.
-        KeyBinding::new("secondary-{", Fold, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-}", Unfold, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-shift-[", Fold, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-shift-]", Unfold, Some(EDITOR_CONTEXT)),
+        // No EDITOR_CONTEXT: the palette dialog is not under Editor, so a
+        // context-scoped binding never paints the chord tip (same as Terminal).
+        KeyBinding::new("secondary-{", Fold, None),
+        KeyBinding::new("secondary-}", Unfold, None),
+        KeyBinding::new("secondary-shift-[", Fold, None),
+        KeyBinding::new("secondary-shift-]", Unfold, None),
     ]);
 }
 
@@ -398,7 +404,7 @@ mod tests {
     fn control_b_toggles_the_sidebar_and_bold_uses_shift() {
         let sidebar = KeyBinding::new("secondary-b", ToggleFileSidebar, None);
         assert_eq!(sidebar.keystrokes().len(), 1);
-        let bold = KeyBinding::new("secondary-shift-b", Bold, Some(EDITOR_CONTEXT));
+        let bold = KeyBinding::new("secondary-shift-b", Bold, None);
         assert_eq!(bold.keystrokes().len(), 1);
         assert_ne!(
             (sidebar.keystrokes()[0].key(), sidebar.keystrokes()[0].modifiers().shift),
@@ -411,8 +417,8 @@ mod tests {
     /// The Fold bindings must use those keys or Xvfb / real Linux keyboards miss.
     #[test]
     fn fold_bindings_use_shifted_bracket_characters() {
-        let fold = KeyBinding::new("secondary-{", Fold, Some(EDITOR_CONTEXT));
-        let unfold = KeyBinding::new("secondary-}", Unfold, Some(EDITOR_CONTEXT));
+        let fold = KeyBinding::new("secondary-{", Fold, None);
+        let unfold = KeyBinding::new("secondary-}", Unfold, None);
         assert_eq!(fold.keystrokes().len(), 1);
         assert_eq!(unfold.keystrokes().len(), 1);
         let fold_ks = &fold.keystrokes()[0];
@@ -425,7 +431,7 @@ mod tests {
 
         // The naive VS Code spellings parse, but they are not what Linux delivers
         // (platform key is `{` without Shift, not `[` with Shift).
-        let naive = KeyBinding::new("secondary-shift-[", Fold, Some(EDITOR_CONTEXT));
+        let naive = KeyBinding::new("secondary-shift-[", Fold, None);
         let naive_ks = &naive.keystrokes()[0];
         assert_eq!(naive_ks.key(), "[");
         assert!(naive_ks.modifiers().shift);

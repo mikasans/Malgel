@@ -16,8 +16,8 @@ use std::{
 
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window,
     assets::IconName,
     base::Disableable as _,
     component::{
@@ -28,6 +28,7 @@ use gpui_kit::{
         v_flex,
     },
     div, px,
+    prelude::FluentBuilder as _,
 };
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
@@ -102,7 +103,13 @@ impl TerminalPanel {
     }
 
     pub fn focus_input(&self, window: &mut Window, cx: &mut App) {
-        self.input.focus_handle(cx).focus(window, cx);
+        // While a PTY is alive the secondary `$ Run a command…` row is hidden;
+        // focus the panel so typed keys go straight to the shell (VS Code feel).
+        if self.writer.is_some() {
+            self.focus_handle.focus(window, cx);
+        } else {
+            self.input.focus_handle(cx).focus(window, cx);
+        }
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
@@ -141,6 +148,65 @@ impl TerminalPanel {
         if let Ok(mut w) = writer.lock() {
             let _ = w.write_all(&payload);
             let _ = w.flush();
+        }
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        let Some(writer) = &self.writer else {
+            return;
+        };
+        if let Ok(mut w) = writer.lock() {
+            let _ = w.write_all(bytes);
+            let _ = w.flush();
+        }
+    }
+
+    /// Forward a key to the live PTY so the panel can hide the secondary
+    /// composer while the shell is running.
+    fn forward_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.writer.is_none() {
+            return;
+        }
+        let keys = &event.keystroke;
+        // Ctrl+C → ETX so interrupt-from-keyboard still reaches the shell.
+        if keys.modifiers.control && !keys.modifiers.alt && !keys.modifiers.platform {
+            if keys.key.eq_ignore_ascii_case("c") {
+                self.write_bytes(&[0x03]);
+                cx.stop_propagation();
+                return;
+            }
+            // Leave other Ctrl/Cmd chords to the workspace (Ctrl+`, etc.).
+            return;
+        }
+        if keys.modifiers.platform || keys.modifiers.secondary() {
+            return;
+        }
+        match keys.key.as_str() {
+            "enter" => {
+                self.write_bytes(b"\n");
+                cx.stop_propagation();
+            }
+            "backspace" => {
+                self.write_bytes(&[0x7f]);
+                cx.stop_propagation();
+            }
+            "tab" => {
+                self.write_bytes(b"\t");
+                cx.stop_propagation();
+            }
+            "escape" => {
+                self.write_bytes(&[0x1b]);
+                cx.stop_propagation();
+            }
+            _ => {
+                if let Some(ch) = keys.key_char.as_deref() {
+                    self.write_bytes(ch.as_bytes());
+                    cx.stop_propagation();
+                } else if keys.key.len() == 1 && !keys.modifiers.control {
+                    self.write_bytes(keys.key.as_bytes());
+                    cx.stop_propagation();
+                }
+            }
         }
     }
 
@@ -313,6 +379,10 @@ impl Render for TerminalPanel {
             .bg(cx.theme().background)
             .border_t_1()
             .border_color(cx.theme().border)
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                this.forward_key(event, cx);
+            }))
             .child(
                 h_flex()
                     .id("terminal-header")
@@ -366,28 +436,33 @@ impl Render for TerminalPanel {
                     .track_scroll(&self.scroll)
                     .child(div().w_full().child(output)),
             )
-            .child(
-                h_flex()
-                    .id("terminal-input-row")
-                    .h(px(36.))
-                    .px_2()
-                    .gap_2()
-                    .items_center()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("$"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.input).appearance(false)),
-                    ),
-            )
+            // One input surface: while the PTY is alive, hide the secondary
+            // `$ Run a command…` composer and type into the shell prompt via
+            // the panel (VS Code). Show the composer only to start a shell.
+            .when(!shell_running, |this| {
+                this.child(
+                    h_flex()
+                        .id("terminal-input-row")
+                        .h(px(36.))
+                        .px_2()
+                        .gap_2()
+                        .items_center()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("$"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(&self.input).appearance(false)),
+                        ),
+                )
+            })
     }
 }
 

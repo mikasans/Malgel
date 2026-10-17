@@ -135,9 +135,20 @@ impl Settings {
         let Some(path) = settings_path() else {
             return Self::default();
         };
-        let mut settings = std::fs::read_to_string(path)
+        // Another editor's settings.json in the same folder (e.g. Zed-style
+        // `{"font_size":14,"theme":…}`) must not become Malgel's UI size —
+        // serde would keep font_size and fill the rest from Default, so a
+        // cold open would show ~80% of [`DEFAULT_FONT_SIZE`] (17.5).
+        let mut settings = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|json| serde_json::from_str::<Settings>(&json).ok())
+            .and_then(|json| {
+                let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+                let obj = value.as_object()?;
+                if !obj.contains_key("appearance") && !obj.contains_key("layout") {
+                    return None;
+                }
+                serde_json::from_value::<Settings>(value).ok()
+            })
             .unwrap_or_default();
         settings.font_size = clamp_font_size(settings.font_size);
         settings.recent_files.truncate(RECENT_LIMIT);
@@ -262,5 +273,18 @@ mod tests {
         assert_eq!(zoom_percent(DEFAULT_FONT_SIZE), 100);
         assert_eq!(zoom_percent(DEFAULT_FONT_SIZE + 1.), 106);
         assert_eq!(zoom_percent(DEFAULT_FONT_SIZE - 1.), 94);
+    }
+
+    #[test]
+    fn foreign_settings_json_does_not_steal_font_size() {
+        // Same shape as a non-Malgel settings file that once landed in the
+        // inspect HOME and made status read 80% on a fresh window.
+        let foreign = r#"{ "theme": "Default Dark", "font_size": 14, "ui_font_size": 14 }"#;
+        let value: serde_json::Value = serde_json::from_str(foreign).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(!obj.contains_key("appearance") && !obj.contains_key("layout"));
+        // load() returns Default when the file is not Malgel's — font stays 17.5.
+        assert_eq!(Settings::default().font_size, DEFAULT_FONT_SIZE);
+        assert_eq!(zoom_percent(Settings::default().font_size), 100);
     }
 }
