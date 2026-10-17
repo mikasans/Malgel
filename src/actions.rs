@@ -49,6 +49,8 @@ actions!(
         ToggleTabs,
         ToggleFileSidebar,
         ToggleOutline,
+        ToggleProblems,
+        ToggleMinimap,
         ToggleMaximizedPanel,
         TogglePdfThumbnails,
         ToggleSpellCheck,
@@ -114,6 +116,11 @@ actions!(
 #[derive(Action, Clone, PartialEq, Deserialize)]
 #[action(namespace = malgel, no_json)]
 pub struct SetLayout(pub Layout);
+
+/// Open a top-level title-bar menu by name (Alt+F → `"File"`, …).
+#[derive(Action, Clone, PartialEq, Deserialize)]
+#[action(namespace = malgel, no_json)]
+pub struct OpenAppMenu(pub String);
 
 /// Turn the current lines into a heading of the given level.
 #[derive(Action, Clone, PartialEq, Deserialize)]
@@ -254,6 +261,19 @@ pub fn bind_keys(cx: &mut App) {
         // keyboard in the tree, and pick the file that is open.
         KeyBinding::new("secondary-shift-e", FocusExplorer, None),
         KeyBinding::new("secondary-alt-o", ToggleOutline, None),
+        // Linux/Windows menubar mnemonics (probe #7): Alt+letter opens the menu.
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-f", OpenAppMenu("File".into()), None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-e", OpenAppMenu("Edit".into()), None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-v", OpenAppMenu("View".into()), None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-g", OpenAppMenu("Go".into()), None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-o", OpenAppMenu("Format".into()), None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-h", OpenAppMenu("Help".into()), None),
         // VS Code gives Ctrl+Shift+F to Find in Files; focus mode moves aside
         // so the key is free for it.
         KeyBinding::new("secondary-alt-f", ToggleFocusMode, None),

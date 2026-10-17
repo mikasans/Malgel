@@ -131,6 +131,31 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
             ]
         }
         "Outline" => vec![label, "outline", "table of contents", "headings"],
+        // Probe #7: discoverability for markdown / toggle preview phrasing.
+        "Preview" => vec![
+            label,
+            "markdown preview",
+            "open preview",
+            "preview markdown",
+            "md preview",
+        ],
+        "Editor and preview" => vec![
+            label,
+            "markdown preview",
+            "open preview",
+            "split preview",
+            "preview",
+        ],
+        "Toggle editor and preview" => vec![
+            label,
+            "toggle preview",
+            "markdown preview",
+            "open preview",
+            "preview",
+            "md preview",
+        ],
+        "Problems" => vec![label, "problems", "diagnostics", "errors", "warnings"],
+        "Toggle Minimap" => vec![label, "minimap", "toggle minimap", "code minimap"],
         _ => vec![label],
     }
 }
@@ -262,6 +287,8 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             ),
             cmd("File sidebar", IconName::PanelLeft, ToggleFileSidebar),
             cmd("Outline", IconName::ListTree, ToggleOutline),
+            cmd("Problems", IconName::TriangleAlert, ToggleProblems),
+            cmd("Toggle Minimap", IconName::PanelRight, ToggleMinimap),
             cmd("Focus mode", IconName::Maximize2, ToggleFocusMode),
             cmd("Toggle word wrap", IconName::TextWrap, ToggleSoftWrap),
             cmd(
@@ -425,5 +452,21 @@ mod tests {
         assert!(keywords("Save All").contains(&"save all"));
         assert!(keywords("Toggle Maximized Panel").contains(&"maximize"));
         assert!(keywords("Open Recent…").contains(&"open recent"));
+    }
+
+    #[test]
+    fn palette_probe7_preview_problems_minimap() {
+        let groups = groups();
+        let labels: Vec<_> = groups
+            .iter()
+            .flat_map(|g| g.items.iter().map(|i| i.label))
+            .collect();
+        assert!(labels.contains(&"Problems"));
+        assert!(labels.contains(&"Toggle Minimap"));
+        assert!(keywords("Preview").contains(&"markdown preview"));
+        assert!(keywords("Preview").contains(&"open preview"));
+        assert!(keywords("Toggle editor and preview").contains(&"toggle preview"));
+        assert!(keywords("Problems").contains(&"problems"));
+        assert!(keywords("Toggle Minimap").contains(&"minimap"));
     }
 }

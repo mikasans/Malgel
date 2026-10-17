@@ -32,7 +32,7 @@ use gpui_kit::{
         h_flex,
         input::{Escape, Input, InputEvent, InputState},
         link::Link,
-        menu::{AppMenuBar, ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
+        menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
         notification::Notification,
         radio::RadioGroup,
         resizable::{h_resizable, resizable_panel, v_resizable},
@@ -69,6 +69,7 @@ use crate::{
     spell,
     terminal::{self, TerminalPanel},
     themes::{self, AppSettings},
+    title_menu_bar::TitleMenuBar,
 };
 
 /// Shown when Malgel starts for the first time.
@@ -265,7 +266,6 @@ enum Placement {
 enum TreePromptKind {
     NewFile,
     NewFolder,
-    Rename,
 }
 
 /// Where a document being opened should land once it has loaded.
@@ -401,7 +401,7 @@ pub struct Workspace {
     /// Focus for the "Searching…" dialog, so its keys reach it.
     find_focus: FocusHandle,
     file_tree: Entity<FileTree>,
-    app_menu_bar: Entity<AppMenuBar>,
+    app_menu_bar: Entity<TitleMenuBar>,
 
     window_title: String,
     closing: bool,
@@ -466,7 +466,7 @@ impl Workspace {
     /// `paths`.
     pub fn new(
         paths: Vec<PathBuf>,
-        app_menu_bar: Entity<AppMenuBar>,
+        app_menu_bar: Entity<TitleMenuBar>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -2391,11 +2391,8 @@ impl Workspace {
             // The root folder is not renamed from here, as in VS Code.
             return;
         }
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.prompt_tree_name(TreePromptKind::Rename, None, &name, window, cx);
+        self.file_tree
+            .update(cx, |tree, cx| tree.begin_inline_rename(window, cx));
     }
 
     fn tree_delete(&mut self, _: &DeleteInTree, window: &mut Window, cx: &mut Context<Self>) {
@@ -2560,7 +2557,6 @@ impl Workspace {
         let (title, placeholder) = match kind {
             TreePromptKind::NewFile => ("New file", "File name"),
             TreePromptKind::NewFolder => ("New folder", "Folder name"),
-            TreePromptKind::Rename => ("Rename", "New name"),
         };
         Self::prompt_line(
             &self.tree_prompt.clone(),
@@ -2849,13 +2845,6 @@ impl Workspace {
                 self.file_tree.update(cx, |tree, cx| {
                     tree.create_entry(&folder, &name, is_dir, window, cx)
                 });
-            }
-            TreePromptKind::Rename => {
-                let Some((path, _)) = self.file_tree.read(cx).single_selection() else {
-                    return;
-                };
-                self.file_tree
-                    .update(cx, |tree, cx| tree.rename_entry(&path, &name, window, cx));
             }
         }
     }
@@ -5681,6 +5670,22 @@ pub fn open_settings(window: &mut Window, cx: &mut App) {
                     cx,
                 ))
                 .child(row(
+                    "problems",
+                    "Problems",
+                    "List diagnostics and spell issues in a panel (VS Code Problems).",
+                    settings.problems_panel,
+                    |settings, on| settings.problems_panel = on,
+                    cx,
+                ))
+                .child(row(
+                    "minimap",
+                    "Minimap",
+                    "Show a code overview strip beside the editor.",
+                    settings.minimap,
+                    |settings, on| settings.minimap = on,
+                    cx,
+                ))
+                .child(row(
                     "restore-session",
                     "Reopen last session",
                     "Start with the documents, folder and window you had open.",
@@ -6271,6 +6276,23 @@ impl Render for Workspace {
                     cx,
                 )
             }))
+            .on_action(cx.listener(|this, _: &ToggleProblems, _, cx| {
+                this.toggle(
+                    |settings| settings.problems_panel = !settings.problems_panel,
+                    cx,
+                )
+            }))
+            .on_action(cx.listener(|this, _: &ToggleMinimap, _, cx| {
+                this.toggle(
+                    |settings| settings.minimap = !settings.minimap,
+                    cx,
+                )
+            }))
+            .on_action(cx.listener(|this, action: &OpenAppMenu, window, cx| {
+                this.app_menu_bar.update(cx, |bar, cx| {
+                    bar.open_named(&action.0, window, cx);
+                });
+            }))
             .on_action(cx.listener(|this, _: &ToggleSpellCheck, _, cx| {
                 this.toggle(|settings| settings.spell_check = !settings.spell_check, cx)
             }))
@@ -6548,14 +6570,115 @@ impl Workspace {
         }
     }
 
-    /// Editor panes, with the integrated terminal docked underneath when open.
+    /// Problems panel: diagnostics + spell issues for the active document.
+    fn render_problems(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let problems = self.active_document().read(cx).problems(cx);
+        v_flex()
+            .id("problems-panel")
+            .size_full()
+            .bg(theme.sidebar)
+            .child(
+                div()
+                    .h(px(28.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .gap_2()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .child("PROBLEMS")
+                    .child(
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{}", problems.len())),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("problems-list")
+                    .flex_1()
+                    .min_h_0()
+                    .px_1()
+                    .pb_2()
+                    .overflow_y_scrollbar()
+                    .when(problems.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .p_3()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child("No problems have been detected in the active document."),
+                        )
+                    })
+                    .children(problems.into_iter().enumerate().map(|(ix, problem)| {
+                        let theme = cx.theme();
+                        let line = problem.line;
+                        let color = if problem.error {
+                            theme.danger
+                        } else if problem.warning {
+                            theme.warning
+                        } else {
+                            theme.muted_foreground
+                        };
+                        div()
+                            .id(("problem", ix))
+                            .flex_none()
+                            .py_1()
+                            .px_2()
+                            .rounded_md()
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.list_hover))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_start()
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .w(px(6.))
+                                            .h(px(6.))
+                                            .rounded(px(3.))
+                                            .bg(color)
+                                            .flex_none(),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .child(problem.message.clone())
+                                            .when_some(line, |this, line| {
+                                                this.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(theme.muted_foreground)
+                                                        .child(format!("Line {line}")),
+                                                )
+                                            }),
+                                    ),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(line) = line {
+                                    this.with_active(window, cx, |doc, window, cx| {
+                                        doc.go_to_line(line, window, cx);
+                                    });
+                                }
+                            }))
+                    })),
+            )
+    }
+
+    /// Editor panes, with Problems and/or the integrated terminal underneath.
     fn render_center(
         &self,
         main: impl IntoElement,
         focus_mode: bool,
         rem: Pixels,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let show_problems = AppSettings::get(cx).problems_panel && !focus_mode;
         let body = div()
             .flex_1()
             .min_h_0()
@@ -6563,16 +6686,34 @@ impl Workspace {
             .drag_over::<TreeDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
             .child(main);
 
+        let with_problems = if show_problems {
+            let problems_h = rems(10.).to_pixels(rem);
+            v_resizable("center-with-problems")
+                .child(
+                    resizable_panel()
+                        .size_range(rems(8.).to_pixels(rem)..Pixels::MAX)
+                        .child(body),
+                )
+                .child(
+                    resizable_panel()
+                        .size(problems_h)
+                        .size_range(rems(6.).to_pixels(rem)..rems(24.).to_pixels(rem))
+                        .child(self.render_problems(cx)),
+                )
+                .into_any_element()
+        } else {
+            body.into_any_element()
+        };
+
         if self.terminal_visible && !focus_mode {
             if self.terminal_maximized {
-                // Maximized panel: terminal dominates; editor keeps a thin strip.
                 let editor_h = rems(6.).to_pixels(rem);
                 v_resizable("center-with-terminal-max")
                     .child(
                         resizable_panel()
                             .size(editor_h)
                             .size_range(rems(4.).to_pixels(rem)..rems(16.).to_pixels(rem))
-                            .child(body),
+                            .child(with_problems),
                     )
                     .child(
                         resizable_panel()
@@ -6586,7 +6727,7 @@ impl Workspace {
                     .child(
                         resizable_panel()
                             .size_range(rems(12.).to_pixels(rem)..Pixels::MAX)
-                            .child(body),
+                            .child(with_problems),
                     )
                     .child(
                         resizable_panel()
@@ -6597,7 +6738,7 @@ impl Workspace {
                     .into_any_element()
             }
         } else {
-            body.into_any_element()
+            with_problems
         }
     }
 

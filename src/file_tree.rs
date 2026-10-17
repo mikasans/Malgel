@@ -14,10 +14,11 @@ use std::{
 };
 
 use gpui_kit::{
-    AppContext as _, ClickEvent, Context, DragMoveEvent, EventEmitter, ExternalPaths, FocusHandle,
-    Focusable, FontWeight, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
+    AppContext as _, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
     MouseDownEvent, MouseUpEvent, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Task, UniformListScrollHandle, Window,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle,
+    Window,
     assets::IconName,
     component::{
         ActiveTheme as _, Icon, Sizable as _, WindowExt as _,
@@ -25,6 +26,7 @@ use gpui_kit::{
         checkbox::Checkbox,
         dialog::DialogFooter,
         h_flex,
+        input::{Escape, Input, InputEvent, InputState},
         menu::ContextMenuExt as _,
         menu::PopupMenuItem,
         notification::Notification,
@@ -189,6 +191,10 @@ pub struct FileTree {
     list_top: usize,
     scroll: UniformListScrollHandle,
     refresh_task: Option<Task<()>>,
+    /// Inline F2 rename: path being edited and the input that holds the name.
+    renaming: Option<PathBuf>,
+    rename_input: Option<Entity<InputState>>,
+    _rename_sub: Option<Subscription>,
 }
 
 impl EventEmitter<FileTreeEvent> for FileTree {}
@@ -219,6 +225,9 @@ impl FileTree {
             list_top: 0,
             scroll: UniformListScrollHandle::new(),
             refresh_task: None,
+            renaming: None,
+            rename_input: None,
+            _rename_sub: None,
         };
         cx.observe_global::<crate::themes::AppSettings>(|this, cx| {
             this.set_show_hidden(crate::themes::AppSettings::get(cx).show_hidden_entries, cx);
@@ -611,6 +620,68 @@ impl FileTree {
 
     /// Rename `path` to `new_name`, keeping it in its folder. Open documents
     /// follow, because the workspace hears [`FileTreeEvent::Moved`].
+
+    /// Start an inline rename on the single selected entry (VS Code Explorer).
+    pub fn begin_inline_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, is_dir)) = self.single_selection() else {
+            return;
+        };
+        if is_dir && self.root.as_deref() == Some(path.as_path()) {
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        self._rename_sub = Some(cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    let name = input.read(cx).value().to_string();
+                    this.commit_inline_rename(name, window, cx);
+                }
+            },
+        ));
+        self.renaming = Some(path.clone());
+        self.rename_input = Some(input.clone());
+        if let Some(ix) = self.rows.iter().position(|r| r.entry.path == path) {
+            self.scroll
+                .scroll_to_item(ix, gpui_kit::ScrollStrategy::Nearest);
+        }
+        let focus = input.read(cx).focus_handle(cx);
+        focus.focus(window, cx);
+        // Select all so typing replaces the name (stem selection is a later polish).
+        window.dispatch_action(Box::new(gpui_kit::component::input::SelectAll), cx);
+        let _ = is_dir;
+        cx.notify();
+    }
+
+    pub fn cancel_inline_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming = None;
+        self.rename_input = None;
+        self._rename_sub = None;
+        cx.notify();
+    }
+
+    fn commit_inline_rename(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.renaming.clone() else {
+            return;
+        };
+        self.cancel_inline_rename(cx);
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.rename_entry(&path, name, window, cx);
+    }
+
     pub fn rename_entry(
         &mut self,
         path: &Path,
@@ -1184,6 +1255,8 @@ impl FileTree {
             theme.primary,
         );
         self.list_top = range.start;
+        let renaming_path = self.renaming.clone();
+        let rename_input = self.rename_input.clone();
         range
             .filter_map(|ix| {
                 let row = self.rows.get(ix)?;
@@ -1281,9 +1354,28 @@ impl FileTree {
                         )
                         .child(Icon::new(icon).small().text_color(muted).flex_none())
                         .child(
-                            div()
-                                .truncate()
-                                .child(SharedString::from(entry.name.clone())),
+                            if renaming_path.as_ref() == Some(&entry.path) {
+                                if let Some(input) = rename_input.clone() {
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .on_action(cx.listener(|this, _: &Escape, _, cx| {
+                                            this.cancel_inline_rename(cx);
+                                        }))
+                                        .child(Input::new(&input).appearance(false))
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .truncate()
+                                        .child(SharedString::from(entry.name.clone()))
+                                        .into_any_element()
+                                }
+                            } else {
+                                div()
+                                    .truncate()
+                                    .child(SharedString::from(entry.name.clone()))
+                                    .into_any_element()
+                            },
                         )
                         .on_mouse_down(
                             MouseButton::Left,

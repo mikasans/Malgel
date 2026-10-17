@@ -9,9 +9,10 @@ use gpui_kit::{
     component::{
         GlobalState, Theme, ThemeMode,
         input::{Copy, Cut, Paste, Redo, Replace, Search, SelectAll, Undo},
-        menu::AppMenuBar,
     },
 };
+
+use crate::title_menu_bar::TitleMenuBar;
 
 use crate::{
     actions::*,
@@ -21,8 +22,9 @@ use crate::{
     themes::{AppSettings, theme_names},
 };
 
-pub fn init(cx: &mut App) -> Entity<AppMenuBar> {
-    let app_menu_bar = AppMenuBar::new(cx);
+pub fn init(cx: &mut App) -> Entity<TitleMenuBar> {
+    crate::title_menu_bar::init(cx);
+    let app_menu_bar = TitleMenuBar::new(cx);
     update(&app_menu_bar, cx);
 
     cx.observe_global::<AppSettings>({
@@ -39,7 +41,7 @@ pub fn init(cx: &mut App) -> Entity<AppMenuBar> {
     app_menu_bar
 }
 
-fn update(app_menu_bar: &Entity<AppMenuBar>, cx: &mut App) {
+fn update(app_menu_bar: &Entity<TitleMenuBar>, cx: &mut App) {
     cx.set_menus(build(cx));
     let menus = build(cx).into_iter().map(|menu| menu.owned()).collect();
     GlobalState::global_mut(cx).set_app_menus(menus);
@@ -250,14 +252,21 @@ pub fn build(cx: &App) -> Vec<Menu> {
         MenuItem::action("Tabs", ToggleTabs).checked(settings.tabs),
         MenuItem::action("File sidebar", ToggleFileSidebar).checked(settings.file_sidebar),
         MenuItem::action("Outline", ToggleOutline).checked(settings.outline_sidebar),
+        MenuItem::action("Problems", ToggleProblems).checked(settings.problems_panel),
+        MenuItem::action("Minimap", ToggleMinimap).checked(settings.minimap),
         MenuItem::separator(),
         MenuItem::action("Sync scrolling", ToggleScrollSync).checked(settings.scroll_sync),
         MenuItem::action("Wrap lines", ToggleSoftWrap).checked(settings.soft_wrap),
         MenuItem::action("Line numbers", ToggleLineNumbers).checked(settings.line_numbers),
         submenu("Spelling", spelling),
-        MenuItem::action("Zoom in", ZoomIn),
-        MenuItem::action("Zoom out", ZoomOut),
-        MenuItem::action("Actual size", ZoomReset),
+        submenu(
+            "Zoom",
+            vec![
+                MenuItem::action("Zoom in", ZoomIn),
+                MenuItem::action("Zoom out", ZoomOut),
+                MenuItem::action("Actual size", ZoomReset),
+            ],
+        ),
         MenuItem::separator(),
         // Themes live in the Appearance submenu: menus with more than
         // MAX_MENU_ITEMS entries turn into small scrolling lists.

@@ -73,6 +73,10 @@ pub struct Settings {
     pub file_sidebar: bool,
     /// Show the document's headings beside the editor.
     pub outline_sidebar: bool,
+    /// Show the Problems panel (diagnostics / spell) like VS Code.
+    pub problems_panel: bool,
+    /// Show a minimap beside the editor.
+    pub minimap: bool,
     /// Underline unknown words.
     pub spell_check: bool,
     /// Dictionary to check against, like `en_US`; `None` follows the system.
@@ -119,6 +123,8 @@ impl Default for Settings {
             centered_layout: false,
             file_sidebar: false,
             outline_sidebar: false,
+            problems_panel: false,
+            minimap: false,
             spell_check: false,
             spell_language: None,
             restore_session: true,

@@ -764,6 +764,51 @@ impl DocumentView {
         &self.analysis
     }
 
+    /// Diagnostics and misspellings for the Problems panel.
+    pub fn problems(&self, cx: &App) -> Vec<ProblemItem> {
+        let mut out = Vec::new();
+        if let Some(live) = &self.live {
+            for diagnostic in &live.diagnostics {
+                let line = diagnostic.range.as_ref().map(|range| {
+                    let upto = range.start.min(self.source.len());
+                    self.source[..floor_char_boundary(&self.source, upto)]
+                        .matches('\n')
+                        .count()
+                        + 1
+                });
+                let message = diagnostic
+                    .message
+                    .lines()
+                    .next()
+                    .unwrap_or(&diagnostic.message)
+                    .to_string();
+                out.push(ProblemItem {
+                    message,
+                    line,
+                    error: diagnostic.error,
+                    warning: !diagnostic.error,
+                });
+            }
+        }
+        for misspelling in self.misspellings.iter() {
+            let line = {
+                let upto = misspelling.range.start.min(self.source.len());
+                self.source[..floor_char_boundary(&self.source, upto)]
+                    .matches('\n')
+                    .count()
+                    + 1
+            };
+            out.push(ProblemItem {
+                message: format!("Unknown word: {}", misspelling.word),
+                line: Some(line),
+                error: false,
+                warning: false,
+            });
+        }
+        let _ = cx;
+        out
+    }
+
     /// Record the encoding the file was read in, so saving keeps it.
     pub fn with_encoding(mut self, encoding: crate::document::Encoding) -> Self {
         self.encoding = encoding;
@@ -2670,6 +2715,7 @@ impl DocumentView {
         let document = cx.weak_entity();
         let settings = AppSettings::get(cx);
         let focus_mode = settings.focus_mode;
+        let show_minimap = settings.minimap && !focus_mode;
         let (pad_left, pad_right) = editor_side_padding(
             self.pane_width(self.editor_width, window, cx),
             cx.theme().font_size,
@@ -2677,7 +2723,7 @@ impl DocumentView {
             settings.centered_layout,
         );
         let (menu_document, paste_document) = (document.clone(), document.clone());
-        div()
+        let editor_pane = div()
             .id("editor-pane")
             .key_context(crate::actions::EDITOR_CONTEXT)
             .relative()
@@ -2869,7 +2915,68 @@ impl DocumentView {
                 .absolute()
                 .inset_0(),
             )
-            .child(self.render_other_match_outlines(cx))
+            .child(self.render_other_match_outlines(cx));
+        if !show_minimap {
+            return editor_pane.into_any_element();
+        }
+        h_flex()
+            .id("editor-with-minimap")
+            .size_full()
+            .min_w_0()
+            .child(div().flex_1().min_w_0().min_h_0().size_full().child(editor_pane))
+            .child(self.render_minimap(cx))
+            .into_any_element()
+    }
+
+    /// A thin overview strip: line density + click-to-jump (Toggle Minimap).
+    fn render_minimap(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let editor = self.editor.read(cx);
+        let rope = editor.text();
+        let line_count = rope.lines_len().max(1);
+        let slots = 120usize.min(line_count);
+        let per = (line_count as f32 / slots as f32).max(1.);
+        let source = self.source.as_str();
+        let mut slots_data = Vec::with_capacity(slots);
+        for slot in 0..slots {
+            let start_line = ((slot as f32) * per).floor() as usize;
+            let end_line = (((slot as f32 + 1.) * per).floor() as usize).min(line_count);
+            let mut density = 0usize;
+            for line_ix in start_line..end_line {
+                let start = rope.line_start_offset(line_ix);
+                let end = if line_ix + 1 < line_count {
+                    rope.line_start_offset(line_ix + 1)
+                } else {
+                    rope.len()
+                };
+                let slice = &source[start.min(source.len())..end.min(source.len())];
+                density += slice.chars().filter(|c| !c.is_whitespace()).count().min(40);
+            }
+            let alpha = (0.15 + (density as f32 / (40. * per)).min(1.) * 0.7).clamp(0.15, 0.85);
+            slots_data.push((start_line + 1, alpha));
+        }
+        v_flex()
+            .id("editor-minimap")
+            .w(px(56.))
+            .flex_none()
+            .h_full()
+            .border_l_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar.opacity(0.6))
+            .py_1()
+            .overflow_hidden()
+            .children(slots_data.into_iter().enumerate().map(|(slot, (jump_line, alpha))| {
+                div()
+                    .id(("minimap-slot", slot))
+                    .flex_1()
+                    .mx_1()
+                    .rounded(px(1.))
+                    .bg(theme.foreground.opacity(alpha))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.go_to_line(jump_line, window, cx);
+                    }))
+            }))
     }
 
     /// Find's other matches: the editor paints them as a faint, desaturated
@@ -3107,6 +3214,15 @@ const LIVE_DEBOUNCE: Duration = Duration::from_millis(40);
 const JUMP_DEDUPE: Duration = Duration::from_millis(350);
 /// How long the caret rests before the preview scrolls to show it.
 const LIVE_REVEAL_DELAY: Duration = Duration::from_millis(150);
+
+/// One row in the Problems panel.
+#[derive(Clone, Debug)]
+pub struct ProblemItem {
+    pub message: String,
+    pub line: Option<usize>,
+    pub error: bool,
+    pub warning: bool,
+}
 
 /// A Typst source's live preview.
 struct TypstLive {

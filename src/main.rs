@@ -22,6 +22,7 @@ mod images;
 mod links;
 mod math;
 mod menus;
+mod title_menu_bar;
 mod pdf;
 pub mod pdf_view;
 mod preview_ext;
@@ -304,7 +305,7 @@ fn main() {
 /// Open files in the window, or in a new one if it was closed.
 fn open_paths(
     paths: Vec<PathBuf>,
-    app_menu_bar: gpui_kit::Entity<gpui_kit::component::menu::AppMenuBar>,
+    app_menu_bar: gpui_kit::Entity<crate::title_menu_bar::TitleMenuBar>,
     cx: &mut App,
 ) {
     if paths.is_empty() {
@@ -332,7 +333,7 @@ fn open_paths(
 
 fn open_window(
     paths: Vec<PathBuf>,
-    app_menu_bar: gpui_kit::Entity<gpui_kit::component::menu::AppMenuBar>,
+    app_menu_bar: gpui_kit::Entity<crate::title_menu_bar::TitleMenuBar>,
     cx: &mut App,
 ) {
     let window_bounds = workspace::restored_bounds(cx).unwrap_or_else(|| {
