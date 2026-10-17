@@ -84,6 +84,13 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
         "Color theme…" => vec![label, "theme", "colour theme", "preferences color theme"],
         "Fold" => vec![label, "fold region", "collapse"],
         "Unfold" => vec![label, "unfold region", "expand fold"],
+        // Round-4: palette query "search" must hit Find in files (Ctrl+Shift+F).
+        "Find in files…" => vec![label, "search", "search in files", "find in folder", "workspace search"],
+        "Split Editor Right" => vec![label, "split", "split right", "split editor", "open to the side"],
+        "Split Editor Down" => vec![label, "split", "split down", "split editor", "open below"],
+        "Keyboard Shortcuts" => {
+            vec![label, "keyboard", "shortcut", "shortcuts", "keybindings", "hotkeys"]
+        }
         _ => vec![label],
     }
 }
@@ -196,6 +203,8 @@ pub fn groups() -> Vec<CommandGroupSpec> {
                 IconName::Columns2,
                 TogglePreviewLayout,
             ),
+            cmd("Split Editor Right", IconName::Columns2, SplitEditorRight),
+            cmd("Split Editor Down", IconName::Rows2, SplitEditorDown),
             cmd("Tabs", IconName::ListTree, ToggleTabs),
             cmd("Pin or unpin tab", IconName::Pin, PinTab),
             cmd(
@@ -207,6 +216,7 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Outline", IconName::ListTree, ToggleOutline),
             cmd("Focus mode", IconName::Maximize2, ToggleFocusMode),
             cmd("Toggle word wrap", IconName::TextWrap, ToggleSoftWrap),
+            cmd("Preview soft line breaks", IconName::TextWrap, ToggleGfmBreaks),
             cmd("Line numbers", IconName::ListOrdered, ToggleLineNumbers),
             cmd("Fold", IconName::ChevronDown, Fold),
             cmd("Unfold", IconName::ChevronRight, Unfold),
@@ -278,6 +288,7 @@ pub fn groups() -> Vec<CommandGroupSpec> {
     let help = group(
         "Help",
         vec![
+            cmd("Keyboard Shortcuts", IconName::Keyboard, OpenKeyboardShortcuts),
             cmd("Markdown guide", IconName::BookOpen, OpenMarkdownGuide),
             cmd("About Malgel", IconName::Info, About),
         ],

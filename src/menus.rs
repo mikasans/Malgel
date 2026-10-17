@@ -236,6 +236,13 @@ pub fn build(cx: &App) -> Vec<Menu> {
         MenuItem::action("Preview", SetLayout(Layout::Preview))
             .checked(settings.layout == Layout::Preview),
         MenuItem::action("Toggle editor and preview", TogglePreviewLayout),
+        submenu(
+            "Split Editor",
+            vec![
+                MenuItem::action("Split Right", SplitEditorRight),
+                MenuItem::action("Split Down", SplitEditorDown),
+            ],
+        ),
         MenuItem::action("Focus mode", ToggleFocusMode).checked(settings.focus_mode),
         MenuItem::separator(),
         MenuItem::action("Tabs", ToggleTabs).checked(settings.tabs),
@@ -246,7 +253,6 @@ pub fn build(cx: &App) -> Vec<Menu> {
         MenuItem::action("Wrap lines", ToggleSoftWrap).checked(settings.soft_wrap),
         MenuItem::action("Line numbers", ToggleLineNumbers).checked(settings.line_numbers),
         submenu("Spelling", spelling),
-        MenuItem::separator(),
         MenuItem::action("Zoom in", ZoomIn),
         MenuItem::action("Zoom out", ZoomOut),
         MenuItem::action("Actual size", ZoomReset),
@@ -269,7 +275,10 @@ pub fn build(cx: &App) -> Vec<Menu> {
         ),
     ];
 
-    let mut help = vec![MenuItem::action("Markdown guide", OpenMarkdownGuide)];
+    let mut help = vec![
+        MenuItem::action("Keyboard Shortcuts", OpenKeyboardShortcuts),
+        MenuItem::action("Markdown guide", OpenMarkdownGuide),
+    ];
     if !macos {
         help.push(MenuItem::separator());
         help.push(MenuItem::action("About Malgel", About));

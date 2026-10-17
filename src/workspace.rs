@@ -439,7 +439,20 @@ pub struct Workspace {
     /// Integrated terminal in the bottom panel (Ctrl+`).
     terminal: Entity<TerminalPanel>,
     terminal_visible: bool,
+    /// Second editor group: another open document beside or below the active one.
+    editor_split: Option<EditorSplit>,
+    /// Debounce for title-bar path copy toasts.
+    last_path_copy: Option<std::time::Instant>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A second editor pane showing another (or the same) open document.
+#[derive(Clone, Copy, Debug)]
+struct EditorSplit {
+    /// Index into `documents`.
+    other: usize,
+    /// `true` = stacked (Split Down), `false` = side-by-side (Split Right).
+    vertical: bool,
 }
 
 impl Workspace {
@@ -576,6 +589,8 @@ impl Workspace {
             document_subscriptions: Vec::new(),
             terminal,
             terminal_visible: false,
+            editor_split: None,
+            last_path_copy: None,
             _subscriptions: subscriptions,
         };
         this.restore(paths, &settings, window, cx);
@@ -1169,8 +1184,12 @@ impl Workspace {
                     settings.push_recent(&path);
                     settings.file_sidebar = true;
                 });
+                let folder = path.clone();
                 self.file_tree
                     .update(cx, |tree, cx| tree.set_root(Some(path), cx));
+                // Round-4: do not leave a pointless blank Untitled as the only
+                // editor when a folder was opened. Prefer README / first .md.
+                self.open_folder_default_doc(&folder, window, cx);
                 continue;
             }
             if let Some(ix) = self
@@ -1911,6 +1930,72 @@ impl Workspace {
             });
         }
         cx.notify();
+    }
+
+
+    /// After a folder becomes the Explorer root, avoid leaving a pointless
+    /// blank Untitled as the only editor (round-4). Prefer README / first
+    /// Markdown file in the folder root.
+    fn open_folder_default_doc(
+        &mut self,
+        folder: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sole = self.documents.len() == 1;
+        let (is_untitled, is_blank, is_welcome) = if sole {
+            let d = self.documents[0].read(cx);
+            let text = d.text_now(cx);
+            (
+                d.path().is_none(),
+                !d.is_dirty() && text.trim().is_empty(),
+                text.starts_with("# Welcome to Malgel"),
+            )
+        } else {
+            (false, false, false)
+        };
+        if !(sole && is_untitled && (is_blank || is_welcome)) {
+            return;
+        }
+        let candidates = [
+            folder.join("README.md"),
+            folder.join("Readme.md"),
+            folder.join("readme.md"),
+        ];
+        let mut pick = candidates.into_iter().find(|p| p.is_file());
+        if pick.is_none() {
+            if let Ok(rd) = std::fs::read_dir(folder) {
+                let mut mds: Vec<_> = rd
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.is_file()
+                            && p.extension().is_some_and(|ext| {
+                                ext.eq_ignore_ascii_case("md")
+                                    || ext.eq_ignore_ascii_case("markdown")
+                            })
+                    })
+                    .collect();
+                mds.sort();
+                pick = mds.into_iter().next();
+            }
+        }
+        let Some(path) = pick else {
+            return;
+        };
+        let placeholder_id = self.documents[0].entity_id();
+        self.load_path(path, Placement::Default, Target::Top, window, cx);
+        // Drop the leftover Untitled/welcome if load added another tab.
+        if self.documents.len() > 1 {
+            if let Some(ix) = self
+                .documents
+                .iter()
+                .position(|doc| doc.entity_id() == placeholder_id)
+            {
+                let id = self.documents[ix].entity_id();
+                self.remove_document(id, window, cx);
+            }
+        }
     }
 
     fn open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
@@ -4112,8 +4197,138 @@ impl Workspace {
         open_settings(window, cx);
     }
 
+    fn open_keyboard_shortcuts(
+        &mut self,
+        _: &OpenKeyboardShortcuts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::shortcuts::open(window, cx);
+    }
+
+    fn toggle_gfm_breaks(&mut self, _: &ToggleGfmBreaks, _: &mut Window, cx: &mut Context<Self>) {
+        AppSettings::update(cx, |settings| settings.gfm_breaks = !settings.gfm_breaks);
+        // Force every open preview to rebuild with the new break style.
+        for doc in &self.documents {
+            doc.update(cx, |doc, cx| doc.refresh_preview_from_settings(cx));
+        }
+        cx.notify();
+    }
+
+    /// Split the editor group: show another open document to the right or below.
+    fn split_editor_right(
+        &mut self,
+        _: &SplitEditorRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_editor_split(false, window, cx);
+    }
+
+    fn split_editor_down(
+        &mut self,
+        _: &SplitEditorDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_editor_split(true, window, cx);
+    }
+
+    fn close_editor_split(
+        &mut self,
+        _: &CloseEditorSplit,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_split = None;
+        cx.notify();
+    }
+
+    fn open_editor_split(&mut self, vertical: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.documents.is_empty() {
+            return;
+        }
+        // Prefer a different open tab; otherwise mirror the active document
+        // (VS Code opens a second view of the same file).
+        let other = if self.documents.len() == 1 {
+            self.active
+        } else if self.active > 0 {
+            self.active - 1
+        } else {
+            1
+        };
+        self.editor_split = Some(EditorSplit { other, vertical });
+        // Editor split is independent of Markdown edit|preview layout.
+        AppSettings::update(cx, |settings| settings.focus_mode = false);
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+
     // ---------------------------------------------------------------------
     // Rendering
+
+
+    /// True when there is no folder and the only buffer is the welcome /
+    /// blank Untitled — show Open folder / Open / New CTAs (round-4).
+    fn shows_welcome_cta(&self, cx: &App) -> bool {
+        if self.file_tree.read(cx).root().is_some() {
+            return false;
+        }
+        if self.documents.len() != 1 {
+            return false;
+        }
+        let doc = self.documents[0].read(cx);
+        doc.path().is_none()
+    }
+
+    fn render_welcome_cta(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("welcome-cta")
+            .w_full()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .items_center()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Start:"),
+            )
+            .child(
+                Button::new("welcome-open-folder")
+                    .small()
+                    .label("Open folder…")
+                    .tooltip("Open folder (Ctrl+K Ctrl+O)")
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(OpenFolder), cx)
+                    }),
+            )
+            .child(
+                Button::new("welcome-open-file")
+                    .small()
+                    .outline()
+                    .label("Open…")
+                    .tooltip("Open file (Ctrl+O)")
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(Open), cx)
+                    }),
+            )
+            .child(
+                Button::new("welcome-new-file")
+                    .small()
+                    .outline()
+                    .label("New file")
+                    .tooltip("New file (Ctrl+N)")
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(NewFile), cx)
+                    }),
+            )
+    }
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = AppSettings::get(cx);
@@ -4144,8 +4359,9 @@ impl Workspace {
                     .when(show_menu_bar, |this| this.child(self.app_menu_bar.clone())),
             )
             .child(
-                // The document name, centered on the window like native title bars.
-                // Click copies the absolute path; a toast confirms.
+                // Document name centered like a native title bar. Path copy is
+                // a small explicit control (not the whole strip) so ordinary
+                // clicks do not spam Copied toasts (round-4).
                 h_flex()
                     .id("title-bar-path")
                     .absolute()
@@ -4153,10 +4369,6 @@ impl Workspace {
                     .justify_center()
                     .gap_1p5()
                     .text_sm()
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.copy_title_path(window, cx);
-                    }))
                     .child(
                         div()
                             .font_weight(FontWeight::MEDIUM)
@@ -4168,6 +4380,18 @@ impl Workspace {
                             div()
                                 .text_color(cx.theme().muted_foreground)
                                 .child("— Edited"),
+                        )
+                    })
+                    .when(doc.path().is_some(), |this| {
+                        this.child(
+                            Button::new("title-copy-path")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(IconName::Copy))
+                                .tooltip("Copy path")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.copy_title_path(window, cx);
+                                })),
                         )
                     }),
             )
@@ -4994,6 +5218,14 @@ pub fn open_settings(window: &mut Window, cx: &mut App) {
                     cx,
                 ))
                 .child(row(
+                    "gfm-breaks",
+                    "Preview soft line breaks",
+                    "Show single newlines in a paragraph as line breaks in the preview (GFM breaks).",
+                    settings.gfm_breaks,
+                    |settings, on| settings.gfm_breaks = on,
+                    cx,
+                ))
+                .child(row(
                     "line-numbers",
                     "Line numbers",
                     "Number the lines in the editor.",
@@ -5404,6 +5636,9 @@ impl Render for Workspace {
                     v_flex()
                         .size_full()
                         .when(self.shows_tabs(cx), |this| this.child(self.render_tabs(cx)))
+                        .when(self.shows_welcome_cta(cx), |this| {
+                            this.child(self.render_welcome_cta(cx))
+                        })
                         .child(self.render_document_stack(cx)),
                 ),
         );
@@ -5479,6 +5714,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_theme_picker))
             .on_action(cx.listener(Self::toggle_focus_mode))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::open_keyboard_shortcuts))
+            .on_action(cx.listener(Self::toggle_gfm_breaks))
+            .on_action(cx.listener(Self::split_editor_right))
+            .on_action(cx.listener(Self::split_editor_down))
+            .on_action(cx.listener(Self::close_editor_split))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
                 let next = (this.active + 1) % this.documents.len();
                 this.activate(next, window, cx);
@@ -5684,14 +5924,20 @@ impl Render for Workspace {
 
 impl Workspace {
     /// Absolute path of the active document onto the clipboard, with a toast.
+    /// Debounced so ordinary title-bar clicks during navigation do not stack
+    /// "Copied …" notifications (round-4).
     fn copy_title_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.active_document().read(cx).path().cloned() else {
-            window.push_notification(
-                Notification::info("Save the document to give it a location."),
-                cx,
-            );
-            return;
+            return; // Untitled: ignore quiet clicks; Save As is the path to a location.
         };
+        let now = std::time::Instant::now();
+        if self
+            .last_path_copy
+            .is_some_and(|prev| now.duration_since(prev) < std::time::Duration::from_millis(1200))
+        {
+            return;
+        }
+        self.last_path_copy = Some(now);
         let abs = path
             .canonicalize()
             .unwrap_or(path)
@@ -5703,37 +5949,117 @@ impl Workspace {
 
     /// Keep every open document mounted so tab switches do not remount the
     /// preview/editor (scroll and preview state stay put, VS Code-like).
+    /// When [`editor_split`] is set, two document panes show side-by-side or
+    /// stacked (Split Editor Right / Down).
     fn render_document_stack(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active;
-        div()
-            .id("document-stack")
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .relative()
-            // Dropping a tab onto the editor opens editor|preview side by
-            // side (Malgel's Split layout) and activates that tab — the
-            // closest VS Code "drag to split" without multi-group editors.
-            .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
-                let ix = drag.index.min(this.documents.len().saturating_sub(1));
-                this.activate(ix, window, cx);
-                AppSettings::update(cx, |settings| {
-                    settings.layout = Layout::Split;
-                    settings.focus_mode = false;
+        let split = self.editor_split;
+        let stack = |active_ix: usize, id: &'static str| {
+            div()
+                .id(id)
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .relative()
+                .children(self.documents.iter().enumerate().map(move |(ix, doc)| {
+                    let shown = ix == active_ix;
+                    div()
+                        .id((id, ix))
+                        .absolute()
+                        .inset_0()
+                        .when(!shown, |this| this.invisible())
+                        .child(doc.clone())
+                }))
+        };
+
+        let drop_listener = cx.listener(|this, drag: &TabDrag, window, cx| {
+            let ix = drag.index.min(this.documents.len().saturating_sub(1));
+            // Dropping a tab onto the right/bottom half of a split group opens
+            // that tab in the secondary pane; otherwise activate + edit|preview.
+            if this.editor_split.is_some() {
+                this.editor_split = Some(EditorSplit {
+                    other: ix,
+                    vertical: this
+                        .editor_split
+                        .map(|s| s.vertical)
+                        .unwrap_or(false),
                 });
                 this.tab_insertion = None;
                 cx.notify();
-            }))
-            .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
-            .children(self.documents.iter().enumerate().map(|(ix, doc)| {
-                let shown = ix == active;
-                div()
-                    .id(("doc-pane", ix))
-                    .absolute()
-                    .inset_0()
-                    .when(!shown, |this| this.invisible())
-                    .child(doc.clone())
-            }))
+                return;
+            }
+            this.activate(ix, window, cx);
+            AppSettings::update(cx, |settings| {
+                settings.layout = Layout::Split;
+                settings.focus_mode = false;
+            });
+            this.tab_insertion = None;
+            cx.notify();
+        });
+
+        if let Some(split) = split {
+            let other = split.other.min(self.documents.len().saturating_sub(1));
+            let panes = if split.vertical {
+                v_flex()
+                    .id("editor-split-vertical")
+                    .size_full()
+                    .child(stack(active, "doc-stack-primary"))
+                    .child(
+                        div()
+                            .h(px(1.))
+                            .w_full()
+                            .bg(cx.theme().border)
+                            .flex_none(),
+                    )
+                    .child(stack(other, "doc-stack-secondary"))
+                    .into_any_element()
+            } else {
+                h_flex()
+                    .id("editor-split-horizontal")
+                    .size_full()
+                    .child(stack(active, "doc-stack-primary"))
+                    .child(
+                        div()
+                            .w(px(1.))
+                            .h_full()
+                            .bg(cx.theme().border)
+                            .flex_none(),
+                    )
+                    .child(stack(other, "doc-stack-secondary"))
+                    .into_any_element()
+            };
+            div()
+                .id("document-stack")
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .on_drop(drop_listener)
+                .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+                .child(panes)
+                .into_any_element()
+        } else {
+            div()
+                .id("document-stack")
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .relative()
+                // Dropping a tab onto the editor opens editor|preview side by
+                // side (Malgel's Split layout) and activates that tab — the
+                // closest VS Code "drag to split" without multi-group editors.
+                .on_drop(drop_listener)
+                .drag_over::<TabDrag>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+                .children(self.documents.iter().enumerate().map(|(ix, doc)| {
+                    let shown = ix == active;
+                    div()
+                        .id(("doc-pane", ix))
+                        .absolute()
+                        .inset_0()
+                        .when(!shown, |this| this.invisible())
+                        .child(doc.clone())
+                }))
+                .into_any_element()
+        }
     }
 
     /// Editor panes, with the integrated terminal docked underneath when open.

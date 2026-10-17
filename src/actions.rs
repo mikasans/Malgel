@@ -40,6 +40,7 @@ actions!(
         OpenMarkdownGuide,
         ToggleScrollSync,
         ToggleSoftWrap,
+        ToggleGfmBreaks,
         ToggleLineNumbers,
         ToggleAppearance,
         SelectColorTheme,
@@ -50,6 +51,10 @@ actions!(
         ToggleSpellCheck,
         ToggleFocusMode,
         TogglePreviewLayout,
+        SplitEditorRight,
+        SplitEditorDown,
+        CloseEditorSplit,
+        OpenKeyboardShortcuts,
         ToggleRestoreSession,
         OpenSettings,
         CopyRichText,
@@ -262,9 +267,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-1", SetLayout(Layout::Editor), None),
         KeyBinding::new("secondary-2", SetLayout(Layout::Split), None),
         KeyBinding::new("secondary-3", SetLayout(Layout::Preview), None),
-        // Toggle editor|preview ↔ editor-only (default open is already split,
+        // Toggle editor|preview <-> editor-only (default open is already split,
         // so a one-shot "open preview" feels like a no-op without this).
         KeyBinding::new("secondary-shift-v", TogglePreviewLayout, None),
+        // VS Code Split Editor Right (Ctrl+\).
+        KeyBinding::new("secondary-\\", SplitEditorRight, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("secondary-k secondary-s", OpenKeyboardShortcuts, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-k cmd-s", OpenKeyboardShortcuts, None),
         // The last binding for an action is the one menus display.
         KeyBinding::new("secondary-+", ZoomIn, None),
         KeyBinding::new("secondary-=", ZoomIn, None),

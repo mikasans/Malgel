@@ -941,6 +941,14 @@ impl DocumentView {
         cx.notify();
     }
 
+    /// Rebuild the Markdown preview after a settings change (e.g. GFM breaks).
+    pub fn refresh_preview_from_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.has_preview() {
+            return;
+        }
+        self.on_text_changed(false, cx);
+    }
+
     fn on_text_changed(&mut self, debounce: bool, cx: &mut Context<Self>) {
         if !self.large && self.editor.read(cx).text().len() > LARGE_DOCUMENT_BYTES {
             // Grew past the limit: stop keeping a second copy.
@@ -986,7 +994,10 @@ impl DocumentView {
         // Source code and other text is not previewed at all, as in VS
         // Code: the editor is the whole view.
         if self.has_preview() {
-            let preview_source = crate::preview_ext::normalize_tab_containers(&source);
+            let mut preview_source = crate::preview_ext::normalize_tab_containers(&source);
+            if crate::themes::AppSettings::get(cx).gfm_breaks {
+                preview_source = crate::preview_ext::apply_gfm_breaks(&preview_source);
+            }
             self.preview
                 .update(cx, |preview, cx| preview.set_text(&preview_source, cx));
             self.preview_limited = false;

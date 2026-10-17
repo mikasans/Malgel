@@ -1358,3 +1358,72 @@ Content 2
         assert_eq!(tabs[1].content.as_ref(), "line 3");
     }
 }
+
+/// Turn single newlines inside paragraphs into GFM hard breaks (`  \n`),
+/// leaving fenced code blocks and blank-line paragraph splits alone.
+pub fn apply_gfm_breaks(source: &str) -> String {
+    let mut out = String::with_capacity(source.len() + 32);
+    let mut in_fence = false;
+    let mut fence_marker: Option<char> = None;
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    for (i, line) in lines.iter().enumerate() {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = body.trim_start();
+        let mut fence_line = false;
+        if !in_fence {
+            if let Some(ch) = trimmed.chars().next().filter(|c| *c == '`' || *c == '~') {
+                let count = trimmed.chars().take_while(|c| *c == ch).count();
+                if count >= 3 {
+                    in_fence = true;
+                    fence_marker = Some(ch);
+                    fence_line = true;
+                }
+            }
+        } else if let Some(ch) = fence_marker {
+            let count = trimmed.chars().take_while(|c| *c == ch).count();
+            if count >= 3 && trimmed.chars().skip(count).all(|c| c.is_whitespace()) {
+                in_fence = false;
+                fence_marker = None;
+                fence_line = true;
+            }
+        }
+        out.push_str(body);
+        if line.ends_with('\n') {
+            let next_blank = lines
+                .get(i + 1)
+                .map(|n| n.strip_suffix('\n').unwrap_or(n).trim().is_empty())
+                .unwrap_or(true);
+            // Soft break → hard break unless blank line, fence marker, or already hard.
+            if !in_fence
+                && !fence_line
+                && !body.is_empty()
+                && !next_blank
+                && !body.ends_with("  ")
+                && !body.ends_with('\t')
+            {
+                out.push_str("  ");
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod gfm_breaks_tests {
+    use super::apply_gfm_breaks;
+
+    #[test]
+    fn soft_breaks_become_hard_outside_fences() {
+        let src = "Step 1\nStep 2\n\nNext para\n";
+        let out = apply_gfm_breaks(src);
+        assert!(out.contains("Step 1  \nStep 2"), "{out:?}");
+        assert!(out.contains("\n\nNext para"), "{out:?}");
+    }
+
+    #[test]
+    fn fences_are_left_alone() {
+        let src = "```\nline1\nline2\n```\n";
+        assert_eq!(apply_gfm_breaks(src), src);
+    }
+}

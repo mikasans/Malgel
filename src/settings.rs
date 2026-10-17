@@ -58,6 +58,8 @@ pub struct Settings {
     pub font_size: f32,
     pub layout: Layout,
     pub soft_wrap: bool,
+    /// Treat single newlines in paragraphs as hard breaks in the preview (GFM breaks).
+    pub gfm_breaks: bool,
     pub line_numbers: bool,
     /// Keep the preview scrolled to the part of the document being edited.
     pub scroll_sync: bool,
@@ -108,6 +110,7 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             layout: Layout::Split,
             soft_wrap: true,
+            gfm_breaks: false,
             line_numbers: true,
             scroll_sync: true,
             recent_files: Vec::new(),

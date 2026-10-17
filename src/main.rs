@@ -30,6 +30,7 @@ mod rich_copy;
 mod search;
 mod session;
 mod settings;
+mod shortcuts;
 mod single_instance;
 mod smart_edit;
 mod spell;

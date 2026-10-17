@@ -1473,7 +1473,7 @@ impl FileTree {
 
 impl Render for FileTree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let focused = self.focus_handle.contains_focused(window, cx);
+        let _focused = self.focus_handle.contains_focused(window, cx);
         let theme = cx.theme();
         let name = self
             .root
@@ -1528,11 +1528,8 @@ impl Render for FileTree {
                     .pl_1()
                     .bg(theme.sidebar)
                     .items_center()
-                    .when(!focused, |actions| {
-                        actions
-                            .invisible()
-                            .group_hover("tree-header", |style| style.visible())
-                    })
+                    // New File / New Folder stay visible (round-4): hover-only
+                    // hid them from probes that never hovered the header.
                     .child(
                         Button::new("new-file")
                             .ghost()
