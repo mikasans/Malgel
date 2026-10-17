@@ -661,8 +661,10 @@ impl Workspace {
     /// nothing was asked for, or the only argument is the same folder the session
     /// had open (re-launching from that directory). Any other path replaces.
     fn restores_session_for(paths: &[PathBuf], folder: Option<&Path>) -> bool {
+        // Probe #13: no-arg launch restores only when the last session had a
+        // folder (folder+tabs). A no-folder session stays on Welcome — no stale tabs.
         if paths.is_empty() {
-            return true;
+            return folder.is_some();
         }
         let Some(folder) = folder else {
             return false;
@@ -772,7 +774,7 @@ impl Workspace {
             });
         }
 
-        if settings.restore_session {
+        if restoring_session {
             self.file_tree
                 .update(cx, |tree, cx| tree.set_root(previous.folder.clone(), cx));
         }
@@ -965,13 +967,47 @@ impl Workspace {
             .retain(|(subscribed, _)| *subscribed != id);
         self.pinned.remove(&id);
         self.unpreview(id);
+        // Probe #13: keep split indices valid; collapse empty/orphan groups.
+        if let Some(split) = self.editor_split {
+            let mut other = split.other;
+            if other == ix {
+                // Closed the secondary pane's doc — collapse the split.
+                self.editor_split = None;
+            } else {
+                if other > ix {
+                    other -= 1;
+                }
+                let n = self.documents.len();
+                if n <= 1 || other >= n {
+                    self.editor_split = None;
+                } else {
+                    self.editor_split = Some(EditorSplit {
+                        other,
+                        vertical: split.vertical,
+                    });
+                }
+            }
+        }
         if self.documents.is_empty() {
             let doc =
                 cx.new(|cx| DocumentView::new(String::new(), None, LineEnding::Lf, window, cx));
             self.add_document(doc, false, window, cx);
+            self.editor_split = None;
         }
         if self.active > ix || self.active >= self.documents.len() {
             self.active = self.active.saturating_sub(1);
+        }
+        // Collapse if both panes would show the same tab.
+        if let Some(split) = self.editor_split {
+            let other = split.other.min(self.documents.len().saturating_sub(1));
+            if other == self.active || self.documents.len() < 2 {
+                self.editor_split = None;
+            } else {
+                self.editor_split = Some(EditorSplit {
+                    other,
+                    vertical: split.vertical,
+                });
+            }
         }
         self.activate(self.active, window, cx);
     }
@@ -2102,20 +2138,27 @@ impl Workspace {
             return;
         }
         let doc = self.active_document().clone();
-        // Prefer fold candidates (code); fall back to Markdown headings.
+        // Prefer scanned code symbols (Python def/class even when too short to fold),
+        // then fold candidates, then Markdown headings.
         let symbols: Vec<(String, usize)> = {
             let d = doc.read(cx);
             let text = d.text_now(cx);
-            let editor = d.editor().read(cx);
-            let rope = editor.text();
-            let mut items = Vec::new();
-            for fold in editor.fold_candidates() {
-                let line = fold.start_line;
-                let start = rope.line_start_offset(line).min(text.len());
-                let end = rope.line_end_offset(line).min(text.len());
-                let label = text.get(start..end).unwrap_or("").trim();
-                if !label.is_empty() {
-                    items.push((label.to_string(), line + 1));
+            let text_ref = text.as_ref();
+            let mut items: Vec<(String, usize)> = crate::analysis::code_symbols(text_ref)
+                .into_iter()
+                .map(|s| (s.label, s.line + 1))
+                .collect();
+            if items.is_empty() {
+                let editor = d.editor().read(cx);
+                let rope = editor.text();
+                for fold in editor.fold_candidates() {
+                    let line = fold.start_line;
+                    let start = rope.line_start_offset(line).min(text_ref.len());
+                    let end = rope.line_end_offset(line).min(text_ref.len());
+                    let label = text_ref.get(start..end).unwrap_or("").trim();
+                    if !label.is_empty() {
+                        items.push((label.to_string(), line + 1));
+                    }
                 }
             }
             if items.is_empty() {
@@ -2705,6 +2748,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Probe #13: with a split, close only the focused (primary) group —
+        // keep the secondary pane's document and collapse the empty group.
         let keep = self.editor_split.map(|split| {
             let ix = split.other.min(self.documents.len().saturating_sub(1));
             self.documents[ix].entity_id()
@@ -2715,8 +2760,11 @@ impl Workspace {
             .map(|doc| doc.entity_id())
             .filter(|id| !self.pinned.contains(id) && keep != Some(*id))
             .collect();
-        if keep.is_some() {
+        if let Some(keep_id) = keep {
             self.editor_split = None;
+            if let Some(ix) = self.document_index(keep_id) {
+                self.active = ix;
+            }
         }
         self.confirm_close_documents(targets, window, cx);
     }
@@ -6157,20 +6205,26 @@ impl Workspace {
     fn render_outline(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let doc = self.active_document().read(cx);
-        // Prefer code fold symbols (sample.py etc.); fall back to Markdown headings.
+        // Prefer scanned code symbols (def/class even when fold misses short bodies),
+        // then fold candidates, then Markdown headings.
         let symbols: Vec<(String, usize, u8)> = {
             let text = doc.text_now(cx);
             let text = text.as_ref();
-            let editor = doc.editor().read(cx);
-            let rope = editor.text();
-            let mut items = Vec::new();
-            for fold in editor.fold_candidates() {
-                let line = fold.start_line;
-                let start = rope.line_start_offset(line).min(text.len());
-                let end = rope.line_end_offset(line).min(text.len());
-                let label = text.get(start..end).unwrap_or("").trim();
-                if !label.is_empty() {
-                    items.push((label.to_string(), line + 1, 1u8));
+            let mut items: Vec<(String, usize, u8)> = crate::analysis::code_symbols(text)
+                .into_iter()
+                .map(|s| (s.label, s.line + 1, s.level))
+                .collect();
+            if items.is_empty() {
+                let editor = doc.editor().read(cx);
+                let rope = editor.text();
+                for fold in editor.fold_candidates() {
+                    let line = fold.start_line;
+                    let start = rope.line_start_offset(line).min(text.len());
+                    let end = rope.line_end_offset(line).min(text.len());
+                    let label = text.get(start..end).unwrap_or("").trim();
+                    if !label.is_empty() {
+                        items.push((label.to_string(), line + 1, 1u8));
+                    }
                 }
             }
             if items.is_empty() {
@@ -6284,6 +6338,11 @@ impl Workspace {
         let line_ending = doc.line_ending();
         let indent = doc.indent();
         let shows_editor = settings.layout.shows_editor() || !doc.has_preview();
+        // Probe #13: words / min-read are prose metrics — hide for code languages.
+        let prose_metrics = matches!(
+            language_label.as_str(),
+            "Markdown" | "MDX" | "Plain Text" | "Typst" | "CSV" | "TSV" | "XML"
+        );
         let ws_eol = workspace.clone();
         let ws_indent = workspace.clone();
         let ws_lang = workspace.clone();
@@ -6291,22 +6350,24 @@ impl Workspace {
             .left(
                 h_flex()
                     .gap_4()
-                    .child(item(format!(
-                        "{} {}",
-                        group_thousands(stats.words),
-                        if stats.words == 1 { "word" } else { "words" }
-                    )))
-                    .child(item(format!(
-                        "{} {}",
-                        group_thousands(stats.characters),
-                        if stats.characters == 1 {
-                            "character"
-                        } else {
-                            "characters"
-                        }
-                    )))
-                    .when(stats.words > 0, |this| {
-                        this.child(item(format!("{} min read", stats.reading_minutes())))
+                    .when(prose_metrics, |this| {
+                        this.child(item(format!(
+                            "{} {}",
+                            group_thousands(stats.words),
+                            if stats.words == 1 { "word" } else { "words" }
+                        )))
+                        .child(item(format!(
+                            "{} {}",
+                            group_thousands(stats.characters),
+                            if stats.characters == 1 {
+                                "character"
+                            } else {
+                                "characters"
+                            }
+                        )))
+                        .when(stats.words > 0, |this| {
+                            this.child(item(format!("{} min read", stats.reading_minutes())))
+                        })
                     })
                     .when(doc.preview_limited(), |this| {
                         this.child(item("Preview limited (large file)".to_string()))
@@ -6878,7 +6939,15 @@ impl Render for Workspace {
                             this.child(self.render_welcome_cta(cx))
                         })
                         .child(if self.diff_session.is_some() {
-                            self.render_diff_editor(cx).into_any_element()
+                            // Probe #13: flex_1 like document_stack — size_full alone left
+                            // panes with zero content height (blank white + mid labels).
+                            div()
+                                .id("diff-host")
+                                .flex_1()
+                                .min_h_0()
+                                .min_w_0()
+                                .child(self.render_diff_editor(cx))
+                                .into_any_element()
                         } else {
                             self.render_document_stack(cx).into_any_element()
                         }),
@@ -7277,13 +7346,24 @@ impl Workspace {
             let ix = drag.index.min(this.documents.len().saturating_sub(1));
             // Probe #12: drop on edge preview creates/moves a split group.
             if let Some(vertical) = this.tab_split_preview.take() {
-                this.activate(ix, window, cx);
+                // Probe #13: move the dragged tab into the new group; keep a
+                // *different* document in the primary pane (no duplicate/orphan).
+                let dragged = ix.min(this.documents.len().saturating_sub(1));
+                let primary = if this.active != dragged {
+                    this.active
+                } else {
+                    (0..this.documents.len())
+                        .find(|&i| i != dragged)
+                        .unwrap_or(dragged)
+                };
+                this.active = primary;
                 this.editor_split = Some(EditorSplit {
-                    other: ix,
+                    other: dragged,
                     vertical,
                 });
                 AppSettings::update(cx, |settings| settings.focus_mode = false);
                 this.tab_insertion = None;
+                this.focus_active(window, cx);
                 cx.notify();
                 return;
             }
@@ -7437,11 +7517,30 @@ impl Workspace {
                     .overflow_y_scrollbar()
                     .when(problems.is_empty(), |this| {
                         this.child(
-                            div()
+                            v_flex()
                                 .p_3()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("No problems have been detected in the active document."),
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child("No problems have been detected in the active document."),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("Enable Check spelling in Settings, or open a Typst file with compile diagnostics."),
+                                )
+                                .child(
+                                    Button::new("problems-open-settings")
+                                        .label("Open Settings…")
+                                        .xsmall()
+                                        .outline()
+                                        .on_click(|_, window, cx| {
+                                            window.dispatch_action(Box::new(OpenSettings), cx)
+                                        }),
+                                ),
                         )
                     })
                     .children(problems.into_iter().enumerate().map(|(ix, problem)| {
@@ -7812,35 +7911,77 @@ impl Workspace {
         let hunk = session.hunks.get(current);
         let left_lines = crate::diff::lines(&session.left);
         let right_lines = crate::diff::lines(&session.right);
-        let left_view = hunk
-            .map(|h| {
-                let start = h.left_start.saturating_sub(2);
-                let end = (h.left_start + h.left_count + 2).min(left_lines.len());
-                left_lines[start..end]
+        let pane_lines =
+            |hunk: Option<&crate::diff::Hunk>, lines: &[&str], side_left: bool| -> Vec<String> {
+                let Some(h) = hunk else {
+                    return vec!["(no hunk)".into()];
+                };
+                let (start0, count) = if side_left {
+                    (h.left_start, h.left_count)
+                } else {
+                    (h.right_start, h.right_count)
+                };
+                let start = start0.saturating_sub(2);
+                let end = (start0 + count.max(1) + 2).min(lines.len());
+                if start >= end {
+                    // Pure insert/delete on this side — still show context.
+                    let fallback = start0.min(lines.len().saturating_sub(1));
+                    if lines.is_empty() {
+                        return vec!["(empty)".into()];
+                    }
+                    return vec![format!("{:>4} │ {}", fallback + 1, lines[fallback])];
+                }
+                lines[start..end]
                     .iter()
                     .enumerate()
                     .map(|(i, line)| format!("{:>4} │ {}", start + i + 1, line))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_else(|| "(no hunk)".into());
-        let right_view = hunk
-            .map(|h| {
-                let start = h.right_start.saturating_sub(2);
-                let end = (h.right_start + h.right_count + 2).min(right_lines.len());
-                right_lines[start..end]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| format!("{:>4} │ {}", start + i + 1, line))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_else(|| "(no hunk)".into());
+                    .collect()
+            };
+        let left_view = pane_lines(hunk, &left_lines, true);
+        let right_view = pane_lines(hunk, &right_lines, false);
         let workspace = cx.weak_entity();
+        let render_pane = |id: &'static str, label: String, lines: Vec<String>, border_r: bool| {
+            let theme = cx.theme();
+            let mut pane = v_flex().flex_1().min_w_0().min_h_0();
+            if border_r {
+                pane = pane.border_r_1().border_color(theme.border);
+            }
+            pane.child(
+                div()
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .bg(theme.sidebar)
+                    .child(label),
+            )
+            .child(
+                v_flex()
+                    .id(id)
+                    .flex_1()
+                    .min_h_0()
+                    .p_2()
+                    .gap_0p5()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .overflow_y_scrollbar()
+                    .children(lines.into_iter().enumerate().map(|(i, line)| {
+                        div()
+                            .id((id, i))
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .child(line)
+                    })),
+            )
+        };
         v_flex()
             .id("diff-editor")
             .size_full()
             .bg(theme.background)
+            .text_color(theme.foreground)
             .child(
                 h_flex()
                     .h(px(36.))
@@ -7896,60 +8037,18 @@ impl Workspace {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .border_r_1()
-                            .border_color(theme.border)
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_1()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.muted_foreground)
-                                    .bg(theme.sidebar)
-                                    .child(session.left_label.clone()),
-                            )
-                            .child(
-                                div()
-                                    .id("diff-left")
-                                    .flex_1()
-                                    .min_h_0()
-                                    .p_2()
-                                    .font_family(theme.mono_font_family.clone())
-                                    .text_xs()
-                                    .overflow_y_scrollbar()
-                                    .child(left_view),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_1()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.muted_foreground)
-                                    .bg(theme.sidebar)
-                                    .child(session.right_label.clone()),
-                            )
-                            .child(
-                                div()
-                                    .id("diff-right")
-                                    .flex_1()
-                                    .min_h_0()
-                                    .p_2()
-                                    .font_family(theme.mono_font_family.clone())
-                                    .text_xs()
-                                    .overflow_y_scrollbar()
-                                    .child(right_view),
-                            ),
-                    ),
+                    .child(render_pane(
+                        "diff-left",
+                        session.left_label.clone(),
+                        left_view,
+                        true,
+                    ))
+                    .child(render_pane(
+                        "diff-right",
+                        session.right_label.clone(),
+                        right_view,
+                        false,
+                    )),
             )
             .into_any_element()
     }
@@ -8485,6 +8584,10 @@ mod tests {
         let other = root.join("other");
         std::fs::create_dir_all(&other).unwrap();
         assert!(Workspace::restores_session_for(&[], Some(&root)));
+        assert!(
+            !Workspace::restores_session_for(&[], None),
+            "no-folder session must not restore tabs on bare launch"
+        );
         assert!(Workspace::restores_session_for(
             std::slice::from_ref(&root),
             Some(&root),

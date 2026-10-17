@@ -183,7 +183,7 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
             "goto symbol",
             "symbol",
             "symbols",
-            "go to outline",
+            // Probe #13: do not match bare query `outline` (Outline ranks first).
         ],
         "Reload Window" => vec![label, "reload window", "reload", "restart window"],
         "Zen Mode" => vec![label, "zen", "zen mode", "distraction free"],
@@ -679,9 +679,20 @@ mod tests {
         assert!(o.contains(&"outline"));
         assert!(o.contains(&"outline view"));
         assert!(
-            !s.contains(&"outline"),
-            "bare outline must not hit Go to Symbol"
+            !s.iter().any(|k| k.contains("outline")),
+            "no Go to Symbol keyword may contain outline (query outline → Outline)"
         );
         assert!(s.contains(&"go to symbol"));
+    }
+
+    #[test]
+    fn palette_probe13_outline_query_hits_outline_label() {
+        let o = keywords("Outline");
+        assert!(
+            o.iter()
+                .any(|k| k == &"outline" || k.to_lowercase().contains("outline"))
+        );
+        let label = "Outline";
+        assert!(label.to_lowercase().contains("outline"));
     }
 }

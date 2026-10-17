@@ -496,3 +496,104 @@ mod large_tests {
         assert_eq!(outline, vec![(1, "Top"), (2, "End")]);
     }
 }
+
+/// A code symbol for Outline / Go to Symbol (line is 0-based).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeSymbol {
+    pub label: String,
+    pub line: usize,
+    pub level: u8,
+}
+
+/// Scan source for top-level-ish `def` / `class` / `fn` / `function` symbols.
+/// Used when fold candidates miss short Python functions (fold needs ≥3 lines).
+pub fn code_symbols(source: &str) -> Vec<CodeSymbol> {
+    let mut items = Vec::new();
+    for (line_ix, line) in source.lines().enumerate() {
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        let level = (indent / 4).min(8) as u8 + 1;
+        if let Some(name) = pythonish_def_name(trimmed) {
+            items.push(CodeSymbol {
+                label: format!("def {name}"),
+                line: line_ix,
+                level,
+            });
+            continue;
+        }
+        if let Some(name) = strip_keyword_name(trimmed, "class ") {
+            items.push(CodeSymbol {
+                label: format!("class {name}"),
+                line: line_ix,
+                level,
+            });
+            continue;
+        }
+        let mut matched = false;
+        for prefix in [
+            "pub async fn ",
+            "pub(crate) fn ",
+            "pub fn ",
+            "async fn ",
+            "fn ",
+        ] {
+            if let Some(name) = strip_keyword_name(trimmed, prefix) {
+                items.push(CodeSymbol {
+                    label: format!("fn {name}"),
+                    line: line_ix,
+                    level,
+                });
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            continue;
+        }
+        if let Some(name) = strip_keyword_name(trimmed, "function ") {
+            items.push(CodeSymbol {
+                label: format!("function {name}"),
+                line: line_ix,
+                level,
+            });
+        }
+    }
+    items
+}
+
+fn pythonish_def_name(trimmed: &str) -> Option<&str> {
+    for prefix in ["async def ", "def "] {
+        if let Some(name) = strip_keyword_name(trimmed, prefix) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn strip_keyword_name<'a>(trimmed: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = trimmed.strip_prefix(prefix)?;
+    let name = rest
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .next()
+        .unwrap_or("");
+    if name.is_empty() { None } else { Some(name) }
+}
+
+#[cfg(test)]
+mod code_symbol_tests {
+    use super::*;
+
+    #[test]
+    fn python_sample_lists_defs_and_class() {
+        let src = "def alpha():\n    pass\n\ndef beta():\n    return 42\n\nclass Gamma:\n    def method(self):\n        return \"g\"\n";
+        let syms = code_symbols(src);
+        let labels: Vec<_> = syms.iter().map(|s| s.label.as_str()).collect();
+        assert!(labels.contains(&"def alpha"), "{labels:?}");
+        assert!(labels.contains(&"def beta"), "{labels:?}");
+        assert!(labels.contains(&"class Gamma"), "{labels:?}");
+        assert!(labels.contains(&"def method"), "{labels:?}");
+    }
+}

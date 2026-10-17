@@ -462,12 +462,14 @@ pub fn open(window: &mut Window, cx: &mut App) {
         return;
     }
     default_app::refresh(cx);
-    window.open_dialog(cx, |dialog, window, cx| {
-        let view = cx.new(|cx| SettingsView::new(window, cx));
-        // Probe #12: auto-focus the filter so typing `wrap` / `autosave` works immediately.
-        let focus = view.read(cx).filter_focus(cx);
-        window.defer(cx, move |window, cx| focus.focus(window, cx));
-        dialog.title("Settings").child(view)
+    // Probe #13: build the view *outside* the dialog builder. The builder
+    // re-runs every frame; creating InputState inside wiped typed filter text
+    // (R1a≡R1b≡R1c) and left focus on a discarded handle.
+    let view = cx.new(|cx| SettingsView::new(window, cx));
+    let focus = view.read(cx).filter_focus(cx);
+    window.defer(cx, move |window, cx| focus.focus(window, cx));
+    window.open_dialog(cx, move |dialog, _window, _cx| {
+        dialog.title("Settings").child(view.clone())
     });
 }
 
