@@ -324,10 +324,14 @@ pub fn bind_keys(cx: &mut App) {
             Some(INPUT_CONTEXT),
         ),
         KeyBinding::new("secondary-shift-c", CodeBlock, Some(EDITOR_CONTEXT)),
+        // Shifted punctuation/numbers: on Linux/Windows GPUI reports the
+        // produced character and strips Shift (Shift+[ → `{`, Shift+8 → `*`).
+        // Bind that character without a shift- modifier, or the shortcut never
+        // matches. Letters still use secondary-shift-x (Shift stays for a–z).
         KeyBinding::new("secondary-shift-.", Quote, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-shift-8", BulletList, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-shift-7", NumberedList, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-shift-9", TaskList, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-*", BulletList, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-&", NumberedList, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-(", TaskList, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-alt-1", Heading(1), Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-alt-2", Heading(2), Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-alt-3", Heading(3), Some(EDITOR_CONTEXT)),
@@ -346,9 +350,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-k", DeleteLine, Some(EDITOR_CONTEXT)),
         KeyBinding::new("alt-up", MoveLineUp, Some(EDITOR_CONTEXT)),
         KeyBinding::new("alt-down", MoveLineDown, Some(EDITOR_CONTEXT)),
-        // VS Code Fold / Unfold.
-        KeyBinding::new("secondary-shift-[", Fold, Some(EDITOR_CONTEXT)),
-        KeyBinding::new("secondary-shift-]", Unfold, Some(EDITOR_CONTEXT)),
+        // VS Code Fold / Unfold (Ctrl/Cmd+Shift+[ / ]). GPUI key is `{` / `}`
+        // with Shift stripped — see comment on BulletList above.
+        KeyBinding::new("secondary-{", Fold, Some(EDITOR_CONTEXT)),
+        KeyBinding::new("secondary-}", Unfold, Some(EDITOR_CONTEXT)),
     ]);
 }
 
@@ -393,5 +398,45 @@ mod tests {
             WORKSPACE_CONTEXT, EDITOR_CONTEXT,
             "Bold and Toggle Side Bar cannot share both the key and the context"
         );
+    }
+
+    /// Ctrl+Shift+[ / ] arrive as ctrl-{ / ctrl-} (Shift stripped for symbols).
+    /// The Fold bindings must use those keys or Xvfb / real Linux keyboards miss.
+    #[test]
+    fn fold_bindings_use_shifted_bracket_characters() {
+        let fold = KeyBinding::new("secondary-{", Fold, Some(EDITOR_CONTEXT));
+        let unfold = KeyBinding::new("secondary-}", Unfold, Some(EDITOR_CONTEXT));
+        assert_eq!(fold.keystrokes().len(), 1);
+        assert_eq!(unfold.keystrokes().len(), 1);
+        let fold_ks = &fold.keystrokes()[0];
+        let unfold_ks = &unfold.keystrokes()[0];
+        assert_eq!(fold_ks.key(), "{");
+        assert_eq!(unfold_ks.key(), "}");
+        assert!(!fold_ks.modifiers().shift, "Shift is already encoded in {{");
+        assert!(!unfold_ks.modifiers().shift, "Shift is already encoded in }}");
+        assert!(fold_ks.modifiers().control || fold_ks.modifiers().platform);
+
+        // The naive VS Code spellings parse, but they are not what Linux delivers
+        // (platform key is `{` without Shift, not `[` with Shift).
+        let naive = KeyBinding::new("secondary-shift-[", Fold, Some(EDITOR_CONTEXT));
+        let naive_ks = &naive.keystrokes()[0];
+        assert_eq!(naive_ks.key(), "[");
+        assert!(naive_ks.modifiers().shift);
+        assert_ne!(
+            (fold_ks.key(), fold_ks.modifiers().shift),
+            (naive_ks.key(), naive_ks.modifiers().shift),
+            "secondary-shift-[ would never match a real Ctrl+Shift+[ on Linux"
+        );
+
+        // Same convention for shifted number-row markdown shortcuts.
+        for (binding, key) in [
+            ("secondary-*", "*"),
+            ("secondary-&", "&"),
+            ("secondary-(", "("),
+        ] {
+            let b = KeyBinding::new(binding, BulletList, Some(EDITOR_CONTEXT));
+            assert_eq!(b.keystrokes()[0].key(), key);
+            assert!(!b.keystrokes()[0].modifiers().shift);
+        }
     }
 }

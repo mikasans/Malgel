@@ -19,6 +19,7 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window,
     assets::IconName,
+    base::Disableable as _,
     component::{
         ActiveTheme as _, Icon, Sizable as _,
         button::{Button, ButtonVariants as _},
@@ -305,6 +306,7 @@ impl Drop for TerminalPanel {
 impl Render for TerminalPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let output: SharedString = self.output.clone().into();
+        let shell_running = self.writer.is_some();
         v_flex()
             .id("terminal-panel")
             .size_full()
@@ -314,9 +316,9 @@ impl Render for TerminalPanel {
             .child(
                 h_flex()
                     .id("terminal-header")
-                    .h(px(32.))
+                    .h(px(36.))
                     .px_2()
-                    .gap_2()
+                    .gap_3()
                     .items_center()
                     .border_b_1()
                     .border_color(cx.theme().border)
@@ -327,22 +329,25 @@ impl Render for TerminalPanel {
                             .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .child("Terminal"),
                     )
+                    // Labeled + small (not xsmall/compact) so Clear and Kill share a
+                    // predictable hit area — icon-only X was easy to miss next to Trash.
                     .child(
                         Button::new("terminal-clear")
                             .ghost()
-                            .xsmall()
-                            .compact()
+                            .small()
                             .icon(Icon::new(IconName::Trash))
-                            .tooltip("Clear")
+                            .label("Clear")
+                            .tooltip("Clear terminal output")
                             .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
                     )
                     .child(
                         Button::new("terminal-kill")
                             .ghost()
-                            .xsmall()
-                            .compact()
+                            .small()
                             .icon(Icon::new(IconName::X))
-                            .tooltip("Kill shell")
+                            .label("Kill")
+                            .tooltip("Kill the shell process")
+                            .disabled(!shell_running)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.stop_shell();
                                 this.append("— shell stopped\n", cx);
