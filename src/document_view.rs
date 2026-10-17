@@ -1067,7 +1067,7 @@ impl DocumentView {
     /// Whether `position` is over the line numbers (not the fold arrows).
     ///
     /// The fold column sits immediately to the right of the digit run (gpui
-    /// reserves ~18px for chevrons after a 6px margin). Ending the hit test
+    /// reserves a dedicated hitbox after a small margin). Ending the hit test
     /// at the last digit keeps chevron clicks out of whole-line selection so
     /// the editor's fold toggle can run.
     fn in_line_numbers(
@@ -1122,9 +1122,10 @@ impl DocumentView {
             .map(|size| size.width)
             .unwrap_or(font_size * 0.6);
         let digits = line_number_digits(editor.text().lines_len());
-        // Match gpui-base: digits, then 6px margin, then ~18px fold hitbox.
+        // Match gpui-base (malgel-fold-0.7.0): digits, then margin, then fold hitbox.
+        // Keep in sync with LINE_NUMBER_RIGHT_MARGIN + FOLD_ICON_HITBOX_WIDTH.
         let left = bounds.origin.x + digit * digits as f32;
-        let right = left + px(6.) + px(18.);
+        let right = left + px(FOLD_COLUMN_MARGIN) + px(FOLD_COLUMN_HITBOX);
         position.x >= left
             && position.x < right
             && position.y >= bounds.origin.y
@@ -3361,6 +3362,11 @@ fn show_line_numbers(settings: &crate::settings::Settings) -> bool {
     settings.line_numbers && !settings.focus_mode
 }
 
+/// Must match gpui-base `LINE_NUMBER_RIGHT_MARGIN` (malgel-fold-0.7.0).
+const FOLD_COLUMN_MARGIN: f32 = 8.;
+/// Must match gpui-base `FOLD_ICON_HITBOX_WIDTH` (malgel-fold-0.7.0).
+const FOLD_COLUMN_HITBOX: f32 = 24.;
+
 /// The folding column: everywhere but focus mode. Plain text (.txt, .typ)
 /// has nothing to fold, but keeps the empty column so the gap between the
 /// line numbers and the text matches Markdown and code (~1.5ch, G9).
@@ -3541,6 +3547,13 @@ mod tests {
         assert_eq!(tail, line.start..wrapped.len());
         assert_eq!(super::line_number_digits(9), 3);
         assert_eq!(super::line_number_digits(12_000), 5);
+    }
+
+    #[test]
+    fn fold_column_hitbox_matches_gpui_base_patch() {
+        // Keep Malgel's gutter hit-test aligned with gpui-base fold layout.
+        assert_eq!(super::FOLD_COLUMN_MARGIN, 8.);
+        assert_eq!(super::FOLD_COLUMN_HITBOX, 24.);
     }
 
     #[test]

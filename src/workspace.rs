@@ -4774,6 +4774,12 @@ impl Workspace {
         let editor = doc.editor().read(cx);
         let position = editor.cursor_position();
         let selection = editor.selected_range();
+        // Unicode scalars (VS Code–like), not UTF-8 bytes — en-dash is 1 char / 3 bytes.
+        let selected_chars = if selection.is_empty() {
+            0
+        } else {
+            selection_character_count(&editor.text().slice(selection.clone()).to_string())
+        };
         let line_ending = doc.line_ending();
         let shows_editor = settings.layout.shows_editor() || !doc.has_preview();
         StatusBar::new()
@@ -4812,7 +4818,7 @@ impl Workspace {
                                 "Ln {}, Col {} ({} selected)",
                                 position.line + 1,
                                 position.character + 1,
-                                group_thousands(selection.len())
+                                group_thousands(selected_chars)
                             )
                         }))
                     })
@@ -5292,6 +5298,12 @@ fn suggested_file_name(analysis: &Analysis, extension: &str) -> String {
         .filter(|stem| !stem.is_empty())
         .unwrap_or_else(|| "Untitled".to_string());
     format!("{stem}.{extension}")
+}
+
+/// Count Unicode scalars in selected text. Prefer this over a byte-offset
+/// `range.len()` so the status bar matches VS Code (en-dash = 1, not 3).
+fn selection_character_count(selected: &str) -> usize {
+    selected.chars().count()
 }
 
 fn group_thousands(value: usize) -> String {
@@ -6056,6 +6068,20 @@ mod tests {
         assert_eq!(group_thousands(999), "999");
         assert_eq!(group_thousands(1_000), "1,000");
         assert_eq!(group_thousands(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn selection_count_uses_characters_not_bytes() {
+        // En-dash U+2013 is one scalar, three UTF-8 bytes.
+        let line = "Line four – click me for selection";
+        assert_eq!(line.chars().count(), 34);
+        assert_eq!(line.len(), 36);
+        assert_eq!(selection_character_count(line), 34);
+        assert_eq!(selection_character_count("–"), 1);
+        assert_eq!("–".len(), 3);
+        // Empty / ASCII stay obvious.
+        assert_eq!(selection_character_count(""), 0);
+        assert_eq!(selection_character_count("abc"), 3);
     }
 
     #[test]

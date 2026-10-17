@@ -1295,6 +1295,43 @@ shot 48c-fallback-saved
   || fail "the file dialog notice covers the top of the window (tabs)"
 pass "no file dialog: in-app path field saves Untitled; notice stays off the tabs"
 
+# 21c3. Fold / Unfold (Ctrl+Shift+[ / ]): a Markdown heading section collapses
+#       and expands again. Assert on the frame — folded body lines disappear.
+printf '%s\n' \
+  '# Fold me' \
+  '' \
+  'hidden body line one' \
+  'hidden body line two' \
+  'hidden body line three' \
+  'hidden body line four' \
+  '' \
+  '## Keep visible' \
+  'after the folded section' >"$WS/notes/fold.md"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'fold.md'
+xdotool key --clearmodifiers Return
+sleep 1.0
+# Editor-only so the fold gutter and text fill the pane (easier pixel check).
+xdotool key --clearmodifiers ctrl+1
+sleep 0.5
+xdotool key --clearmodifiers ctrl+Home
+sleep 0.3
+shot 48d-fold-before
+xdotool key --clearmodifiers ctrl+shift+bracketleft
+sleep 0.8
+shot 48e-fold-collapsed
+[[ "$(pixels_differ 48d-fold-before 48e-fold-collapsed)" -gt 2000 ]] \
+  || fail "Ctrl+Shift+[ did not fold the heading section"
+xdotool key --clearmodifiers ctrl+shift+bracketright
+sleep 0.8
+shot 48f-fold-expanded
+[[ "$(pixels_differ 48d-fold-before 48f-fold-expanded)" -lt 2500 ]] \
+  || fail "Ctrl+Shift+] did not restore the unfolded view"
+[[ "$(pixels_differ 48e-fold-collapsed 48f-fold-expanded)" -gt 2000 ]] \
+  || fail "Unfold left the folded frame unchanged"
+pass "Ctrl+Shift+[ / ] fold and unfold a Markdown heading"
+
 # 21d. G5: in Tokyo Moon the line numbers render at >= 4.5:1 (they are painted
 #      with muted.foreground; the old #6e738d was 3.28:1). Last, since the
 #      theme choice persists.

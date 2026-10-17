@@ -54,7 +54,9 @@ application that starts, paints and responds.
     the wrong button after a zoom — clicks it, and checks the panes shift and
     the setting the app saved says the sidebar is gone; clicking it again
     brings both back.
-20. Checks the process is still alive at the end (no crash from any step).
+20. Folds a Markdown heading with `Ctrl+Shift+[`, checks the body leaves the
+    frame, then unfolds with `Ctrl+Shift+]`.
+21. Checks the process is still alive at the end (no crash from any step).
 
 A viewer has no text field for the keyboard to land in, so steps 13 and 15
 click — the two places in this script that do. `title_bar_button.py` locates
