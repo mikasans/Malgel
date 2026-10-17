@@ -7061,6 +7061,12 @@ fn esc_closes(content: impl IntoElement) -> gpui_kit::Div {
             window.close_dialog(cx);
             cx.stop_propagation();
         })
+        // InputState may clear the filter on Escape without emitting Cancel when
+        // the query is non-empty; still close on one Escape (VS Code quick input).
+        .capture_action(|_: &Escape, window, cx| {
+            window.close_dialog(cx);
+            cx.stop_propagation();
+        })
         // Ctrl+Shift+F over a picker leaves it for Find in Files, rather
         // than being typed into the picker's query. The binding belongs to
         // the workspace's key context, which a dialog's focus is outside of,
