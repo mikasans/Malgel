@@ -16,11 +16,11 @@ use std::{
 };
 
 use gpui_kit::{
-    Anchor, App, AppContext as _, Bounds, ClipboardItem, Context, DragMoveEvent, Entity, EntityId,
-    ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
-    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, PathPromptOptions, Pixels,
-    Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window, WindowBounds,
+    Anchor, App, AppContext as _, Bounds, ClipboardItem, Context, DismissEvent, DragMoveEvent,
+    Entity, EntityId, ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement as _,
+    IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, PathPromptOptions,
+    Pixels, Point, Render, ScrollHandle, SharedString, Size, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window, WindowBounds, anchored,
     assets::IconName,
     base::Disableable as _,
     component::{
@@ -33,7 +33,7 @@ use gpui_kit::{
         h_flex,
         input::{Escape, Input, InputEvent, InputState},
         link::Link,
-        menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
+        menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
         notification::Notification,
         resizable::{h_resizable, resizable_panel, v_resizable},
         scroll::ScrollableElement as _,
@@ -41,7 +41,7 @@ use gpui_kit::{
         status_bar::StatusBar,
         v_flex,
     },
-    div,
+    deferred, div,
     prelude::FluentBuilder as _,
     px, rems,
 };
@@ -380,6 +380,15 @@ struct TabInsertion {
     source: usize,
 }
 
+/// Probe #17: workspace-owned tab context menu. Declarative `.context_menu()`
+/// on tabs races `activate()` rebuild + deferred editor focus under Xvfb and
+/// never paints; opening `PopupMenu` explicitly (like the title-bar menus)
+/// survives the re-render.
+struct TabContextMenu {
+    position: Point<Pixels>,
+    menu: Entity<PopupMenu>,
+}
+
 /// The ghost rendered under the cursor while a tab or a tree entry is
 /// being dragged.
 pub(crate) struct DragGhost {
@@ -493,6 +502,9 @@ pub struct Workspace {
     tab_drag_last_pos: Cell<Option<Point<Pixels>>>,
     /// Document/editor body bounds for drag-to-edge hit testing.
     editor_body_bounds: Cell<Option<Bounds<Pixels>>>,
+    /// Open tab context menu (probe #17), if any.
+    tab_context_menu: Option<TabContextMenu>,
+    _tab_context_menu_sub: Option<Subscription>,
     _watch_task: Task<()>,
     document_subscriptions: Vec<(EntityId, Vec<Subscription>)>,
     /// Integrated terminal sessions in the bottom panel (Ctrl+`).
@@ -665,6 +677,8 @@ impl Workspace {
             tab_drag_index: Cell::new(None),
             tab_drag_last_pos: Cell::new(None),
             editor_body_bounds: Cell::new(None),
+            tab_context_menu: None,
+            _tab_context_menu_sub: None,
             _watch_task: watch_task,
             document_subscriptions: Vec::new(),
             terminals,
@@ -5006,6 +5020,239 @@ impl Workspace {
         }
     }
 
+    /// Probe #17: dismiss the programmatic tab context menu.
+    fn dismiss_tab_context_menu(&mut self, cx: &mut Context<Self>) {
+        self._tab_context_menu_sub.take();
+        self.tab_context_menu.take();
+        cx.notify();
+    }
+
+    /// Probe #17: open Pin / Select for Compare / … at `position` for tab `ix`.
+    /// Built as an owned `PopupMenu` so `activate()` re-renders cannot wipe a
+    /// pending `.context_menu()` element state under Xvfb.
+    fn open_tab_context_menu(
+        &mut self,
+        ix: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ix >= self.documents.len() {
+            return;
+        }
+        // Select the tab without deferred editor focus — that raced the old
+        // declarative menu and could steal focus before it painted.
+        self.activate_inner(ix, false, window, cx);
+
+        let count = self.documents.len();
+        let doc_entity = self.documents[ix].clone();
+        let doc_id = doc_entity.entity_id();
+        let is_pinned = self.pinned.contains(&doc_id);
+        let is_last = ix + 1 >= count;
+        let has_other = count > 1;
+        let tab_path = doc_entity.read(cx).path().cloned();
+        let ws = cx.weak_entity();
+
+        let menu = PopupMenu::build(window, cx, {
+            let ws = ws.clone();
+            let doc_weak = doc_entity.clone();
+            let path = tab_path.clone();
+            move |menu, _, _| {
+                let ws_close = ws.clone();
+                let ws_other = ws.clone();
+                let ws_right = ws.clone();
+                let ws_pin = ws.clone();
+                let ws_sel = ws.clone();
+                let ws_cmp = ws.clone();
+                let doc = doc_weak.clone();
+                let sel_path = path.clone();
+                let cmp_path = path.clone();
+                let has_path = path.is_some();
+                let pin_label = tab_context_menu_labels(is_pinned)[0];
+                let menu = menu
+                    .item(PopupMenuItem::new(pin_label).on_click(move |_, _, cx| {
+                        _ = ws_pin.update(cx, |this, cx| {
+                            this.toggle_pin_by_id(doc_id, cx);
+                        });
+                    }))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new("Select for Compare")
+                            .disabled(!has_path)
+                            .on_click(move |_, window, cx| {
+                                let Some(sel_path) = sel_path.clone() else {
+                                    return;
+                                };
+                                _ = ws_sel.update(cx, |this, cx| {
+                                    this.compare_selection = Some(sel_path.clone());
+                                    let name = sel_path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| sel_path.display().to_string());
+                                    window.push_notification(
+                                        Notification::info(format!(
+                                            "Selected {name} for compare. Right-click another file → Compare with Selected."
+                                        )),
+                                        cx,
+                                    );
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Compare with Selected")
+                            .disabled(!has_path)
+                            .on_click(move |_, window, cx| {
+                                let Some(right) = cmp_path.clone() else {
+                                    return;
+                                };
+                                _ = ws_cmp.update(cx, |this, cx| {
+                                    let Some(left) = this.compare_selection.clone() else {
+                                        window.push_notification(
+                                            Notification::info(
+                                                "Select for Compare on a file first.",
+                                            ),
+                                            cx,
+                                        );
+                                        return;
+                                    };
+                                    if left == right {
+                                        window.push_notification(
+                                            Notification::info(
+                                                "Pick a different file to compare.",
+                                            ),
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                    let Ok(left_text) = std::fs::read_to_string(&left) else {
+                                        window.push_notification(
+                                            Notification::info("Couldn’t read the first file."),
+                                            cx,
+                                        );
+                                        return;
+                                    };
+                                    let Ok(right_text) = std::fs::read_to_string(&right) else {
+                                        window.push_notification(
+                                            Notification::info("Couldn’t read the second file."),
+                                            cx,
+                                        );
+                                        return;
+                                    };
+                                    let left_name = left
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "left".into());
+                                    let right_name = right
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "right".into());
+                                    this.open_diff_session(
+                                        format!("Compare: {left_name} ↔ {right_name}"),
+                                        left_name,
+                                        right_name,
+                                        left_text,
+                                        right_text,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    )
+                    .separator()
+                    .item(PopupMenuItem::new("Close").on_click(move |_, window, cx| {
+                        _ = ws_close.update(cx, |this, cx| {
+                            let id = doc.entity_id();
+                            this.confirm_unsaved(
+                                doc.clone(),
+                                AfterConfirm::CloseDocument(id),
+                                window,
+                                cx,
+                            );
+                        });
+                    }))
+                    .item(
+                        PopupMenuItem::new("Close Other Tabs")
+                            .disabled(!has_other)
+                            .on_click(move |_, window, cx| {
+                                _ = ws_other.update(cx, |this, cx| {
+                                    this.close_other_tabs_by_id(doc_id, window, cx);
+                                });
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Close Tabs to the Right")
+                            .disabled(is_last)
+                            .on_click(move |_, window, cx| {
+                                _ = ws_right.update(cx, |this, cx| {
+                                    this.close_tabs_to_the_right_by_id(doc_id, window, cx);
+                                });
+                            }),
+                    );
+                match path.clone() {
+                    Some(path) => {
+                        let text = path.display().to_string();
+                        let reveal = path.clone();
+                        menu.separator()
+                            .item(PopupMenuItem::new("Copy Path").on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                            }))
+                            .item(
+                                PopupMenuItem::new("Reveal in File Manager").on_click(
+                                    move |_, _, cx| {
+                                        cx.reveal_path(&reveal);
+                                    },
+                                ),
+                            )
+                    }
+                    None => menu,
+                }
+            }
+        });
+
+        let focus = menu.focus_handle(cx);
+        if !focus.contains_focused(window, cx) {
+            focus.focus(window, cx);
+        }
+
+        self._tab_context_menu_sub.take();
+        self._tab_context_menu_sub = Some(cx.subscribe_in(
+            &menu,
+            window,
+            |this, _, _: &DismissEvent, _, cx| {
+                this.dismiss_tab_context_menu(cx);
+            },
+        ));
+        self.tab_context_menu = Some(TabContextMenu { position, menu });
+        cx.notify();
+    }
+
+    /// Shift+F10 / Menu key: open the tab context menu for the active tab.
+    fn show_tab_context_menu(
+        &mut self,
+        _: &ShowTabContextMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.documents.is_empty() {
+            return;
+        }
+        let position = self
+            .tab_bar_bounds
+            .get()
+            .map(|b| {
+                Point::new(
+                    b.origin.x + px(80.).min(b.size.width * 0.5),
+                    b.origin.y + b.size.height * 0.5,
+                )
+            })
+            .unwrap_or_else(|| {
+                // Probe #17 hit Y ≈ 46–54; default near first tab label.
+                Point::new(px(250.), px(50.))
+            });
+        let ix = self.active;
+        self.open_tab_context_menu(ix, position, window, cx);
+    }
 
     /// After a cross-group tab drop: `(new_active, new_other)`. Never leaves
     /// both panes on the same document when more than one tab exists (move,
@@ -6103,7 +6350,7 @@ impl Workspace {
         }
         let tab_scroll = self.tab_scroll.clone();
 
-        h_flex()
+        let bar = h_flex()
             .id("tabs")
             .h(px(36.))
             .flex_none()
@@ -6146,12 +6393,10 @@ impl Workspace {
                 )
             })
             .child(
-                // Probe #16: do NOT attach `.horizontal_scrollbar` here. That
-                // helper overlays an absolute inset_0 Scrollbar whose full-area
-                // hitbox calls stop_propagation on mouse-down when "visible",
-                // which swallows right-clicks before `.context_menu()` can open
-                // (Explorer has no such overlay — Select for Compare works).
-                // overflow_x_scroll + the prev/next chevrons are enough.
+                // Probe #16/#17: do NOT attach `.horizontal_scrollbar` here.
+                // That helper overlays an absolute inset_0 Scrollbar whose
+                // full-area hitbox can swallow right-clicks. Tab menus now
+                // open programmatically; overflow_x_scroll + chevrons remain.
                 div()
                     .relative()
                     .flex_1()
@@ -6178,15 +6423,10 @@ impl Workspace {
                                 // for good, the way VS Code marks its preview.
                                 let is_preview = self.preview == Some(doc_id);
                                 let is_pinned = self.pinned.contains(&doc_id);
-                                let is_last = ix + 1 >= count;
-                                let has_other = count > 1;
                                 let name = doc.name().to_string();
                                 // The tab carries its file's type icon, as in VS Code.
                                 let tab_icon = doc.path().map(|path| file_icon(path));
-                                let tab_path = doc.path().cloned();
                                 let theme = cx.theme();
-                                let doc_weak = doc_entity.clone();
-                                let ws_menu = workspace.clone();
                                 let drag_label: SharedString = name.clone().into();
 
                                 h_flex()
@@ -6352,12 +6592,18 @@ impl Workspace {
                                     .on_mouse_down(
                                         MouseButton::Right,
                                         cx.listener(
-                                            move |this, _: &MouseDownEvent, window, cx| {
-                                                // Probe #16: pick the tab before the
-                                                // context menu opens (Explorer does
-                                                // the same). Menu still comes from
-                                                // `.context_menu` below.
-                                                this.activate(ix, window, cx);
+                                            move |this, event: &MouseDownEvent, window, cx| {
+                                                // Probe #17: open menu programmatically.
+                                                // Declarative `.context_menu()` lost its
+                                                // element state when activate() notified
+                                                // and deferred editor focus under Xvfb.
+                                                cx.stop_propagation();
+                                                this.open_tab_context_menu(
+                                                    ix,
+                                                    event.position,
+                                                    window,
+                                                    cx,
+                                                );
                                             },
                                         ),
                                     )
@@ -6389,206 +6635,6 @@ impl Workspace {
                                             );
                                         }),
                                     )
-                                    .context_menu({
-                                        let ws = ws_menu.clone();
-                                        let path = tab_path.clone();
-                                        move |menu, _, _| {
-                                            let ws_close = ws.clone();
-                                            let ws_other = ws.clone();
-                                            let ws_right = ws.clone();
-                                            let ws_pin = ws.clone();
-                                            let ws_sel = ws.clone();
-                                            let ws_cmp = ws.clone();
-                                            let doc = doc_weak.clone();
-                                            let sel_path = path.clone();
-                                            let cmp_path = path.clone();
-                                            let has_path = path.is_some();
-
-                                            // Probe #15/#16: Select for Compare / Compare
-                                            // with Selected sit near the top. Labels match
-                                            // `tab_context_menu_labels` (unit-tested).
-                                            let pin_label = tab_context_menu_labels(is_pinned)[0];
-                                            let menu = menu
-                                                .item(
-                                                    PopupMenuItem::new(pin_label)
-                                                    .on_click(move |_, _, cx| {
-                                                        _ = ws_pin.update(cx, |this, cx| {
-                                                            this.toggle_pin_by_id(doc_id, cx);
-                                                        });
-                                                    }),
-                                                )
-                                                .separator()
-                                                .item(
-                                                    PopupMenuItem::new("Select for Compare")
-                                                        .disabled(!has_path)
-                                                        .on_click(move |_, window, cx| {
-                                                            let Some(sel_path) = sel_path.clone() else {
-                                                                return;
-                                                            };
-                                                            _ = ws_sel.update(cx, |this, cx| {
-                                                                this.compare_selection =
-                                                                    Some(sel_path.clone());
-                                                                let name = sel_path
-                                                                    .file_name()
-                                                                    .map(|n| {
-                                                                        n.to_string_lossy()
-                                                                            .into_owned()
-                                                                    })
-                                                                    .unwrap_or_else(|| {
-                                                                        sel_path.display().to_string()
-                                                                    });
-                                                                window.push_notification(
-                                                                    Notification::info(format!(
-                                                                        "Selected {name} for compare. Right-click another file → Compare with Selected."
-                                                                    )),
-                                                                    cx,
-                                                                );
-                                                                cx.notify();
-                                                            });
-                                                        }),
-                                                )
-                                                .item(
-                                                    PopupMenuItem::new("Compare with Selected")
-                                                        .disabled(!has_path)
-                                                        .on_click(move |_, window, cx| {
-                                                            let Some(right) = cmp_path.clone() else {
-                                                                return;
-                                                            };
-                                                            _ = ws_cmp.update(cx, |this, cx| {
-                                                                let Some(left) =
-                                                                    this.compare_selection.clone()
-                                                                else {
-                                                                    window.push_notification(
-                                                                        Notification::info(
-                                                                            "Select for Compare on a file first.",
-                                                                        ),
-                                                                        cx,
-                                                                    );
-                                                                    return;
-                                                                };
-                                                                if left == right {
-                                                                    window.push_notification(
-                                                                        Notification::info(
-                                                                            "Pick a different file to compare.",
-                                                                        ),
-                                                                        cx,
-                                                                    );
-                                                                    return;
-                                                                }
-                                                                let Ok(left_text) =
-                                                                    std::fs::read_to_string(&left)
-                                                                else {
-                                                                    window.push_notification(
-                                                                        Notification::info(
-                                                                            "Couldn’t read the first file.",
-                                                                        ),
-                                                                        cx,
-                                                                    );
-                                                                    return;
-                                                                };
-                                                                let Ok(right_text) =
-                                                                    std::fs::read_to_string(&right)
-                                                                else {
-                                                                    window.push_notification(
-                                                                        Notification::info(
-                                                                            "Couldn’t read the second file.",
-                                                                        ),
-                                                                        cx,
-                                                                    );
-                                                                    return;
-                                                                };
-                                                                let left_name = left
-                                                                    .file_name()
-                                                                    .map(|n| {
-                                                                        n.to_string_lossy().into_owned()
-                                                                    })
-                                                                    .unwrap_or_else(|| "left".into());
-                                                                let right_name = right
-                                                                    .file_name()
-                                                                    .map(|n| {
-                                                                        n.to_string_lossy().into_owned()
-                                                                    })
-                                                                    .unwrap_or_else(|| "right".into());
-                                                                this.open_diff_session(
-                                                                    format!(
-                                                                        "Compare: {left_name} ↔ {right_name}"
-                                                                    ),
-                                                                    left_name,
-                                                                    right_name,
-                                                                    left_text,
-                                                                    right_text,
-                                                                    window,
-                                                                    cx,
-                                                                );
-                                                            });
-                                                        }),
-                                                )
-                                                .separator()
-                                                .item(PopupMenuItem::new("Close").on_click(
-                                                    move |_, window, cx| {
-                                                        _ = ws_close.update(cx, |this, cx| {
-                                                            let id = doc.entity_id();
-                                                            this.confirm_unsaved(
-                                                                doc.clone(),
-                                                                AfterConfirm::CloseDocument(id),
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    },
-                                                ))
-                                                .item(
-                                                    PopupMenuItem::new("Close Other Tabs")
-                                                        .disabled(!has_other)
-                                                        .on_click(move |_, window, cx| {
-                                                            _ = ws_other.update(cx, |this, cx| {
-                                                                this.close_other_tabs_by_id(
-                                                                    doc_id, window, cx,
-                                                                );
-                                                            });
-                                                        }),
-                                                )
-                                                .item(
-                                                    PopupMenuItem::new("Close Tabs to the Right")
-                                                        .disabled(is_last)
-                                                        .on_click(move |_, window, cx| {
-                                                            _ = ws_right.update(cx, |this, cx| {
-                                                                this.close_tabs_to_the_right_by_id(
-                                                                    doc_id, window, cx,
-                                                                );
-                                                            });
-                                                        }),
-                                                );
-
-                                            match path.clone() {
-                                                Some(path) => {
-                                                    let text = path.display().to_string();
-                                                    let reveal = path.clone();
-                                                    menu.separator()
-                                                        .item(
-                                                            PopupMenuItem::new("Copy Path").on_click(
-                                                                move |_, _, cx| {
-                                                                    cx.write_to_clipboard(
-                                                                        ClipboardItem::new_string(
-                                                                            text.clone(),
-                                                                        ),
-                                                                    );
-                                                                },
-                                                            ),
-                                                        )
-                                                        .item(
-                                                            PopupMenuItem::new(
-                                                                "Reveal in File Manager",
-                                                            )
-                                                            .on_click(move |_, _, cx| {
-                                                                cx.reveal_path(&reveal);
-                                                            }),
-                                                        )
-                                                }
-                                                None => menu,
-                                            }
-                                        }
-                                    })
                             })),
                     ),
             )
@@ -6652,6 +6698,24 @@ impl Workspace {
                                 ),
                             )
                         }),
+                )
+            });
+
+        // Probe #17: paint the programmatic tab context menu above the strip.
+        div()
+            .id("tabs-host")
+            .relative()
+            .w_full()
+            .child(bar)
+            .when_some(self.tab_context_menu.as_ref(), |this, open| {
+                this.child(
+                    deferred(
+                        anchored()
+                            .position(open.position)
+                            .snap_to_window_with_margin(px(8.))
+                            .anchor(Anchor::TopLeft)
+                            .child(open.menu.clone()),
+                    ),
                 )
             })
     }
@@ -7445,6 +7509,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::close_all_tabs))
             .on_action(cx.listener(Self::reopen_closed_editor))
             .on_action(cx.listener(Self::pin_tab))
+            .on_action(cx.listener(Self::show_tab_context_menu))
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
             .on_action(cx.listener(Self::close_other_tabs))
@@ -7723,8 +7788,31 @@ impl Render for Workspace {
             // Probe #15: Xvfb often never delivers on_drop to the edge strip.
             // Mouse-up while an edge preview (or last pos in-zone) is active
             // commits the same move_tab_into_split as Split Editor Right.
-            .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, window, cx| {
-                if this.tab_drag_index.get().is_some() || this.tab_split_preview.is_some() {
+            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                if this.tab_drag_index.get().is_some()
+                    || this.tab_split_preview.is_some()
+                    || this.tab_drag_last_pos.get().is_some()
+                {
+                    // Probe #17: release point is authoritative under Xvfb —
+                    // last drag-move can lag or miss the 120px edge strip.
+                    this.tab_drag_last_pos.set(Some(event.position));
+                    if this.tab_split_preview.is_none() {
+                        let body = this.editor_body_bounds.get().or_else(|| {
+                            // Fallback when body bounds never arrived: content
+                            // below chrome (~tab/breadcrumb), window-local.
+                            let size = window.viewport_size();
+                            Some(Bounds::new(
+                                Point::new(px(0.), px(70.)),
+                                Size::new(
+                                    size.width,
+                                    (size.height - px(70.)).max(px(1.)),
+                                ),
+                            ))
+                        });
+                        if let Some(vertical) = Self::edge_split_at(event.position, body) {
+                            this.tab_split_preview = Some(vertical);
+                        }
+                    }
                     if !this.try_commit_tab_edge_split(window, cx) {
                         // Drag ended off-edge: drop stale state so a later
                         // ordinary click cannot invent a split.

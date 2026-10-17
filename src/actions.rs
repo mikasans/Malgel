@@ -46,6 +46,7 @@ actions!(
         ReopenClosedEditor,
         ToggleLineEnding,
         PinTab,
+        ShowTabContextMenu,
         NextTab,
         PreviousTab,
         GoBack,
@@ -267,6 +268,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-w", CloseWindow, None),
         KeyBinding::new("ctrl-tab", NextTab, workspace),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, workspace),
+        // Probe #17 a11y: Shift+F10 / Menu key open the tab context menu.
+        KeyBinding::new("shift-f10", ShowTabContextMenu, workspace),
+        KeyBinding::new("menu", ShowTabContextMenu, workspace),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-shift-]", NextTab, workspace),
         #[cfg(target_os = "macos")]
