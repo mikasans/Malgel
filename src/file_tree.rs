@@ -618,9 +618,6 @@ impl FileTree {
         }
     }
 
-    /// Rename `path` to `new_name`, keeping it in its folder. Open documents
-    /// follow, because the workspace hears [`FileTreeEvent::Moved`].
-
     /// Start an inline rename on the single selected entry (VS Code Explorer).
     pub fn begin_inline_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((path, is_dir)) = self.single_selection() else {
@@ -677,6 +674,8 @@ impl FileTree {
         self.rename_entry(&path, name, window, cx);
     }
 
+    /// Rename `path` to `new_name`, keeping it in its folder. Open documents
+    /// follow, because the workspace hears [`FileTreeEvent::Moved`].
     pub fn rename_entry(
         &mut self,
         path: &Path,

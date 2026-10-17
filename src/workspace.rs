@@ -2334,22 +2334,21 @@ impl Workspace {
             folder.join("readme.md"),
         ];
         let mut pick = candidates.into_iter().find(|p| p.is_file());
-        if pick.is_none() {
-            if let Ok(rd) = std::fs::read_dir(folder) {
-                let mut mds: Vec<_> = rd
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.is_file()
-                            && p.extension().is_some_and(|ext| {
-                                ext.eq_ignore_ascii_case("md")
-                                    || ext.eq_ignore_ascii_case("markdown")
-                            })
-                    })
-                    .collect();
-                mds.sort();
-                pick = mds.into_iter().next();
-            }
+        if pick.is_none()
+            && let Ok(rd) = std::fs::read_dir(folder)
+        {
+            let mut mds: Vec<_> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension().is_some_and(|ext| {
+                            ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
+                        })
+                })
+                .collect();
+            mds.sort();
+            pick = mds.into_iter().next();
         }
         let Some(path) = pick else {
             return;
@@ -2357,15 +2356,14 @@ impl Workspace {
         let placeholder_id = self.documents[0].entity_id();
         self.load_path(path, Placement::Default, Target::Top, window, cx);
         // Drop the leftover Untitled/welcome if load added another tab.
-        if self.documents.len() > 1 {
-            if let Some(ix) = self
+        if self.documents.len() > 1
+            && let Some(ix) = self
                 .documents
                 .iter()
                 .position(|doc| doc.entity_id() == placeholder_id)
-            {
-                let id = self.documents[ix].entity_id();
-                self.remove_document(id, window, cx);
-            }
+        {
+            let id = self.documents[ix].entity_id();
+            self.remove_document(id, window, cx);
         }
     }
 
@@ -5741,11 +5739,11 @@ impl Workspace {
         let crumbs = match doc.path() {
             Some(path) => {
                 let mut parts: Vec<String> = Vec::new();
-                if let Some(root) = self.file_tree.read(cx).root() {
-                    if let Ok(rel) = path.strip_prefix(root) {
-                        for c in rel.components() {
-                            parts.push(c.as_os_str().to_string_lossy().into_owned());
-                        }
+                if let Some(root) = self.file_tree.read(cx).root()
+                    && let Ok(rel) = path.strip_prefix(root)
+                {
+                    for c in rel.components() {
+                        parts.push(c.as_os_str().to_string_lossy().into_owned());
                     }
                 }
                 if parts.is_empty() {

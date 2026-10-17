@@ -53,11 +53,7 @@ impl TitleMenuBar {
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let menu_bar = cx.entity();
-        let menus: Vec<OwnedMenu> = GlobalState::global(cx)
-            .app_menus()
-            .iter()
-            .cloned()
-            .collect();
+        let menus: Vec<OwnedMenu> = GlobalState::global(cx).app_menus().to_vec();
         self.menus = menus
             .iter()
             .enumerate()
@@ -249,7 +245,7 @@ impl TitleMenu {
 
     fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let is_open = self.is_open(cx);
-        _ = self.menu_bar.update(cx, |state, cx| {
+        self.menu_bar.update(cx, |state, cx| {
             let new_ix = if is_open { None } else { Some(self.ix) };
             state.set_selected_index(new_ix, window, cx);
         });
@@ -262,7 +258,7 @@ impl TitleMenu {
         if !self.menu_bar.read(cx).has_activated_menu() {
             return;
         }
-        _ = self.menu_bar.update(cx, |state, cx| {
+        self.menu_bar.update(cx, |state, cx| {
             state.set_selected_index(Some(self.ix), window, cx);
         });
     }
