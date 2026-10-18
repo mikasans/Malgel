@@ -53,7 +53,7 @@ use crate::{
     document::{self, LineEnding, display_name},
     document_view::{DocumentEvent, DocumentView},
     docx, export,
-    file_icon::file_icon,
+    file_icon::{file_icon, file_icon_color, folder_icon_color, activity_icon_color, ActivityIcon},
     file_tree::{
         FileTree, FileTreeEvent, TreeDrag, absolute_paths_for_clipboard, invert_key_held,
         relative_paths_for_clipboard,
@@ -3434,7 +3434,7 @@ impl Workspace {
                 CommandItem::new()
                     .label(label)
                     .keywords([shown, hit.text.clone()])
-                    .icon(Icon::new(file_icon(&hit.path)))
+                    .icon(Icon::new(file_icon(&hit.path)).text_color(file_icon_color(&hit.path)))
             });
             let picked = hits.clone();
             let confirm_ws = workspace.clone();
@@ -5573,10 +5573,15 @@ impl Workspace {
                 if let Some(keyword) = &row.keyword {
                     keywords.push(keyword.clone().into());
                 }
+                let icon_color = if row.is_dir {
+                    folder_icon_color()
+                } else {
+                    file_icon_color(&row.path)
+                };
                 CommandItem::new()
                     .label(shown)
                     .keywords(keywords)
-                    .icon(Icon::new(icon))
+                    .icon(Icon::new(icon).text_color(icon_color))
             };
             let recent_items = first.iter().map(item).collect::<Vec<_>>();
             let items = rows.iter().map(item).collect::<Vec<_>>();
@@ -6492,10 +6497,10 @@ impl Workspace {
                                 .child(
                                     div()
                                         .flex_none()
-                                        .text_color(if active {
-                                            theme.tab_active_foreground
-                                        } else {
-                                            theme.muted_foreground
+                                        .text_color(match doc.path() {
+                                            Some(path) => file_icon_color(path),
+                                            None if active => theme.tab_active_foreground,
+                                            None => theme.muted_foreground,
                                         })
                                         .child(
                                             Icon::new(tab_icon.unwrap_or(IconName::FileText))
@@ -8673,13 +8678,15 @@ impl Workspace {
         let workspace = cx.weak_entity();
         let btn = |id: &'static str,
                    icon: IconName,
+                   color: gpui_kit::Hsla,
                    tip: &'static str,
                    on: bool,
                    click: fn(&mut Self, &mut Window, &mut Context<Self>)| {
             let ws = workspace.clone();
+            let paint = if on { color } else { color.opacity(0.85) };
             Button::new(id)
                 .ghost()
-                .icon(Icon::new(icon))
+                .icon(Icon::new(icon).text_color(paint))
                 .tooltip(tip)
                 .selected(on)
                 .on_click(move |_, window, cx| {
@@ -8700,6 +8707,7 @@ impl Workspace {
             .child(btn(
                 "activity-explorer",
                 IconName::Files,
+                activity_icon_color(ActivityIcon::Explorer),
                 "Explorer (Ctrl+Shift+E)",
                 active == ActivityView::Explorer,
                 |this, window, cx| this.show_explorer_view(&ShowExplorerView, window, cx),
@@ -8707,6 +8715,7 @@ impl Workspace {
             .child(btn(
                 "activity-search",
                 IconName::Search,
+                activity_icon_color(ActivityIcon::Search),
                 "Search (Ctrl+Shift+F)",
                 active == ActivityView::Search,
                 |this, window, cx| this.show_search_view(&ShowSearchView, window, cx),
@@ -8714,6 +8723,7 @@ impl Workspace {
             .child(btn(
                 "activity-scm",
                 IconName::GitBranch,
+                activity_icon_color(ActivityIcon::SourceControl),
                 "Source Control",
                 active == ActivityView::SourceControl,
                 |this, window, cx| this.show_source_control(&ShowSourceControl, window, cx),
@@ -8721,6 +8731,7 @@ impl Workspace {
             .child(btn(
                 "activity-extensions",
                 IconName::Puzzle,
+                activity_icon_color(ActivityIcon::Extensions),
                 "Extensions",
                 active == ActivityView::Extensions,
                 |this, window, cx| this.show_extensions(&ShowExtensions, window, cx),

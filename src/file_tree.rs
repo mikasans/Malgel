@@ -41,7 +41,7 @@ use gpui_kit::{
 use crate::workspace::DragGhost;
 
 use crate::actions::{FILE_TREE_CONTEXT, OpenFolder};
-use crate::file_icon::file_icon;
+use crate::file_icon::{file_icon, file_icon_color, folder_icon_color};
 
 /// Entries hidden by default, matching VS Code's `files.exclude`.
 pub(crate) const DEFAULT_EXCLUDED: &[&str] =
@@ -1346,7 +1346,16 @@ impl FileTree {
                                     this.child(div().w(px(6.)).h(px(6.)).rounded(px(3.)).bg(marker))
                                 }),
                         )
-                        .child(Icon::new(icon).small().text_color(muted).flex_none())
+                        .child(
+                            Icon::new(icon)
+                                .small()
+                                .text_color(if entry.is_dir {
+                                    folder_icon_color()
+                                } else {
+                                    file_icon_color(&entry.path)
+                                })
+                                .flex_none(),
+                        )
                         .child(if renaming_path.as_ref() == Some(&entry.path) {
                             if let Some(input) = rename_input.clone() {
                                 div()

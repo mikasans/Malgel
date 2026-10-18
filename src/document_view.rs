@@ -1504,6 +1504,16 @@ impl DocumentView {
                         compiled.pages.as_ref().map_or(0, Vec::len),
                     );
                 }
+                let mut diagnostics = compiled.diagnostics;
+                if compiled.pages.is_none() && !diagnostics.iter().any(|d| d.error) {
+                    // A failed compile with no diagnostic would leave the first-paint
+                    // spinner forever — always surface something the user can act on.
+                    diagnostics.push(crate::typst_live::LiveDiagnostic {
+                        range: None,
+                        message: "Typst compile failed.".into(),
+                        error: true,
+                    });
+                }
                 if let Some(pages) = compiled.pages {
                     let n = pages.len();
                     let first = !live.compiled_once;
@@ -1534,7 +1544,7 @@ impl DocumentView {
                         live.compiled_once = true;
                     }
                 }
-                live.diagnostics = compiled.diagnostics;
+                live.diagnostics = diagnostics;
                 if compiled.revision == current {
                     live.last_tags = compiled.highlights.clone();
                     let theme = cx.theme().highlight_theme.clone();
@@ -1750,7 +1760,18 @@ impl DocumentView {
                         .child("Compiling\u{2026}")
                 })
                 .when(banner.is_some(), |this| {
-                    this.child("Fix the error to see the pages.")
+                    this.child(
+                        v_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .text_color(theme.danger)
+                                    .child("Preview failed"),
+                            )
+                            .child("Fix the error above to see the pages."),
+                    )
                 })
                 .into_any_element()
         };

@@ -245,7 +245,8 @@ pub fn bind_keys(cx: &mut App) {
         // in the File menu the way a Mac shortcut should.
         #[cfg(target_os = "macos")]
         KeyBinding::new("secondary-ctrl-o", OpenFolder, workspace),
-        KeyBinding::new("secondary-r", OpenRecent(0), workspace),
+        // VS Code: Ctrl/Cmd+R opens the Recent quick-pick (not jump-to-#0).
+        KeyBinding::new("secondary-r", OpenRecentPicker, workspace),
         KeyBinding::new("secondary-s", Save, None),
         KeyBinding::new("secondary-shift-s", SaveAs, None),
         // Export lives in the File menu only: VS Code gives Ctrl+Shift+E to

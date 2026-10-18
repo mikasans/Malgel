@@ -1,15 +1,11 @@
 //! Dynamic render-budget gate for heavy Markdown / Typst previews.
 //!
-//! When an estimate of pages, pixmap memory, or source size exceeds a soft
-//! budget, the UI shows an inline banner and does **not** auto-render until
-//! the user confirms. Light documents stay on the automatic path.
+//! When the estimated raster / embedded-image footprint reaches **150 MiB**,
+//! the UI shows an inline banner and does **not** auto-render until the user
+//! confirms. Smaller documents stay on the automatic path (no nag).
 
-/// Soft budgets — exceed any one and the preview waits for confirmation.
-pub const BUDGET_SOURCE_BYTES: usize = 256 * 1024;
-pub const BUDGET_PAGES: usize = 10;
-/// Estimated RGBA pixmap MiB across all live sheets (A4 @ 2× ≈ 7.7 MiB each).
-pub const BUDGET_PIXMAP_MIB: f64 = 40.0;
-pub const BUDGET_EMBEDDED_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+/// Soft budget — only prompt when estimated usage is at least this many MiB.
+pub const BUDGET_PIXMAP_MIB: f64 = 150.0;
 
 /// A cheap, conservative cost estimate — never a full compile.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,29 +68,20 @@ pub enum RenderConsent {
 
 /// Estimate Typst live-preview cost from source text alone (no compile).
 ///
-/// Page count: `#pagebreak` markers plus a loose length heuristic so a
-/// long single-page stream still trips the budget. Pixmap estimate assumes
-/// A4 @ `SHEET_SCALE` 2× (~7.7 MiB) per page — posters are capped elsewhere
-/// but still count as one heavy sheet.
+/// Page count: `#pagebreak` markers plus a loose length heuristic. Pixmap
+/// estimate assumes A4 @ `SHEET_SCALE` 2× (~7.7 MiB) per page, plus embedded
+/// image bytes. The gate trips only when that total is ≥ `BUDGET_PIXMAP_MIB`.
 pub fn estimate_typst(source: &str, embedded_image_bytes: u64) -> RenderEstimate {
     let source_bytes = source.len();
     let pagebreaks = source.matches("#pagebreak").count();
     // ~2.5 KB of source ≈ one dense page of body text once laid out.
     let length_pages = (source_bytes / 2500).max(1);
     let pages = (pagebreaks + 1).max(length_pages);
-    let pixmap_mib = pages as f64 * 7.7;
+    let pixmap_mib =
+        pages as f64 * 7.7 + (embedded_image_bytes as f64 / (1024.0 * 1024.0));
     let mut reasons = Vec::new();
-    if source_bytes > BUDGET_SOURCE_BYTES {
-        reasons.push("large source");
-    }
-    if pages > BUDGET_PAGES {
-        reasons.push("many pages");
-    }
-    if pixmap_mib > BUDGET_PIXMAP_MIB {
+    if pixmap_mib >= BUDGET_PIXMAP_MIB {
         reasons.push("heavy rasters");
-    }
-    if embedded_image_bytes > BUDGET_EMBEDDED_IMAGE_BYTES {
-        reasons.push("large images");
     }
     RenderEstimate {
         source_bytes,
@@ -126,13 +113,7 @@ pub fn estimate_markdown(source: &str) -> RenderEstimate {
     let pages = mermaid_blocks;
     let pixmap_mib = mermaid_blocks as f64 * 4.0;
     let mut reasons = Vec::new();
-    if source_bytes > BUDGET_SOURCE_BYTES {
-        reasons.push("large source");
-    }
-    if mermaid_blocks > 6 {
-        reasons.push("many diagrams");
-    }
-    if pixmap_mib > BUDGET_PIXMAP_MIB {
+    if pixmap_mib >= BUDGET_PIXMAP_MIB {
         reasons.push("heavy diagrams");
     }
     RenderEstimate {
@@ -155,27 +136,52 @@ mod tests {
     }
 
     #[test]
-    fn many_pagebreaks_trip_budget() {
+    fn many_pages_alone_do_not_nag_under_150_mib() {
+        // 15 pages ≈ 115.5 MiB < 150 — must not prompt.
         let mut src = String::from("= Doc\n");
         for i in 0..15 {
             src.push_str(&format!("\n#pagebreak()\n== S{i}\n"));
         }
         let e = estimate_typst(&src, 0);
+        assert!(!e.exceeds_budget(), "15 pages should be under 150 MiB: {e:?}");
+        assert!(e.pixmap_mib < BUDGET_PIXMAP_MIB);
+    }
+
+    #[test]
+    fn heavy_raster_estimate_trips_at_150_mib() {
+        // ~20 pages ≈ 154 MiB.
+        let mut src = String::from("= Doc\n");
+        for i in 0..20 {
+            src.push_str(&format!("\n#pagebreak()\n== S{i}\n"));
+        }
+        let e = estimate_typst(&src, 0);
         assert!(e.exceeds_budget(), "{e:?}");
-        assert!(e.pages > BUDGET_PAGES);
+        assert!(e.pixmap_mib >= BUDGET_PIXMAP_MIB);
+        assert!(e.reasons.contains(&"heavy rasters"));
     }
 
     #[test]
-    fn large_images_trip_budget() {
-        let e = estimate_typst("= Hi\n", BUDGET_EMBEDDED_IMAGE_BYTES + 1);
+    fn large_embedded_images_count_toward_mib() {
+        // 1 page (~7.7) + 150 MiB images ≥ 150.
+        let e = estimate_typst("= Hi\n", 150 * 1024 * 1024);
         assert!(e.exceeds_budget());
-        assert!(e.reasons.contains(&"large images"));
+        assert!(e.pixmap_mib >= BUDGET_PIXMAP_MIB);
     }
 
     #[test]
-    fn many_mermaid_trip_markdown_budget() {
+    fn few_mermaid_do_not_nag() {
         let mut src = String::new();
         for i in 0..8 {
+            src.push_str(&format!("```mermaid\ngraph TD; A{i}-->B{i}\n```\n\n"));
+        }
+        let e = estimate_markdown(&src);
+        assert!(!e.exceeds_budget(), "8 mermaid ≈ 32 MiB: {e:?}");
+    }
+
+    #[test]
+    fn many_mermaid_trip_at_150_mib() {
+        let mut src = String::new();
+        for i in 0..40 {
             src.push_str(&format!("```mermaid\ngraph TD; A{i}-->B{i}\n```\n\n"));
         }
         let e = estimate_markdown(&src);

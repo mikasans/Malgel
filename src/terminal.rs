@@ -4,6 +4,12 @@
 //! focuses the live PTY, output auto-scrolls to the end while the user is
 //! following the tail, and the pump keeps painting as bytes arrive. New
 //! Terminal is Ctrl+Shift+` (never the same chord as toggle).
+//!
+//! Output is a line buffer (not one wrapping string) so glyph columns stay
+//! aligned with the shell cursor: `\r` rewrites the current line, tabs expand
+//! to spaces, and each row is `whitespace_nowrap` at a fixed line height.
+//! Copy / paste use Ctrl+Shift+C / Ctrl+Shift+V (VS Code), leaving Ctrl+C as
+//! interrupt.
 
 use std::{
     io::{Read, Write},
@@ -17,7 +23,7 @@ use std::{
 };
 
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement as _, Render,
     ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
     Styled as _, Window,
@@ -31,12 +37,13 @@ use gpui_kit::{
         v_flex,
     },
     div, point,
-    prelude::FluentBuilder as _,
-    px,
+    px, rems,
 };
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 const MAX_OUTPUT_CHARS: usize = 200_000;
+const TAB_WIDTH: usize = 8;
+const LINE_HEIGHT_REMS: f32 = 1.35;
 
 enum PtyMessage {
     Output(Vec<u8>),
@@ -47,7 +54,10 @@ enum PtyMessage {
 pub struct TerminalPanel {
     focus_handle: FocusHandle,
     cwd: Option<PathBuf>,
-    output: String,
+    /// Completed lines (no trailing newline) plus the live line under edit.
+    lines: Vec<String>,
+    /// Characters of the unfinished last line (after the last `\n`).
+    current: String,
     input: Entity<InputState>,
     scroll: ScrollHandle,
     writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
@@ -85,7 +95,8 @@ impl TerminalPanel {
         Self {
             focus_handle: cx.focus_handle(),
             cwd: None,
-            output: String::new(),
+            lines: Vec::new(),
+            current: String::new(),
             input,
             scroll: ScrollHandle::new(),
             writer: None,
@@ -126,10 +137,42 @@ impl TerminalPanel {
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
-        self.output.clear();
+        self.lines.clear();
+        self.current.clear();
         self.follow_tail = true;
         self.scroll_to_end();
         cx.notify();
+    }
+
+    /// Full transcript for clipboard copy.
+    fn transcript(&self) -> String {
+        let mut out = String::new();
+        for line in &self.lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(&self.current);
+        out
+    }
+
+    fn copy_all(&self, cx: &mut Context<Self>) {
+        let text = self.transcript();
+        if text.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let Some(text) = item.text() else {
+            return;
+        };
+        // Normalize newlines; PTY expects `\n` (or `\r` on some shells — `\n` is fine).
+        let payload = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.write_bytes(payload.as_bytes());
     }
 
     pub fn ensure_running(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -186,8 +229,22 @@ impl TerminalPanel {
             return;
         }
         let keys = &event.keystroke;
+        // Ctrl+Shift+C / Ctrl+Shift+V — copy / paste (VS Code terminal).
+        if keys.modifiers.control && keys.modifiers.shift && !keys.modifiers.alt {
+            if keys.key.eq_ignore_ascii_case("c") {
+                self.copy_all(cx);
+                cx.stop_propagation();
+                return;
+            }
+            if keys.key.eq_ignore_ascii_case("v") {
+                self.paste_clipboard(cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
         // Ctrl+C → ETX so interrupt-from-keyboard still reaches the shell.
-        if keys.modifiers.control && !keys.modifiers.alt && !keys.modifiers.platform {
+        if keys.modifiers.control && !keys.modifiers.alt && !keys.modifiers.platform && !keys.modifiers.shift
+        {
             if keys.key.eq_ignore_ascii_case("c") {
                 self.write_bytes(&[0x03]);
                 cx.stop_propagation();
@@ -197,6 +254,23 @@ impl TerminalPanel {
             return;
         }
         if keys.modifiers.platform || keys.modifiers.secondary() {
+            // Cmd+C / Cmd+V on macOS when shift is not held: still copy/paste
+            // in the terminal (platform secondary), matching VS Code.
+            #[cfg(target_os = "macos")]
+            {
+                if keys.modifiers.platform && !keys.modifiers.alt && !keys.modifiers.control {
+                    if keys.key.eq_ignore_ascii_case("c") {
+                        self.copy_all(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if keys.key.eq_ignore_ascii_case("v") {
+                        self.paste_clipboard(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+            }
             return;
         }
         match keys.key.as_str() {
@@ -229,7 +303,7 @@ impl TerminalPanel {
     }
 
     pub fn append(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.output.push_str(text);
+        self.ingest(text);
         self.trim_output();
         if self.follow_tail {
             self.scroll_to_end();
@@ -237,18 +311,42 @@ impl TerminalPanel {
         cx.notify();
     }
 
+    /// Feed PTY / status text into the line buffer with `\r` / tab handling.
+    fn ingest(&mut self, text: &str) {
+        for ch in text.chars() {
+            match ch {
+                '\n' => {
+                    self.lines.push(std::mem::take(&mut self.current));
+                }
+                '\r' => {
+                    // Carriage return: rewrite the current line from column 0.
+                    self.current.clear();
+                }
+                '\t' => {
+                    let col = self.current.chars().count();
+                    let spaces = TAB_WIDTH - (col % TAB_WIDTH);
+                    for _ in 0..spaces {
+                        self.current.push(' ');
+                    }
+                }
+                c if c == '\u{08}' || c == '\u{7f}' => {
+                    self.current.pop();
+                }
+                c => self.current.push(c),
+            }
+        }
+    }
+
     fn trim_output(&mut self) {
-        if self.output.len() <= MAX_OUTPUT_CHARS {
+        let mut total: usize = self.lines.iter().map(|l| l.len() + 1).sum();
+        total += self.current.len();
+        if total <= MAX_OUTPUT_CHARS {
             return;
         }
-        let keep = MAX_OUTPUT_CHARS / 2;
-        let start = self
-            .output
-            .char_indices()
-            .nth(self.output.chars().count().saturating_sub(keep))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        self.output = self.output[start..].to_string();
+        while total > MAX_OUTPUT_CHARS / 2 && !self.lines.is_empty() {
+            let removed = self.lines.remove(0);
+            total = total.saturating_sub(removed.len() + 1);
+        }
     }
 
     fn start_shell(&mut self, cx: &mut Context<Self>) {
@@ -346,22 +444,17 @@ impl TerminalPanel {
 
     /// Returns whether to keep pumping (channel still open).
     fn drain_pty(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(rx) = &self.rx else {
+        let Some(rx) = self.rx.take() else {
             return false;
         };
         let mut changed = false;
         let mut exited = false;
+        let mut chunks = Vec::new();
         loop {
             match rx.try_recv() {
-                Ok(PtyMessage::Output(bytes)) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    self.output.push_str(&strip_ansi(&text));
-                    changed = true;
-                }
+                Ok(PtyMessage::Output(bytes)) => chunks.push(bytes),
                 Ok(PtyMessage::Exited) => {
-                    self.output.push_str("\n— shell exited\n");
                     exited = true;
-                    changed = true;
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -371,10 +464,20 @@ impl TerminalPanel {
                 }
             }
         }
+        for bytes in chunks {
+            let text = String::from_utf8_lossy(&bytes);
+            self.ingest(&strip_ansi(&text));
+            changed = true;
+        }
         if exited {
+            self.ingest("
+— shell exited
+");
+            changed = true;
             self.writer = None;
             self.child = None;
-            self.rx = None;
+        } else {
+            self.rx = Some(rx);
         }
         if changed {
             self.trim_output();
@@ -395,8 +498,15 @@ impl Drop for TerminalPanel {
 
 impl Render for TerminalPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let output: SharedString = self.output.clone().into();
         let shell_running = self.writer.is_some();
+        let mut rows: Vec<SharedString> = self
+            .lines
+            .iter()
+            .map(|l| SharedString::from(l.clone()))
+            .collect();
+        // Always show the live line (may be empty) so the cursor row stays put.
+        rows.push(SharedString::from(self.current.clone()));
+
         v_flex()
             .id("terminal-panel")
             .size_full()
@@ -423,8 +533,25 @@ impl Render for TerminalPanel {
                             .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .child("Terminal"),
                     )
-                    // Labeled + small (not xsmall/compact) so Clear and Kill share a
-                    // predictable hit area — icon-only X was easy to miss next to Trash.
+                    .child(
+                        Button::new("terminal-copy")
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(IconName::Copy))
+                            .label("Copy")
+                            .tooltip("Copy all output (Ctrl+Shift+C)")
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_all(cx))),
+                    )
+                    .child(
+                        Button::new("terminal-paste")
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(IconName::Clipboard))
+                            .label("Paste")
+                            .tooltip("Paste into shell (Ctrl+Shift+V)")
+                            .disabled(!shell_running)
+                            .on_click(cx.listener(|this, _, _, cx| this.paste_clipboard(cx))),
+                    )
                     .child(
                         Button::new("terminal-clear")
                             .ghost()
@@ -456,6 +583,8 @@ impl Render for TerminalPanel {
                     .p_2()
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_sm()
+                    .line_height(rems(LINE_HEIGHT_REMS))
+                    .overflow_x_scroll()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
                     // Clicking the transcript focuses the PTY so typing resumes
@@ -482,35 +611,51 @@ impl Render for TerminalPanel {
                         }
                         cx.notify();
                     }))
-                    .child(div().w_full().child(output)),
+                    .child(
+                        v_flex().w_full().children(rows.into_iter().enumerate().map(
+                            |(ix, line)| {
+                                // Non-breaking space keeps an empty line's height so
+                                // the cursor row does not collapse and drift.
+                                let shown = if line.is_empty() {
+                                    SharedString::from("\u{00a0}")
+                                } else {
+                                    line
+                                };
+                                div()
+                                    .id(("term-line", ix))
+                                    .w_full()
+                                    .whitespace_nowrap()
+                                    .child(shown)
+                            },
+                        )),
+                    ),
             )
-            // One input surface: while the PTY is alive, hide the secondary
-            // `$ Run a command…` composer and type into the shell prompt via
-            // the panel (VS Code). Show the composer only to start a shell.
-            .when(!shell_running, |this| {
-                this.child(
-                    h_flex()
-                        .id("terminal-input-row")
-                        .h(px(36.))
-                        .px_2()
-                        .gap_2()
-                        .items_center()
-                        .border_t_1()
-                        .border_color(cx.theme().border)
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("$"),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(Input::new(&self.input).appearance(false)),
-                        ),
-                )
-            })
+            // Always keep a line composer (Pebrel-simple): Enter sends a line
+            // to the PTY. When the panel is focused, keys also go straight to
+            // the shell (VS Code). Hiding the composer made headless / focus
+            // edge cases look like a broken terminal.
+            .child(
+                h_flex()
+                    .id("terminal-input-row")
+                    .h(px(36.))
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("$"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.input).appearance(false)),
+                    ),
+            )
     }
 }
 
@@ -560,7 +705,8 @@ fn strip_ansi(input: &str) -> String {
                 }
                 None => {}
             }
-        } else if ch != '\r' {
+        } else {
+            // Keep `\r` / `\n` / tabs — `ingest` interprets them.
             out.push(ch);
         }
     }
@@ -587,6 +733,11 @@ mod tests {
     }
 
     #[test]
+    fn strip_ansi_keeps_carriage_return() {
+        assert!(strip_ansi("a\rb").contains('\r'));
+    }
+
+    #[test]
     fn terminal_cwd_prefers_folder() {
         let folder = Path::new("/tmp/proj");
         let doc = Path::new("/tmp/other/file.md");
@@ -594,5 +745,33 @@ mod tests {
             terminal_cwd(Some(folder), Some(doc)).as_deref(),
             Some(folder)
         );
+    }
+
+    #[test]
+    fn ingest_cr_rewrites_current_line() {
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        let ingest = |text: &str, lines: &mut Vec<String>, current: &mut String| {
+            for ch in text.chars() {
+                match ch {
+                    '\n' => lines.push(std::mem::take(current)),
+                    '\r' => current.clear(),
+                    '\t' => {
+                        let col = current.chars().count();
+                        let spaces = TAB_WIDTH - (col % TAB_WIDTH);
+                        for _ in 0..spaces {
+                            current.push(' ');
+                        }
+                    }
+                    c => current.push(c),
+                }
+            }
+        };
+        ingest("hello\rworld", &mut lines, &mut current);
+        assert!(lines.is_empty());
+        assert_eq!(current, "world");
+        ingest("\nnext", &mut lines, &mut current);
+        assert_eq!(lines, vec!["world".to_string()]);
+        assert_eq!(current, "next");
     }
 }

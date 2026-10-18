@@ -74,6 +74,11 @@ pub const SHORTCUTS: &[ShortcutRow] = &[
         chord: "Ctrl+P  (⌘P)",
     },
     ShortcutRow {
+        command: "Open Recent",
+        when: "Workspace",
+        chord: "Ctrl+R  (⌘R)",
+    },
+    ShortcutRow {
         command: "Toggle Preview Layout",
         when: "Workspace",
         chord: "Ctrl+Shift+V  (⌘⇧V)",

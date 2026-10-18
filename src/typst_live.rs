@@ -21,6 +21,7 @@
 
 use std::{
     collections::HashMap,
+    panic::{self, AssertUnwindSafe},
     num::NonZeroUsize,
     ops::Range,
     path::{Path, PathBuf},
@@ -614,11 +615,39 @@ impl LiveWorker {
                                     continue;
                                 }
                                 let partial_tx = answers.clone();
-                                let compiled =
-                                    compiler.compile_progressive(&text, revision, move |partial| {
-                                        let _ =
-                                            partial_tx.unbounded_send(Response::Compiled(partial));
-                                    });
+                                let compiled = match panic::catch_unwind(AssertUnwindSafe(|| {
+                                    compiler.compile_progressive(
+                                        &text,
+                                        revision,
+                                        move |partial| {
+                                            let _ = partial_tx
+                                                .unbounded_send(Response::Compiled(partial));
+                                        },
+                                    )
+                                })) {
+                                    Ok(compiled) => compiled,
+                                    Err(_) => {
+                                        log::error!(
+                                            "typst live: compile panicked (rev {revision})"
+                                        );
+                                        // Rebuild the world — a panicking compile may
+                                        // leave memoization / sheets inconsistent.
+                                        compiler = LiveCompiler::new(&path);
+                                        Compiled {
+                                            revision,
+                                            pages: None,
+                                            diagnostics: vec![LiveDiagnostic {
+                                                message: "Typst compile panicked — preview stopped. Fix the source and try again.".into(),
+                                                range: None,
+                                                error: true,
+                                            }],
+                                            elapsed: Duration::ZERO,
+                                            redrawn: 0,
+                                            highlights: Vec::new(),
+                                            partial: false,
+                                        }
+                                    }
+                                };
                                 Response::Compiled(compiled)
                             }
                             Request::SourceAt { page, x, y } => {
