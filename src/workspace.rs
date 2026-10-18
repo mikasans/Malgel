@@ -8265,9 +8265,42 @@ impl Workspace {
             )
     }
 
-    fn render_terminal_area(&self, _cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        if self.terminal_split && self.terminals.len() >= 2 {
-            let a = self.terminal_active.min(self.terminals.len() - 1);
+    fn render_terminal_area(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let active = self
+            .terminal_active
+            .min(self.terminals.len().saturating_sub(1));
+        let session_bar = if self.terminals.len() > 1 {
+            Some(
+                h_flex()
+                    .id("terminal-sessions")
+                    .h(px(28.))
+                    .px_2()
+                    .gap_1()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .children(self.terminals.iter().enumerate().map(|(ix, _)| {
+                        let selected = ix == active;
+                        Button::new(("term-session", ix as u64))
+                            .ghost()
+                            .small()
+                            .label(format!("{}", ix + 1))
+                            .selected(selected)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.terminal_active = ix;
+                                this.terminals[ix].update(cx, |term, cx| {
+                                    term.focus_input(window, cx);
+                                });
+                                cx.notify();
+                            }))
+                    })),
+            )
+        } else {
+            None
+        };
+
+        let body = if self.terminal_split && self.terminals.len() >= 2 {
+            let a = active;
             let b = if a + 1 < self.terminals.len() {
                 a + 1
             } else {
@@ -8279,22 +8312,63 @@ impl Workspace {
                 .gap_px()
                 .child(
                     div()
+                        .id(("term-pane", a as u64))
                         .flex_1()
                         .min_w_0()
                         .size_full()
+                        .border_1()
+                        .border_color(if a == active {
+                            cx.theme().border
+                        } else {
+                            cx.theme().border.opacity(0.4)
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.terminal_active = a;
+                                this.terminals[a].update(cx, |term, cx| {
+                                    term.focus_input(window, cx);
+                                });
+                                cx.notify();
+                            }),
+                        )
                         .child(self.terminals[a].clone()),
                 )
                 .child(
                     div()
+                        .id(("term-pane", b as u64))
                         .flex_1()
                         .min_w_0()
                         .size_full()
+                        .border_1()
+                        .border_color(if b == active {
+                            cx.theme().border
+                        } else {
+                            cx.theme().border.opacity(0.4)
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.terminal_active = b;
+                                this.terminals[b].update(cx, |term, cx| {
+                                    term.focus_input(window, cx);
+                                });
+                                cx.notify();
+                            }),
+                        )
                         .child(self.terminals[b].clone()),
                 )
                 .into_any_element()
         } else {
             self.active_terminal().clone().into_any_element()
-        }
+        };
+
+        v_flex()
+            .id("terminal-area")
+            .size_full()
+            .when_some(session_bar, |this, bar| this.child(bar))
+            .child(div().id("terminal-body").flex_1().min_h_0().child(body))
+            .into_any_element()
     }
 
     fn render_activity_sidebar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {

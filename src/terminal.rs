@@ -9,9 +9,12 @@
 //! aligned with the shell cursor: `\r` rewrites the current line, tabs expand
 //! to spaces, and each row is `whitespace_nowrap` at a fixed line height.
 //! Copy / paste use Ctrl+Shift+C / Ctrl+Shift+V (VS Code), leaving Ctrl+C as
-//! interrupt.
+//! interrupt. A single line composer always owns typed input (IME-safe). While
+//! the PTY is alive its `$` prefix is omitted so the shell prompt in the
+//! transcript is the only dollar — no double composers.
 
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -36,11 +39,16 @@ use gpui_kit::{
         input::{Input, InputEvent, InputState},
         v_flex,
     },
-    div, point, px, rems,
+    div, point,
+    prelude::FluentBuilder as _,
+    px, rems,
 };
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 
 const MAX_OUTPUT_CHARS: usize = 200_000;
+/// Cap painted rows so a flooded PTY cannot rebuild tens of thousands of
+/// elements every frame. Copy / trim still see the full ring buffer.
+const MAX_RENDER_LINES: usize = 2_000;
 const TAB_WIDTH: usize = 8;
 const LINE_HEIGHT_REMS: f32 = 1.35;
 
@@ -54,12 +62,14 @@ pub struct TerminalPanel {
     focus_handle: FocusHandle,
     cwd: Option<PathBuf>,
     /// Completed lines (no trailing newline) plus the live line under edit.
-    lines: Vec<String>,
+    lines: VecDeque<String>,
     /// Characters of the unfinished last line (after the last `\n`).
     current: String,
     input: Entity<InputState>,
     scroll: ScrollHandle,
     writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    /// Kept alive so the PTY master FD is not closed while reader/writer clones run.
+    _master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     rx: Option<Receiver<PtyMessage>>,
     _reader: Option<thread::JoinHandle<()>>,
@@ -78,7 +88,7 @@ impl Focusable for TerminalPanel {
 
 impl TerminalPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Run a command…"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(""));
         cx.subscribe_in(
             &input,
             window,
@@ -86,6 +96,7 @@ impl TerminalPanel {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     let line = input.read(cx).value().to_string();
                     input.update(cx, |input, cx| input.set_value("", window, cx));
+                    // Line composer: start shell if needed, then send CR-terminated line.
                     this.send_line(&line, cx);
                 }
             },
@@ -94,11 +105,12 @@ impl TerminalPanel {
         Self {
             focus_handle: cx.focus_handle(),
             cwd: None,
-            lines: Vec::new(),
+            lines: VecDeque::new(),
             current: String::new(),
             input,
             scroll: ScrollHandle::new(),
             writer: None,
+            _master: None,
             child: None,
             rx: None,
             _reader: None,
@@ -120,13 +132,14 @@ impl TerminalPanel {
     }
 
     pub fn focus_input(&self, window: &mut Window, cx: &mut App) {
-        // While a PTY is alive the secondary `$ Run a command…` row is hidden;
-        // focus the panel so typed keys go straight to the shell (VS Code feel).
-        if self.writer.is_some() {
-            self.focus_handle.focus(window, cx);
-        } else {
-            self.input.focus_handle(cx).focus(window, cx);
-        }
+        // Focus the Input key-sink so the window has an input_handler.
+        // X11 IME commits (and `xdotool type`) are dropped without one; raw
+        // KeyDown alone is not enough for typed characters under Xvfb.
+        let running = self.writer.is_some();
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder(if running { "" } else { "Run a command…" }, window, cx);
+        });
+        self.input.focus_handle(cx).focus(window, cx);
     }
 
     /// Keep the viewport on the newest output (Pebrel/VS Code follow-tail).
@@ -169,8 +182,11 @@ impl TerminalPanel {
         let Some(text) = item.text() else {
             return;
         };
-        // Normalize newlines; PTY expects `\n` (or `\r` on some shells — `\n` is fine).
-        let payload = text.replace("\r\n", "\n").replace('\r', "\n");
+        // Normalize to CR — what a keyboard Enter sends into a tty.
+        let payload = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\n', "\r");
         self.write_bytes(payload.as_bytes());
     }
 
@@ -190,6 +206,7 @@ impl TerminalPanel {
             let _ = child.kill();
         }
         self.writer = None;
+        self._master = None;
         self.rx = None;
         self._reader = None;
         self._pump = None;
@@ -203,8 +220,9 @@ impl TerminalPanel {
             self.append("Couldn’t start a shell.\n", cx);
             return;
         };
+        // PTY line discipline expects CR (same as a real keyboard Enter).
         let mut payload = line.as_bytes().to_vec();
-        payload.push(b'\n');
+        payload.push(b'\r');
         if let Ok(mut w) = writer.lock() {
             let _ = w.write_all(&payload);
             let _ = w.flush();
@@ -277,7 +295,7 @@ impl TerminalPanel {
         }
         match keys.key.as_str() {
             "enter" => {
-                self.write_bytes(b"\n");
+                self.write_bytes(b"\r");
                 cx.stop_propagation();
             }
             "backspace" => {
@@ -290,6 +308,10 @@ impl TerminalPanel {
             }
             "escape" => {
                 self.write_bytes(&[0x1b]);
+                cx.stop_propagation();
+            }
+            "space" => {
+                self.write_bytes(b" ");
                 cx.stop_propagation();
             }
             _ => {
@@ -315,13 +337,19 @@ impl TerminalPanel {
 
     /// Feed PTY / status text into the line buffer with `\r` / tab handling.
     fn ingest(&mut self, text: &str) {
-        for ch in text.chars() {
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
             match ch {
                 '\n' => {
-                    self.lines.push(std::mem::take(&mut self.current));
+                    self.lines.push_back(std::mem::take(&mut self.current));
                 }
                 '\r' => {
-                    // Carriage return: rewrite the current line from column 0.
+                    // CRLF from a tty: the CR is just the line-ending prefix —
+                    // do not clear, or the echoed command vanishes before `\n`.
+                    if chars.peek() == Some(&'\n') {
+                        continue;
+                    }
+                    // Bare CR (progress / spinner): rewrite from column 0.
                     self.current.clear();
                 }
                 '\t' => {
@@ -334,6 +362,8 @@ impl TerminalPanel {
                 c if c == '\u{08}' || c == '\u{7f}' => {
                     self.current.pop();
                 }
+                // Drop other C0 controls (BEL, etc.) so they cannot shift glyphs.
+                c if c.is_control() => {}
                 c => self.current.push(c),
             }
         }
@@ -345,8 +375,10 @@ impl TerminalPanel {
         if total <= MAX_OUTPUT_CHARS {
             return;
         }
-        while total > MAX_OUTPUT_CHARS / 2 && !self.lines.is_empty() {
-            let removed = self.lines.remove(0);
+        while total > MAX_OUTPUT_CHARS / 2 {
+            let Some(removed) = self.lines.pop_front() else {
+                break;
+            };
             total = total.saturating_sub(removed.len() + 1);
         }
     }
@@ -417,6 +449,7 @@ impl TerminalPanel {
         });
 
         self.writer = Some(writer);
+        self._master = Some(pair.master);
         self.child = Some(child);
         self.rx = Some(rx);
         self._reader = Some(reader);
@@ -479,7 +512,10 @@ impl TerminalPanel {
             );
             changed = true;
             self.writer = None;
+            self._master = None;
             self.child = None;
+            self._pump = None;
+            self._reader = None;
         } else {
             self.rx = Some(rx);
         }
@@ -503,9 +539,11 @@ impl Drop for TerminalPanel {
 impl Render for TerminalPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let shell_running = self.writer.is_some();
+        let skip = self.lines.len().saturating_sub(MAX_RENDER_LINES);
         let mut rows: Vec<SharedString> = self
             .lines
             .iter()
+            .skip(skip)
             .map(|l| SharedString::from(l.clone()))
             .collect();
         // Always show the live line (may be empty) so the cursor row stays put.
@@ -573,9 +611,10 @@ impl Render for TerminalPanel {
                             .label("Kill")
                             .tooltip("Kill the shell process")
                             .disabled(!shell_running)
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.stop_shell();
                                 this.append("— shell stopped\n", cx);
+                                this.focus_input(window, cx);
                             })),
                     ),
             )
@@ -632,10 +671,9 @@ impl Render for TerminalPanel {
                         },
                     ))),
             )
-            // Always keep a line composer (Pebrel-simple): Enter sends a line
-            // to the PTY. When the panel is focused, keys also go straight to
-            // the shell (VS Code). Hiding the composer made headless / focus
-            // edge cases look like a broken terminal.
+            // Single line composer (always). While the PTY is alive we omit the
+            // `$` prefix so the shell prompt in the transcript is the only dollar
+            // (no double composers). The Input keeps the IME input_handler.
             .child(
                 h_flex()
                     .id("terminal-input-row")
@@ -645,12 +683,20 @@ impl Render for TerminalPanel {
                     .items_center()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("$"),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.focus_input(window, cx);
+                        }),
                     )
+                    .when(!shell_running, |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("$"),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -670,8 +716,17 @@ fn default_shell() -> CommandBuilder {
     #[cfg(not(windows))]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let mut cmd = CommandBuilder::new(shell);
+        let mut cmd = CommandBuilder::new(&shell);
+        // Skip rc/profile so a broken ~/.bashrc cannot kill the session under
+        // headless / Xvfb runs; still interactive for a prompt + job control.
+        if shell.ends_with("/bash") || shell.ends_with("bash") {
+            cmd.arg("--norc");
+            cmd.arg("--noprofile");
+        }
         cmd.arg("-i");
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("PS1", "$ ");
         cmd
     }
 }
@@ -750,14 +805,37 @@ mod tests {
     }
 
     #[test]
+    fn trim_output_pops_from_front_without_shifting() {
+        let mut lines: VecDeque<String> = (0..500)
+            .map(|i| format!("line-{i}-{}", "y".repeat(200)))
+            .collect();
+        let mut total: usize = lines.iter().map(|l| l.len() + 1).sum();
+        assert!(total > MAX_OUTPUT_CHARS / 4);
+        while total > MAX_OUTPUT_CHARS / 2 {
+            let Some(removed) = lines.pop_front() else {
+                break;
+            };
+            total = total.saturating_sub(removed.len() + 1);
+        }
+        assert!(total <= MAX_OUTPUT_CHARS / 2 + 400);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
     fn ingest_cr_rewrites_current_line() {
         let mut lines = Vec::new();
         let mut current = String::new();
         let ingest = |text: &str, lines: &mut Vec<String>, current: &mut String| {
-            for ch in text.chars() {
+            let mut chars = text.chars().peekable();
+            while let Some(ch) = chars.next() {
                 match ch {
                     '\n' => lines.push(std::mem::take(current)),
-                    '\r' => current.clear(),
+                    '\r' => {
+                        if chars.peek() == Some(&'\n') {
+                            continue;
+                        }
+                        current.clear();
+                    }
                     '\t' => {
                         let col = current.chars().count();
                         let spaces = TAB_WIDTH - (col % TAB_WIDTH);
@@ -775,5 +853,33 @@ mod tests {
         ingest("\nnext", &mut lines, &mut current);
         assert_eq!(lines, vec!["world".to_string()]);
         assert_eq!(current, "next");
+    }
+
+    #[test]
+    fn ingest_crlf_keeps_echoed_command() {
+        let mut lines: VecDeque<String> = VecDeque::new();
+        let mut current = String::new();
+        let ingest = |text: &str, lines: &mut VecDeque<String>, current: &mut String| {
+            let mut chars = text.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\n' => lines.push_back(std::mem::take(current)),
+                    '\r' => {
+                        if chars.peek() == Some(&'\n') {
+                            continue;
+                        }
+                        current.clear();
+                    }
+                    c => current.push(c),
+                }
+            }
+        };
+        // What a tty typically echoes after we write `echo hi\r`.
+        ingest("echo hi\r\nSPRINT\r\n$ ", &mut lines, &mut current);
+        assert_eq!(
+            lines.iter().cloned().collect::<Vec<_>>(),
+            vec!["echo hi".to_string(), "SPRINT".to_string()]
+        );
+        assert_eq!(current, "$ ");
     }
 }
