@@ -2438,6 +2438,7 @@ impl Workspace {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_diff_session(
         &mut self,
         title: String,

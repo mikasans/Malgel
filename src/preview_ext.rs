@@ -1124,10 +1124,7 @@ impl MarkdownPlugin for MermaidPlugin {
             MarkdownNode::new("mermaid", MermaidSource(code.value.clone()))
                 .text(code.value.clone())
                 .accessibility_label("Mermaid diagram")
-                .markdown({
-                    let raw = cx.node_source(node).unwrap_or(&code.value);
-                    raw
-                }),
+                .markdown(cx.node_source(node).unwrap_or(&code.value)),
         )
     }
 

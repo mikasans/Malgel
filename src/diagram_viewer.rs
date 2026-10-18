@@ -713,11 +713,11 @@ const MAX_DIAGRAM_RASTER_EDGE: u32 = 2048;
 /// Draw the part of the diagram `view` shows at its exact zoom, as PNG.
 fn draw_view(drawn: &Drawn, view: View) -> Option<Vec<u8>> {
     // Reuse the process-wide system font DB (no second disk scan).
-    static OPTIONS: LazyLock<resvg::usvg::Options<'static>> = LazyLock::new(|| {
-        let mut options = resvg::usvg::Options::default();
-        options.fontdb = crate::typst_world::SYSTEM_FONT_DB.clone();
-        options
-    });
+    static OPTIONS: LazyLock<resvg::usvg::Options<'static>> =
+        LazyLock::new(|| resvg::usvg::Options {
+            fontdb: crate::typst_world::SYSTEM_FONT_DB.clone(),
+            ..Default::default()
+        });
     let svg = cropped_svg(drawn, view)?;
     let tree = resvg::usvg::Tree::from_str(&svg, &OPTIONS).ok()?;
     let size = tree.size().to_int_size();
