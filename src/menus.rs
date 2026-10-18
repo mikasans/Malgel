@@ -82,12 +82,18 @@ pub fn build(cx: &App) -> Vec<Menu> {
             .enumerate()
             .map(|(ix, path)| {
                 let name = display_name(Some(path));
-                let folder = path
-                    .parent()
-                    .and_then(|dir| dir.file_name())
-                    .map(|dir| format!("  —  {}", dir.to_string_lossy()))
-                    .unwrap_or_default();
-                MenuItem::action(format!("{name}{folder}"), OpenRecent(ix))
+                let label = if path.is_dir() {
+                    // Native menus cannot paint icons; mark folders in text.
+                    format!("{name}  —  Folder")
+                } else {
+                    let parent = path
+                        .parent()
+                        .and_then(|dir| dir.file_name())
+                        .map(|dir| format!("  —  {}", dir.to_string_lossy()))
+                        .unwrap_or_default();
+                    format!("{name}{parent}")
+                };
+                MenuItem::action(label, OpenRecent(ix))
             })
             .collect()
     };
