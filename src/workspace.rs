@@ -352,6 +352,30 @@ enum DiskChange {
     Touched(Option<DiskStamp>),
 }
 
+/// Command palette default rows force icon paint to muted/accent
+/// (`CommandState::render_item_with_binding`), so `.icon(...).text_color(…)`
+/// is ignored. Own the row via `.child` — same accent path as Explorer/tabs.
+fn command_item_with_colored_icon(
+    label: impl Into<SharedString>,
+    keywords: impl IntoIterator<Item = impl Into<SharedString>>,
+    icon: IconName,
+    color: gpui_kit::Hsla,
+) -> CommandItem {
+    let label: SharedString = label.into();
+    let row_label = label.clone();
+    CommandItem::new()
+        .label(label)
+        .keywords(keywords)
+        .child(move |_window, _cx| {
+            h_flex()
+                .flex_1()
+                .gap_2()
+                .items_center()
+                .child(Icon::new(icon).size_4().text_color(color))
+                .child(row_label.clone())
+        })
+}
+
 /// Labels near the top of the editor-tab context menu (probe #15/#16).
 /// Kept as a pure list so tests can prove Select for Compare is registered
 /// even when Xvfb hit-testing is involved.
@@ -2425,19 +2449,17 @@ impl Workspace {
                 .collect();
             let mut group = CommandGroup::new().label("Recent");
             for (_, label, icon, color) in &items {
-                group = group.item(
-                    CommandItem::new()
-                        .label(label.clone())
-                        .keywords([
-                            label.as_str(),
-                            if *icon == IconName::Folder {
-                                "folder"
-                            } else {
-                                "file"
-                            },
-                        ])
-                        .icon(Icon::new(*icon).text_color(*color)),
-                );
+                let kind = if *icon == IconName::Folder {
+                    "folder"
+                } else {
+                    "file"
+                };
+                group = group.item(command_item_with_colored_icon(
+                    label.clone(),
+                    [label.as_str(), kind],
+                    *icon,
+                    *color,
+                ));
             }
             dialog.close_button(false).p_0().child(esc_closes(
                 Command::new(&state)
@@ -3453,10 +3475,12 @@ impl Workspace {
                     .to_string_lossy()
                     .replace('\\', "/");
                 let label: SharedString = format!("{shown}:{}  {}", hit.line, hit.text).into();
-                CommandItem::new()
-                    .label(label)
-                    .keywords([shown, hit.text.clone()])
-                    .icon(Icon::new(file_icon(&hit.path)).text_color(file_icon_color(&hit.path)))
+                command_item_with_colored_icon(
+                    label,
+                    [shown, hit.text.clone()],
+                    file_icon(&hit.path),
+                    file_icon_color(&hit.path),
+                )
             });
             let picked = hits.clone();
             let confirm_ws = workspace.clone();
@@ -5600,10 +5624,7 @@ impl Workspace {
                 } else {
                     file_icon_color(&row.path)
                 };
-                CommandItem::new()
-                    .label(shown)
-                    .keywords(keywords)
-                    .icon(Icon::new(icon).text_color(icon_color))
+                command_item_with_colored_icon(shown, keywords, icon, icon_color)
             };
             let recent_items = first.iter().map(item).collect::<Vec<_>>();
             let items = rows.iter().map(item).collect::<Vec<_>>();
