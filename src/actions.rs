@@ -255,6 +255,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-w", CloseDocument, None),
         KeyBinding::new("secondary-alt-w", CloseOtherTabs, workspace),
         // VS Code's Close All Editors and Reopen Closed Editor.
+        // Chord works at the keyboard; macOS menus still show only the first
+        // key (same limitation as Open folder — see cfg below).
         KeyBinding::new("secondary-k secondary-w", CloseAllTabs, workspace),
         // VS Code's chord, off macOS (see Open folder above); the editor
         // binds it again beside Link. The palette's "Color theme…" reaches
@@ -266,16 +268,23 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-left", GoBack, workspace),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("alt-right", GoForward, workspace),
+        // VS Code on macOS: Ctrl+- / Ctrl+Shift+- (Cmd+- is Zoom Out).
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("ctrl--", GoBack, workspace),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("ctrl-shift--", GoForward, workspace),
         KeyBinding::new("secondary-shift-w", CloseWindow, None),
         KeyBinding::new("ctrl-tab", NextTab, workspace),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, workspace),
         // Probe #17 a11y: Shift+F10 / Menu key open the tab context menu.
         KeyBinding::new("shift-f10", ShowTabContextMenu, workspace),
         KeyBinding::new("menu", ShowTabContextMenu, workspace),
+        // macOS: Cmd+Alt+←/→ for next/prev tab (VS Code). Do NOT use
+        // Cmd+Shift+[ / ] — those are Fold / Unfold and would conflict.
         #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-]", NextTab, workspace),
+        KeyBinding::new("cmd-alt-right", NextTab, workspace),
         #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-[", PreviousTab, workspace),
+        KeyBinding::new("cmd-alt-left", PreviousTab, workspace),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-pagedown", NextTab, workspace),
         #[cfg(not(target_os = "macos"))]
@@ -301,8 +310,12 @@ pub fn bind_keys(cx: &mut App) {
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("alt-h", OpenAppMenu("Help".into()), None),
         // VS Code gives Ctrl+Shift+F to Find in Files; focus mode moves aside
-        // so the key is free for it.
+        // so the key is free for it. On macOS Cmd+Alt+F is Replace (VS Code),
+        // so Focus Mode uses Cmd+Alt+Shift+F there instead.
+        #[cfg(not(target_os = "macos"))]
         KeyBinding::new("secondary-alt-f", ToggleFocusMode, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-shift-f", ToggleFocusMode, None),
         KeyBinding::new("secondary-shift-f", FindInFiles, None),
         // VS Code Replace in Files.
         KeyBinding::new("secondary-shift-h", ReplaceInFiles, None),
@@ -340,6 +353,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-k s", SaveAll, Some(EDITOR_CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-k s", SaveAll, workspace),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-k s", SaveAll, Some(EDITOR_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-k cmd-w", CloseAllTabs, Some(EDITOR_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-k z", ToggleZenMode, Some(EDITOR_CONTEXT)),
         // The last binding for an action is the one menus display.
         KeyBinding::new("secondary-+", ZoomIn, None),
         KeyBinding::new("secondary-=", ZoomIn, None),
@@ -350,7 +369,12 @@ pub fn bind_keys(cx: &mut App) {
         // VS Code: Ctrl+Shift+O = Go to Symbol in Editor (headings via palette / Outline).
         KeyBinding::new("secondary-shift-o", GoToSymbol, None),
         KeyBinding::new("secondary-shift-.", GoToHeading, None),
+        // VS Code: Go to Line is Ctrl+G on every platform. On macOS Cmd+G is
+        // Find Next (editor library); binding secondary-g there steals it.
+        #[cfg(not(target_os = "macos"))]
         KeyBinding::new("secondary-g", GoToLine, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("ctrl-g", GoToLine, None),
         // Typst (and later other languages): jump to the definition under the caret.
         KeyBinding::new("f12", GoToDefinition, Some(EDITOR_CONTEXT)),
         KeyBinding::new("secondary-shift-p", CommandPalette, None),
@@ -416,6 +440,19 @@ pub fn bind_keys(cx: &mut App) {
             "ctrl-shift-z",
             gpui_kit::component::input::Redo,
             Some(INPUT_CONTEXT),
+        ),
+        // VS Code Replace: Ctrl+H (Win/Linux), Cmd+Option+F (macOS).
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new(
+            "ctrl-h",
+            gpui_kit::component::input::Replace,
+            Some(INPUT_CONTEXT),
+        ),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new(
+            "cmd-alt-f",
+            gpui_kit::component::input::Replace,
+            Some(EDITOR_CONTEXT),
         ),
         KeyBinding::new("secondary-shift-c", CodeBlock, None),
         // Shifted punctuation/numbers: on Linux/Windows GPUI reports the
@@ -546,5 +583,52 @@ mod tests {
             assert_eq!(b.keystrokes()[0].key(), key);
             assert!(!b.keystrokes()[0].modifiers().shift);
         }
+    }
+
+    /// macOS must not bind Next/Prev tab to Cmd+Shift+[ / ] — Fold owns those.
+    #[test]
+    fn macos_tab_chords_do_not_collide_with_fold() {
+        let fold = KeyBinding::new("secondary-shift-[", Fold, None);
+        let unfold = KeyBinding::new("secondary-shift-]", Unfold, None);
+        let prev = KeyBinding::new("cmd-alt-left", PreviousTab, None);
+        let next = KeyBinding::new("cmd-alt-right", NextTab, None);
+        assert_eq!(fold.keystrokes()[0].key(), "[");
+        assert!(fold.keystrokes()[0].modifiers().shift);
+        assert_eq!(prev.keystrokes()[0].key(), "left");
+        assert!(prev.keystrokes()[0].modifiers().alt);
+        assert_eq!(next.keystrokes()[0].key(), "right");
+        assert_ne!(
+            (
+                fold.keystrokes()[0].key(),
+                fold.keystrokes()[0].modifiers().shift
+            ),
+            (
+                prev.keystrokes()[0].key(),
+                prev.keystrokes()[0].modifiers().shift
+            ),
+        );
+        assert_ne!(
+            (
+                unfold.keystrokes()[0].key(),
+                unfold.keystrokes()[0].modifiers().shift
+            ),
+            (
+                next.keystrokes()[0].key(),
+                next.keystrokes()[0].modifiers().shift
+            ),
+        );
+    }
+
+    /// Go to Line stays Ctrl+G on macOS so Cmd+G remains Find Next.
+    #[test]
+    fn go_to_line_mac_spelling_is_ctrl_g() {
+        let mac = KeyBinding::new("ctrl-g", GoToLine, None);
+        assert_eq!(mac.keystrokes().len(), 1);
+        assert!(mac.keystrokes()[0].modifiers().control);
+        assert!(!mac.keystrokes()[0].modifiers().platform);
+        let back = KeyBinding::new("ctrl--", GoBack, None);
+        let forward = KeyBinding::new("ctrl-shift--", GoForward, None);
+        assert_eq!(back.keystrokes().len(), 1);
+        assert_eq!(forward.keystrokes().len(), 1);
     }
 }

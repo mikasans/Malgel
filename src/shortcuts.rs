@@ -91,12 +91,12 @@ pub const SHORTCUTS: &[ShortcutRow] = &[
     ShortcutRow {
         command: "Fold",
         when: "Editor",
-        chord: "Ctrl+Shift+[",
+        chord: "Ctrl+Shift+[  (⌘⇧[)",
     },
     ShortcutRow {
         command: "Unfold",
         when: "Editor",
-        chord: "Ctrl+Shift+]",
+        chord: "Ctrl+Shift+]  (⌘⇧])",
     },
     ShortcutRow {
         command: "Toggle Line Comment",
@@ -106,7 +106,7 @@ pub const SHORTCUTS: &[ShortcutRow] = &[
     ShortcutRow {
         command: "Open Folder",
         when: "Workspace",
-        chord: "Ctrl+K Ctrl+O",
+        chord: "Ctrl+K Ctrl+O  (macOS ⌘⌃O)",
     },
     ShortcutRow {
         command: "Toggle Outline",
@@ -136,12 +136,12 @@ pub const SHORTCUTS: &[ShortcutRow] = &[
     ShortcutRow {
         command: "Save All",
         when: "Workspace",
-        chord: "Ctrl+K S",
+        chord: "Ctrl+K S  (macOS ⌘K S)",
     },
     ShortcutRow {
         command: "Replace",
         when: "Editor",
-        chord: "Ctrl+H  (⌘⌥F)",
+        chord: "Ctrl+H  (macOS ⌘⌥F)",
     },
     ShortcutRow {
         command: "Rename (Explorer)",
@@ -161,7 +161,7 @@ pub const SHORTCUTS: &[ShortcutRow] = &[
     ShortcutRow {
         command: "Keyboard Shortcuts",
         when: "Workspace",
-        chord: "Ctrl+K Ctrl+S",
+        chord: "Ctrl+K Ctrl+S  (macOS ⌘K ⌘S)",
     },
     ShortcutRow {
         command: "Zoom In",
@@ -181,12 +181,37 @@ pub const SHORTCUTS: &[ShortcutRow] = &[
     ShortcutRow {
         command: "Go to Line",
         when: "Workspace",
-        chord: "Ctrl+G  (⌘G)",
+        chord: "Ctrl+G  (macOS Ctrl+G, not ⌘G)",
     },
     ShortcutRow {
         command: "Go to Heading",
         when: "Workspace",
-        chord: "Ctrl+Shift+O",
+        chord: "Ctrl+Shift+.",
+    },
+    ShortcutRow {
+        command: "Go Back",
+        when: "Workspace",
+        chord: "Alt+←  (macOS Ctrl+-)",
+    },
+    ShortcutRow {
+        command: "Go Forward",
+        when: "Workspace",
+        chord: "Alt+→  (macOS Ctrl+Shift+-)",
+    },
+    ShortcutRow {
+        command: "Next Tab",
+        when: "Workspace",
+        chord: "Ctrl+Tab / Ctrl+PgDn  (macOS ⌘⌥→)",
+    },
+    ShortcutRow {
+        command: "Previous Tab",
+        when: "Workspace",
+        chord: "Ctrl+Shift+Tab / Ctrl+PgUp  (macOS ⌘⌥←)",
+    },
+    ShortcutRow {
+        command: "Close All Editors",
+        when: "Workspace",
+        chord: "Ctrl+K Ctrl+W  (macOS ⌘K ⌘W)",
     },
 ];
 

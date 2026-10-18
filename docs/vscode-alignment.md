@@ -120,6 +120,11 @@ is not considered).
   under File on Windows and Linux, matching File ▸ Preferences; the File menu
   carries Close all editors and Reopen closed editor.
 
+## Platform keys (macOS)
+
+See [`mac-shortcuts-matrix.md`](./mac-shortcuts-matrix.md) for the Win/Linux ↔ macOS
+chord matrix (Cmd vs Ctrl, Fold vs tab, Go to Line, terminal).
+
 ## How it is checked
 
 `cargo test` covers the pieces (the key-binding table, the icon map, the
