@@ -107,7 +107,7 @@ mod tests {
 
     fn sample_rgba(w: u32, h: u32) -> Vec<u8> {
         let mut rgba = vec![0u8; (w * h * 4) as usize];
-        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+        for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let x = (i as u32) % w;
             let y = (i as u32) / w;
             px[0] = (x % 256) as u8;
