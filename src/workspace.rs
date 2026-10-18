@@ -53,7 +53,7 @@ use crate::{
     document::{self, LineEnding, display_name},
     document_view::{DocumentEvent, DocumentView},
     docx, export,
-    file_icon::{file_icon, file_icon_color, folder_icon_color, activity_icon_color, ActivityIcon},
+    file_icon::{ActivityIcon, activity_icon_color, file_icon, file_icon_color, folder_icon_color},
     file_tree::{
         FileTree, FileTreeEvent, TreeDrag, absolute_paths_for_clipboard, invert_key_held,
         relative_paths_for_clipboard,

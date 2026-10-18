@@ -36,8 +36,7 @@ use gpui_kit::{
         input::{Input, InputEvent, InputState},
         v_flex,
     },
-    div, point,
-    px, rems,
+    div, point, px, rems,
 };
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
@@ -243,7 +242,10 @@ impl TerminalPanel {
             }
         }
         // Ctrl+C → ETX so interrupt-from-keyboard still reaches the shell.
-        if keys.modifiers.control && !keys.modifiers.alt && !keys.modifiers.platform && !keys.modifiers.shift
+        if keys.modifiers.control
+            && !keys.modifiers.alt
+            && !keys.modifiers.platform
+            && !keys.modifiers.shift
         {
             if keys.key.eq_ignore_ascii_case("c") {
                 self.write_bytes(&[0x03]);
@@ -470,9 +472,11 @@ impl TerminalPanel {
             changed = true;
         }
         if exited {
-            self.ingest("
+            self.ingest(
+                "
 — shell exited
-");
+",
+            );
             changed = true;
             self.writer = None;
             self.child = None;
@@ -611,24 +615,22 @@ impl Render for TerminalPanel {
                         }
                         cx.notify();
                     }))
-                    .child(
-                        v_flex().w_full().children(rows.into_iter().enumerate().map(
-                            |(ix, line)| {
-                                // Non-breaking space keeps an empty line's height so
-                                // the cursor row does not collapse and drift.
-                                let shown = if line.is_empty() {
-                                    SharedString::from("\u{00a0}")
-                                } else {
-                                    line
-                                };
-                                div()
-                                    .id(("term-line", ix))
-                                    .w_full()
-                                    .whitespace_nowrap()
-                                    .child(shown)
-                            },
-                        )),
-                    ),
+                    .child(v_flex().w_full().children(rows.into_iter().enumerate().map(
+                        |(ix, line)| {
+                            // Non-breaking space keeps an empty line's height so
+                            // the cursor row does not collapse and drift.
+                            let shown = if line.is_empty() {
+                                SharedString::from("\u{00a0}")
+                            } else {
+                                line
+                            };
+                            div()
+                                .id(("term-line", ix))
+                                .w_full()
+                                .whitespace_nowrap()
+                                .child(shown)
+                        },
+                    ))),
             )
             // Always keep a line composer (Pebrel-simple): Enter sends a line
             // to the PTY. When the panel is focused, keys also go straight to

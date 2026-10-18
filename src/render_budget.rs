@@ -77,8 +77,7 @@ pub fn estimate_typst(source: &str, embedded_image_bytes: u64) -> RenderEstimate
     // ~2.5 KB of source ≈ one dense page of body text once laid out.
     let length_pages = (source_bytes / 2500).max(1);
     let pages = (pagebreaks + 1).max(length_pages);
-    let pixmap_mib =
-        pages as f64 * 7.7 + (embedded_image_bytes as f64 / (1024.0 * 1024.0));
+    let pixmap_mib = pages as f64 * 7.7 + (embedded_image_bytes as f64 / (1024.0 * 1024.0));
     let mut reasons = Vec::new();
     if pixmap_mib >= BUDGET_PIXMAP_MIB {
         reasons.push("heavy rasters");
@@ -143,7 +142,10 @@ mod tests {
             src.push_str(&format!("\n#pagebreak()\n== S{i}\n"));
         }
         let e = estimate_typst(&src, 0);
-        assert!(!e.exceeds_budget(), "15 pages should be under 150 MiB: {e:?}");
+        assert!(
+            !e.exceeds_budget(),
+            "15 pages should be under 150 MiB: {e:?}"
+        );
         assert!(e.pixmap_mib < BUDGET_PIXMAP_MIB);
     }
 
