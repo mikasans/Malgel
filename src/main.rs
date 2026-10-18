@@ -11,6 +11,7 @@ mod diagram;
 mod diagram_viewer;
 mod dialog_focus;
 mod diff;
+mod display_raster;
 mod document;
 mod document_view;
 mod docx;

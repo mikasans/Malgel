@@ -57,8 +57,8 @@ const MAX_SHEET_EDGE: u32 = 2048;
 /// Turn a Typst SVG page into a PNG `Image` on the compiler thread so GPUI
 /// never runs resvg on the UI thread for live preview pages.
 fn sheet_image(svg: String, width_pt: f32, height_pt: f32) -> Arc<Image> {
-    match rasterize_svg_png(&svg, width_pt, height_pt) {
-        Some(png) => Arc::new(Image::from_bytes(ImageFormat::Png, png)),
+    match rasterize_svg_display(&svg, width_pt, height_pt) {
+        Some((format, bytes)) => Arc::new(Image::from_bytes(format, bytes)),
         None => {
             log::warn!("typst live: SVG raster failed; falling back to SVG image");
             Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()))
@@ -66,7 +66,13 @@ fn sheet_image(svg: String, width_pt: f32, height_pt: f32) -> Arc<Image> {
     }
 }
 
-fn rasterize_svg_png(svg: &str, width_pt: f32, height_pt: f32) -> Option<Vec<u8>> {
+/// Rasterize a Typst SVG page for the live sheet cache. Prefers JPEG over PNG
+/// so cached `Arc<Image>` payloads stay small (display fidelity OK to trade).
+fn rasterize_svg_display(
+    svg: &str,
+    width_pt: f32,
+    height_pt: f32,
+) -> Option<(ImageFormat, Vec<u8>)> {
     let options = resvg::usvg::Options::default();
     let tree = resvg::usvg::Tree::from_str(svg, &options).ok()?;
     let mut width = ((width_pt * SHEET_SCALE).ceil() as u32).max(1);
@@ -89,9 +95,9 @@ fn rasterize_svg_png(svg: &str, width_pt: f32, height_pt: f32) -> Option<Vec<u8>
     let sy = height as f32 / tree.size().height().max(1.);
     let transform = resvg::tiny_skia::Transform::from_scale(sx, sy);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-    let png = pixmap.encode_png().ok();
+    let encoded = crate::display_raster::encode_rgba(width, height, pixmap.data());
     drop(_span);
-    png
+    encoded
 }
 
 /// A drawn page: its size in points and its sheet.
@@ -823,8 +829,13 @@ mod tests {
         let img = &pages[0].image;
         assert!(
             img.bytes().len() < 8 * 1024 * 1024,
-            "poster sheet PNG too large: {} bytes",
+            "poster sheet too large: {} bytes",
             img.bytes().len()
+        );
+        let b = img.bytes();
+        assert!(
+            b.starts_with(&[0xFF, 0xD8]) || (b.len() >= 4 && b[0] == 0x89 && &b[1..4] == b"PNG"),
+            "expected JPEG or PNG sheet cache encoding"
         );
     }
 }

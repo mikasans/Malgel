@@ -505,6 +505,8 @@ pub struct Workspace {
     tab_context_menu: Option<TabContextMenu>,
     _tab_context_menu_sub: Option<Subscription>,
     _watch_task: Task<()>,
+    /// Quiet status-bar mem/CPU pulse refresh (does not sample; reads shared pulse).
+    _pulse_task: Task<()>,
     document_subscriptions: Vec<(EntityId, Vec<Subscription>)>,
     /// Integrated terminal sessions in the bottom panel (Ctrl+`).
     terminals: Vec<Entity<TerminalPanel>>,
@@ -630,6 +632,26 @@ impl Workspace {
             }
         });
 
+        // Status-bar mem/CPU: sampler lives in perf (one process thread); this
+        // only repaints when the shared pulse generation advances (~1.5s).
+        crate::perf::ensure_pulse();
+        let mut last_pulse_gen = 0u64;
+        let pulse_task = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1500))
+                    .await;
+                let (_, generation) = crate::perf::pulse_snapshot();
+                if generation == last_pulse_gen {
+                    continue;
+                }
+                last_pulse_gen = generation;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
+
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             documents: Vec::new(),
@@ -679,6 +701,7 @@ impl Workspace {
             tab_context_menu: None,
             _tab_context_menu_sub: None,
             _watch_task: watch_task,
+            _pulse_task: pulse_task,
             document_subscriptions: Vec::new(),
             terminals,
             terminal_active: 0,
@@ -6815,8 +6838,14 @@ impl Workspace {
         // preview names the picture's size and zoom.
         if doc.is_media() {
             let status = doc.media_status(cx);
+            let pulse = crate::perf::pulse_label();
             return StatusBar::new()
-                .left(h_flex().gap_4().children(status.into_iter().map(item)))
+                .left(
+                    h_flex()
+                        .gap_4()
+                        .children(status.into_iter().map(item))
+                        .when(!pulse.is_empty(), |this| this.child(item(pulse))),
+                )
                 .right(h_flex().gap_4().child(item(language_label)))
                 .into_any_element();
         }
@@ -6867,6 +6896,10 @@ impl Workspace {
                     })
                     .when(doc.preview_limited(), |this| {
                         this.child(item("Preview limited (large file)".to_string()))
+                    })
+                    .children({
+                        let pulse = crate::perf::pulse_label();
+                        (!pulse.is_empty()).then(|| item(pulse))
                     }),
             )
             .right(

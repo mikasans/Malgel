@@ -80,15 +80,10 @@ pub fn load_image(path: &Path, bytes: Vec<u8>) -> Result<(Arc<Image>, f32, f32),
     // A photo of tens of megapixels would be decoded whole onto the GPU;
     // past what any screen shows, keep a copy at display resolution instead.
     // The layout still uses the full size, so zoom and fit are unchanged.
-    let bytes = if width * height > MAX_DECODED_PIXELS {
-        downscaled_png(&bytes, format).unwrap_or(bytes)
+    let (format, bytes) = if width * height > MAX_DECODED_PIXELS {
+        downscaled_display(&bytes, format).unwrap_or((format, bytes))
     } else {
-        bytes
-    };
-    let format = if bytes.starts_with(b"\x89PNG") {
-        ImageFormat::Png
-    } else {
-        format
+        (format, bytes)
     };
     let image = Arc::new(Image::from_bytes(format, bytes));
     Ok((image, width, height))
@@ -97,9 +92,10 @@ pub fn load_image(path: &Path, bytes: Vec<u8>) -> Result<(Arc<Image>, f32, f32),
 /// Pixels decoded for display at most: 4096 × 4096, 64 MB as RGBA.
 const MAX_DECODED_PIXELS: f32 = 4096. * 4096.;
 
-/// `bytes` decoded and scaled to fit 4096 × 4096, as PNG. The full-size
-/// bitmap exists only while this runs.
-fn downscaled_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
+/// `bytes` decoded and scaled to fit 4096 × 4096, as JPEG for the display
+/// cache (smaller than PNG; fidelity OK to trade). Full-size bitmap lives
+/// only while this runs.
+fn downscaled_display(bytes: &[u8], format: ImageFormat) -> Option<(ImageFormat, Vec<u8>)> {
     let fmt = match format {
         ImageFormat::Png => image::ImageFormat::Png,
         ImageFormat::Jpeg => image::ImageFormat::Jpeg,
@@ -125,9 +121,12 @@ fn downscaled_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
         image::DynamicImage::ImageRgba8(rgba) => image::imageops::thumbnail(&rgba, tw, th),
         other => other.thumbnail_exact(tw, th).into_rgba8(),
     });
+    if let Some(jpeg) = crate::display_raster::encode_dynamic_jpeg(&small) {
+        return Some((ImageFormat::Jpeg, jpeg));
+    }
     let mut out = std::io::Cursor::new(Vec::new());
     small.write_to(&mut out, image::ImageFormat::Png).ok()?;
-    Some(out.into_inner())
+    Some((ImageFormat::Png, out.into_inner()))
 }
 
 /// Read an image's pixel dimensions without keeping the decoded bitmap.
@@ -565,7 +564,9 @@ mod tests {
         image::DynamicImage::ImageRgb8(big)
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
-        let small = super::downscaled_png(png.get_ref(), gpui_kit::ImageFormat::Png).unwrap();
+        let small = super::downscaled_display(png.get_ref(), gpui_kit::ImageFormat::Png)
+            .unwrap()
+            .1;
         let decoded = image::load_from_memory(&small).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (4096, 32));
     }
@@ -577,7 +578,9 @@ mod tests {
         image::DynamicImage::ImageRgb16(big)
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
-        let small = super::downscaled_png(png.get_ref(), gpui_kit::ImageFormat::Png).unwrap();
+        let small = super::downscaled_display(png.get_ref(), gpui_kit::ImageFormat::Png)
+            .unwrap()
+            .1;
         let decoded = image::load_from_memory(&small).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (4096, 32));
     }

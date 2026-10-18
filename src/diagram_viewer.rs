@@ -375,13 +375,13 @@ impl DiagramViewer {
             let task = cx
                 .background_executor()
                 .spawn(async move { draw_view(&drawn, view) });
-            let Some(png) = task.await else {
+            let Some((format, bytes)) = task.await else {
                 return;
             };
             _ = this.update(cx, |this, cx| {
                 this.sharp = Some(Sharp {
                     view,
-                    image: Arc::new(Image::from_bytes(ImageFormat::Png, png)),
+                    image: Arc::new(Image::from_bytes(format, bytes)),
                 });
                 cx.notify();
             });
@@ -711,7 +711,7 @@ fn cropped_svg(drawn: &Drawn, view: View) -> Option<String> {
 const MAX_DIAGRAM_RASTER_EDGE: u32 = 2048;
 
 /// Draw the part of the diagram `view` shows at its exact zoom, as PNG.
-fn draw_view(drawn: &Drawn, view: View) -> Option<Vec<u8>> {
+fn draw_view(drawn: &Drawn, view: View) -> Option<(ImageFormat, Vec<u8>)> {
     // Reuse the process-wide system font DB (no second disk scan).
     static OPTIONS: LazyLock<resvg::usvg::Options<'static>> =
         LazyLock::new(|| resvg::usvg::Options {
@@ -740,7 +740,7 @@ fn draw_view(drawn: &Drawn, view: View) -> Option<Vec<u8>> {
         resvg::tiny_skia::Transform::default()
     };
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-    pixmap.encode_png().ok()
+    crate::display_raster::encode_rgba(out_w, out_h, pixmap.data())
 }
 
 #[cfg(test)]
@@ -779,8 +779,9 @@ mod tests {
             r#"<svg width="800" height="600" viewBox="12 2 100 75" preserveAspectRatio="none" xmlns"#
         ));
         assert!(svg.ends_with(r#"<rect width="10" height="10"/></svg>"#));
-        let png = draw_view(&drawn, view).unwrap();
-        assert!(png.starts_with(b"\x89PNG"));
+        let (fmt, bytes) = draw_view(&drawn, view).unwrap();
+        assert!(matches!(fmt, ImageFormat::Jpeg | ImageFormat::Png));
+        assert!(!bytes.is_empty());
     }
 
     #[test]
