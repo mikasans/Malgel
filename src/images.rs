@@ -6,7 +6,7 @@
 //! and `data:` URLs are decoded once and cached.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -100,12 +100,69 @@ fn data_url_bytes(data: &str) -> Option<(Vec<u8>, &str)> {
     Some((bytes, mime))
 }
 
+/// Bound the inline `data:` image cache so long sessions do not grow without
+/// limit. Evict least-recently-used entries by both count and decoded bytes.
+const INLINE_IMAGE_CACHE_MAX_ENTRIES: usize = 64;
+const INLINE_IMAGE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+struct InlineImageCache {
+    map: HashMap<u64, (Arc<Image>, usize)>,
+    order: VecDeque<u64>,
+    bytes: usize,
+}
+
+impl InlineImageCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    fn get(&mut self, key: u64) -> Option<Arc<Image>> {
+        let image = self.map.get(&key)?.0.clone();
+        // Move to most-recently used.
+        if let Some(pos) = self.order.iter().position(|&k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+        Some(image)
+    }
+
+    fn insert(&mut self, key: u64, image: Arc<Image>) {
+        let size = image.bytes().len();
+        if let Some((_, old)) = self.map.insert(key, (image, size)) {
+            self.bytes = self.bytes.saturating_sub(old);
+            if let Some(pos) = self.order.iter().position(|&k| k == key) {
+                self.order.remove(pos);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.order.push_back(key);
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        while self.map.len() > INLINE_IMAGE_CACHE_MAX_ENTRIES
+            || self.bytes > INLINE_IMAGE_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, size)) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(size);
+            }
+        }
+    }
+}
+
 fn decode_data_url(data: &str) -> Option<Arc<Image>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<Image>>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<InlineImageCache>> = OnceLock::new();
     let key = content_hash(data);
-    let cache = CACHE.get_or_init(Default::default);
-    if let Some(image) = cache.lock().ok()?.get(&key) {
-        return Some(image.clone());
+    let cache = CACHE.get_or_init(|| Mutex::new(InlineImageCache::new()));
+    if let Some(image) = cache.lock().ok()?.get(key) {
+        return Some(image);
     }
 
     let (bytes, mime) = data_url_bytes(data)?;

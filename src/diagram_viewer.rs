@@ -705,22 +705,41 @@ fn cropped_svg(drawn: &Drawn, view: View) -> Option<String> {
     Some(format!("{root}{}", &svg[root_end..]))
 }
 
+/// Longest edge of a Mermaid display raster. Larger diagrams are downsampled
+/// so zoomed views stay sharp enough to read without allocating multi‑GB
+/// pixmaps on the UI path.
+const MAX_DIAGRAM_RASTER_EDGE: u32 = 2048;
+
 /// Draw the part of the diagram `view` shows at its exact zoom, as PNG.
 fn draw_view(drawn: &Drawn, view: View) -> Option<Vec<u8>> {
+    // Reuse the process-wide system font DB (no second disk scan).
     static OPTIONS: LazyLock<resvg::usvg::Options<'static>> = LazyLock::new(|| {
         let mut options = resvg::usvg::Options::default();
-        options.fontdb_mut().load_system_fonts();
+        options.fontdb = crate::typst_world::SYSTEM_FONT_DB.clone();
         options
     });
     let svg = cropped_svg(drawn, view)?;
     let tree = resvg::usvg::Tree::from_str(&svg, &OPTIONS).ok()?;
     let size = tree.size().to_int_size();
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())?;
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::default(),
-        &mut pixmap.as_mut(),
-    );
+    let (width, height) = (size.width(), size.height());
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let longest = width.max(height);
+    let scale = if longest > MAX_DIAGRAM_RASTER_EDGE {
+        MAX_DIAGRAM_RASTER_EDGE as f32 / longest as f32
+    } else {
+        1.
+    };
+    let out_w = ((width as f32) * scale).round().max(1.) as u32;
+    let out_h = ((height as f32) * scale).round().max(1.) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(out_w, out_h)?;
+    let transform = if scale < 1. {
+        resvg::tiny_skia::Transform::from_scale(scale, scale)
+    } else {
+        resvg::tiny_skia::Transform::default()
+    };
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
     pixmap.encode_png().ok()
 }
 

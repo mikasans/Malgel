@@ -7,7 +7,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{LazyLock, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
 };
 
 use typst::{
@@ -15,7 +15,10 @@ use typst::{
     diag::{FileError, FileResult},
     foundations::{Bytes, Datetime, Duration},
     syntax::{FileId, Source},
-    text::{Font, FontBook, FontInfo},
+    text::{
+        Coverage, Font, FontBook, FontFlags, FontInfo, FontStretch, FontStyle, FontVariant,
+        FontWeight,
+    },
     utils::LazyHash,
 };
 use typst_layout::PagedDocument;
@@ -80,35 +83,73 @@ pub static BUNDLED_FONTS: LazyLock<FontSet> = LazyLock::new(|| {
     }
 });
 
-/// The bundled fonts first, then the system's, so documents keep their
-/// designed look while scripts and symbols the bundled fonts lack (CJK,
-/// emoji, …) fall back to installed fonts. Scanning happens once, on first
-/// use, and font data is only read when a font is actually needed.
-pub static DOCUMENT_FONTS: LazyLock<FontSet> = LazyLock::new(|| {
-    let (mut book, mut slots) = bundled_fonts();
+/// Shared system font index (paths + face metadata). Built once via fontdb's
+/// memmap-backed scan; never copies font files into the heap. Typst and Mermaid
+/// both reuse this so a second full disk scan never runs.
+pub static SYSTEM_FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
     let mut database = fontdb::Database::new();
     database.load_system_fonts();
-    let mut files: Vec<PathBuf> = database
-        .faces()
-        .filter_map(|face| match &face.source {
-            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => Some(path.clone()),
-            _ => None,
-        })
-        .collect();
-    files.sort();
-    files.dedup();
-    for path in files {
-        let Ok(data) = std::fs::read(&path) else {
+    Arc::new(database)
+});
+
+/// Coverage claim used when indexing system faces from fontdb metadata only.
+/// Exact cmap coverage is unknown until the face is loaded; claiming the full
+/// Unicode range keeps CJK / emoji fallback candidates visible. The real file
+/// is still read only inside [`FontSlot`] on first use.
+static SYSTEM_FACE_COVERAGE: LazyLock<Coverage> = LazyLock::new(|| {
+    // Run-length: 0 outside, then every Unicode scalar value inside.
+    serde_json::from_value(serde_json::json!([0, 0x11_0000]))
+        .expect("full Unicode coverage encoding")
+});
+
+/// Build Typst [`FontInfo`] from fontdb face metadata — no `std::fs::read`.
+fn font_info_from_face(face: &fontdb::FaceInfo) -> Option<FontInfo> {
+    let family = face.families.first()?.0.clone();
+    let style = match face.style {
+        fontdb::Style::Normal => FontStyle::Normal,
+        fontdb::Style::Italic => FontStyle::Italic,
+        fontdb::Style::Oblique => FontStyle::Oblique,
+    };
+    let mut flags = FontFlags::empty();
+    if face.monospaced {
+        flags.insert(FontFlags::MONOSPACE);
+    }
+    Some(FontInfo {
+        family,
+        variant: FontVariant {
+            style,
+            weight: FontWeight::from(face.weight),
+            stretch: FontStretch::from_number(face.stretch.to_number()),
+        },
+        flags,
+        axes: Vec::new(),
+        coverage: SYSTEM_FACE_COVERAGE.clone(),
+    })
+}
+
+/// The bundled fonts first, then the system's, so documents keep their
+/// designed look while scripts and symbols the bundled fonts lack (CJK,
+/// emoji, …) fall back to installed fonts.
+///
+/// Indexing walks fontdb face metadata only (family / weight / style / path).
+/// Font *bytes* are never `std::fs::read` into a `Vec` here — that happens
+/// once inside [`FontSlot`] when Typst actually selects the face.
+pub static DOCUMENT_FONTS: LazyLock<FontSet> = LazyLock::new(|| {
+    let (mut book, mut slots) = bundled_fonts();
+    for face in SYSTEM_FONT_DB.faces() {
+        let path = match &face.source {
+            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path.clone(),
+            _ => continue,
+        };
+        let Some(info) = font_info_from_face(face) else {
             continue;
         };
-        for (index, info) in FontInfo::iter(&data).enumerate() {
-            book.push(info);
-            slots.push(FontSlot::System {
-                path: path.clone(),
-                index: index as u32,
-                font: OnceLock::new(),
-            });
-        }
+        book.push(info);
+        slots.push(FontSlot::System {
+            path,
+            index: face.index,
+            font: OnceLock::new(),
+        });
     }
     FontSet {
         book: LazyHash::new(book),
@@ -281,6 +322,34 @@ mod tests {
                 &BUNDLED_FONTS
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn system_font_index_avoids_eager_heap_reads() {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let faces = SYSTEM_FONT_DB.faces().count();
+        let scan = t0.elapsed();
+        let t1 = Instant::now();
+        let fonts = &*DOCUMENT_FONTS;
+        let index = t1.elapsed();
+        let mut book_len = 0usize;
+        while fonts.book.info(book_len).is_some() {
+            book_len += 1;
+        }
+        assert!(
+            book_len > 1 && faces > 0,
+            "expected system faces (book={book_len}, fontdb={faces})"
+        );
+        // Indexing must stay well under the multi-second / GB-heap stall of the old
+        // std::fs::read-every-font loop (typically tens–hundreds of ms).
+        eprintln!(
+            "SYSTEM_FONT_DB scan={scan:?} faces={faces}, DOCUMENT_FONTS index={index:?} book={book_len}"
+        );
+        assert!(
+            index.as_secs() < 5,
+            "DOCUMENT_FONTS index took {index:?}; expected path/metadata-only"
         );
     }
 
