@@ -66,7 +66,7 @@ use crate::{
     session::{self, DiskStamp, Session, SessionDocument, WindowPlacement},
     settings::{Appearance, Layout, LinkPlacement, clamp_font_size},
     spell,
-    terminal::{self, TerminalPanel},
+    terminal::{self, TerminalEvent, TerminalPanel},
     themes::{self, AppSettings},
     title_menu_bar::TitleMenuBar,
 };
@@ -540,6 +540,8 @@ pub struct Workspace {
     terminal_visible: bool,
     /// When true, the terminal panel takes most of the center (VS Code Maximize Panel).
     terminal_maximized: bool,
+    /// Kill/CloseSession subscriptions for each integrated terminal.
+    terminal_subscriptions: Vec<Subscription>,
     /// Second editor group: another open document beside or below the active one.
     editor_split: Option<EditorSplit>,
     /// Debounce for title-bar path copy toasts.
@@ -577,7 +579,8 @@ impl Workspace {
         let search_find = cx.new(|cx| InputState::new(window, cx).placeholder("Find"));
         let search_replace = cx.new(|cx| InputState::new(window, cx).placeholder("Replace"));
         let file_tree = cx.new(FileTree::new);
-        let terminals = vec![cx.new(|cx| TerminalPanel::new(window, cx))];
+        let terminals: Vec<Entity<TerminalPanel>> = Vec::new();
+        let terminal_subscriptions: Vec<Subscription> = Vec::new();
 
         let subscriptions = vec![
             cx.subscribe_in(
@@ -732,10 +735,14 @@ impl Workspace {
             terminal_split: false,
             terminal_visible: false,
             terminal_maximized: false,
+            terminal_subscriptions,
             editor_split: None,
             last_path_copy: None,
             _subscriptions: subscriptions,
         };
+        // Seed the first integrated terminal session (subscriptions need `this`).
+        let seed = cx.new(|cx| TerminalPanel::new(window, cx));
+        this.push_terminal(seed, window, cx);
         this.restore(paths, &settings, window, cx);
         this
     }
@@ -2132,8 +2139,57 @@ impl Workspace {
             .min(self.terminals.len().saturating_sub(1))]
     }
 
+    /// Push a session and subscribe for toolbar Kill → close-tab (VS Code).
+    fn push_terminal(
+        &mut self,
+        term: Entity<TerminalPanel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sub = cx.subscribe_in(&term, window, {
+            move |this, panel, event: &TerminalEvent, window, cx| {
+                if matches!(event, TerminalEvent::CloseSession) {
+                    let id = panel.entity_id();
+                    this.close_terminal_by_id(id, window, cx);
+                }
+            }
+        });
+        self.terminal_subscriptions.push(sub);
+        self.terminals.push(term);
+        self.terminal_active = self.terminals.len() - 1;
+    }
+
+    /// Close the session with `id` (toolbar Kill). Last session stays with Restart.
+    fn close_terminal_by_id(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.terminals.iter().position(|t| t.entity_id() == id) else {
+            return;
+        };
+        if self.terminals.len() > 1 {
+            self.terminals.remove(ix);
+            if ix < self.terminal_subscriptions.len() {
+                let _ = self.terminal_subscriptions.remove(ix);
+            }
+            self.terminal_active = ix.saturating_sub(1).min(self.terminals.len() - 1);
+            if self.terminals.len() < 2 {
+                self.terminal_split = false;
+            }
+            if self.terminal_visible {
+                self.active_terminal()
+                    .update(cx, |term, cx| term.focus_input(window, cx));
+            }
+        } else {
+            // Last session: shell already stopped by the panel; keep Restart affordance.
+            self.terminals[ix].update(cx, |term, cx| term.focus_input(window, cx));
+        }
+        cx.notify();
+    }
+
     fn ensure_terminal_visible(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal_visible = true;
+        if self.terminals.is_empty() {
+            let term = cx.new(|cx| TerminalPanel::new(window, cx));
+            self.push_terminal(term, window, cx);
+        }
         let cwd = terminal::terminal_cwd(
             self.file_tree.read(cx).root(),
             self.active_document().read(cx).path().map(|p| p.as_path()),
@@ -2145,22 +2201,32 @@ impl Workspace {
         });
     }
 
-    /// Toggle the integrated terminal panel (VS Code Ctrl+`).
+    /// VS Code Ctrl+` / Toggle Terminal:
+    /// - hidden → show + focus composer
+    /// - visible but focus elsewhere (editor / image) → focus composer (do not hide)
+    /// - visible and terminal already focused → hide and restore editor focus
     fn summon_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.terminal_visible = !self.terminal_visible;
-        if self.terminal_visible {
+        let term_focused = self
+            .terminals
+            .iter()
+            .any(|t| t.read(cx).contains_focus(window, cx));
+        if !self.terminal_visible {
             self.ensure_terminal_visible(window, cx);
-        } else {
+        } else if term_focused {
+            self.terminal_visible = false;
             self.terminal_maximized = false;
             self.terminal_split = false;
+            self.focus_active(window, cx);
+        } else {
+            // Panel open but editor/image owns focus — summon focuses composer.
+            self.ensure_terminal_visible(window, cx);
         }
         cx.notify();
     }
 
     fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
         let term = cx.new(|cx| TerminalPanel::new(window, cx));
-        self.terminals.push(term);
-        self.terminal_active = self.terminals.len() - 1;
+        self.push_terminal(term, window, cx);
         self.ensure_terminal_visible(window, cx);
         cx.notify();
     }
@@ -2170,22 +2236,12 @@ impl Workspace {
             return;
         }
         let ix = self.terminal_active.min(self.terminals.len() - 1);
+        let id = self.terminals[ix].entity_id();
         self.terminals[ix].update(cx, |term, cx| {
             term.stop_shell();
             term.append("— shell stopped\n", cx);
         });
-        if self.terminals.len() > 1 {
-            self.terminals.remove(ix);
-            self.terminal_active = ix.saturating_sub(1).min(self.terminals.len() - 1);
-            if self.terminals.len() < 2 {
-                self.terminal_split = false;
-            }
-        }
-        if self.terminal_visible {
-            self.active_terminal()
-                .update(cx, |term, cx| term.focus_input(window, cx));
-        }
-        cx.notify();
+        self.close_terminal_by_id(id, window, cx);
     }
 
     fn clear_terminal(&mut self, _: &ClearTerminal, _: &mut Window, cx: &mut Context<Self>) {
@@ -2198,11 +2254,11 @@ impl Workspace {
     fn split_terminal(&mut self, _: &SplitTerminal, window: &mut Window, cx: &mut Context<Self>) {
         if self.terminals.len() < 2 {
             let term = cx.new(|cx| TerminalPanel::new(window, cx));
-            self.terminals.push(term);
+            self.push_terminal(term, window, cx);
         }
         self.terminal_split = true;
         self.ensure_terminal_visible(window, cx);
-        // Ensure the second session is running too.
+        // Ensure every session is running (left/right panes).
         let cwd = terminal::terminal_cwd(
             self.file_tree.read(cx).root(),
             self.active_document().read(cx).path().map(|p| p.as_path()),
@@ -8300,24 +8356,27 @@ impl Workspace {
         };
 
         let body = if self.terminal_split && self.terminals.len() >= 2 {
-            let a = active;
-            let b = if a + 1 < self.terminals.len() {
-                a + 1
+            // Always paint lower index on the LEFT so click-to-focus matches the
+            // pane under the cursor (no left/right swap when active is last).
+            let pair = if active + 1 < self.terminals.len() {
+                (active, active + 1)
             } else {
-                a.saturating_sub(1)
+                (active.saturating_sub(1), active)
             };
+            let left = pair.0.min(pair.1);
+            let right = pair.0.max(pair.1);
             h_flex()
                 .id("terminal-split")
                 .size_full()
                 .gap_px()
                 .child(
                     div()
-                        .id(("term-pane", a as u64))
+                        .id(("term-pane", left as u64))
                         .flex_1()
                         .min_w_0()
                         .size_full()
                         .border_1()
-                        .border_color(if a == active {
+                        .border_color(if left == active {
                             cx.theme().border
                         } else {
                             cx.theme().border.opacity(0.4)
@@ -8325,23 +8384,23 @@ impl Workspace {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
-                                this.terminal_active = a;
-                                this.terminals[a].update(cx, |term, cx| {
+                                this.terminal_active = left;
+                                this.terminals[left].update(cx, |term, cx| {
                                     term.focus_input(window, cx);
                                 });
                                 cx.notify();
                             }),
                         )
-                        .child(self.terminals[a].clone()),
+                        .child(self.terminals[left].clone()),
                 )
                 .child(
                     div()
-                        .id(("term-pane", b as u64))
+                        .id(("term-pane", right as u64))
                         .flex_1()
                         .min_w_0()
                         .size_full()
                         .border_1()
-                        .border_color(if b == active {
+                        .border_color(if right == active {
                             cx.theme().border
                         } else {
                             cx.theme().border.opacity(0.4)
@@ -8349,14 +8408,14 @@ impl Workspace {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
-                                this.terminal_active = b;
-                                this.terminals[b].update(cx, |term, cx| {
+                                this.terminal_active = right;
+                                this.terminals[right].update(cx, |term, cx| {
                                     term.focus_input(window, cx);
                                 });
                                 cx.notify();
                             }),
                         )
-                        .child(self.terminals[b].clone()),
+                        .child(self.terminals[right].clone()),
                 )
                 .into_any_element()
         } else {

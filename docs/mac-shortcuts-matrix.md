@@ -69,3 +69,14 @@ parse tests and Xvfb smoke for the Win/Linux column.
 - Unit: `cargo test --lib` (binding parse + Fold/tab non-collision).
 - Linux/Xvfb: `scripts/e2e/gui_smoke.sh` (Ctrl chords).
 - macOS-only: menu accelerators, ⌘J terminal, ⌘⌥←/→ tabs, Ctrl+G go-to-line, Ctrl+- back — Codemagic / local Mac.
+
+## Terminal summon (Linux verified; Mac still needs device)
+
+Ctrl+` / Toggle Terminal follows VS Code: show+focus composer when the panel is
+hidden or focus is in the editor/image tab; hide only when the terminal already
+owns focus. Split panes use unique element ids and lower-index-on-left so
+click-to-focus maps to the pane under the cursor. Kill closes the session tab
+when another remains; the last session shows a **Restart** affordance.
+
+**Mac matrix still needs a real Mac or Codemagic** for ⌘J toggle, ⌘⌥←/→ tabs,
+Ctrl+G go-to-line, and Ctrl+- go-back — box Xvfb cannot hard-verify those.
