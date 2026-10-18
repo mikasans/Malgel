@@ -127,6 +127,8 @@ pub struct Compiled {
     /// Syntax highlighting for the text compiled, from the compiler's own
     /// parse: (byte range, tag), outer nodes before the nodes inside them.
     pub highlights: Vec<(Range<usize>, Tag)>,
+    /// More sheets are still being rasterized; UI may paint what is here now.
+    pub partial: bool,
 }
 
 /// The highlighting typst's own syntax tree gives `source`, the same
@@ -216,6 +218,7 @@ impl LiveCompiler {
                 elapsed: started.elapsed(),
                 redrawn: 0,
                 highlights: highlights(self.world.main_source()),
+                partial: false,
             };
         }
         if self.text != text {
@@ -296,6 +299,135 @@ impl LiveCompiler {
             elapsed,
             redrawn,
             highlights: highlights(self.world.main_source()),
+            partial: false,
+        }
+    }
+
+    /// Compile with progressive sheet paint: first dirty page is rasterized and
+    /// reported via `on_partial` before the remaining dirty pages, so first
+    /// paint does not wait on the whole stack.
+    pub fn compile_progressive(
+        &mut self,
+        text: &str,
+        revision: usize,
+        mut on_partial: impl FnMut(Compiled),
+    ) -> Compiled {
+        let started = Instant::now();
+        crate::perf::mark(&format!("typst_compile_begin rev={revision}"));
+        if text == self.text && self.document.is_some() && !self.sheets.is_empty() {
+            return self.compile(text, revision);
+        }
+        if self.text != text {
+            self.text = text.to_string();
+        }
+        self.revision = revision;
+        self.world.set_text(text);
+        let warned = {
+            let _span = crate::perf::Span::new("typst_compile_core");
+            typst::compile::<PagedDocument>(&self.world)
+        };
+        let mut diagnostics: Vec<LiveDiagnostic> = warned
+            .warnings
+            .iter()
+            .map(|warning| self.diagnostic(warning))
+            .collect();
+        let mut redrawn = 0usize;
+        let pages = match warned.output {
+            Ok(document) => {
+                let mut keys = Vec::with_capacity(document.pages().len());
+                let mut meta = Vec::with_capacity(document.pages().len());
+                let mut dirty: Vec<usize> = Vec::new();
+                for (ix, page) in document.pages().iter().enumerate() {
+                    let key = hash128(page);
+                    let width = page.frame.width().to_pt() as f32;
+                    let height = page.frame.height().to_pt() as f32;
+                    keys.push(key);
+                    meta.push((width, height));
+                    if !self.sheets.contains_key(&key) {
+                        dirty.push(ix);
+                    }
+                }
+                let mut sheets = HashMap::with_capacity(document.pages().len());
+                for key in &keys {
+                    if let Some(image) = self.sheets.get(key) {
+                        sheets.insert(*key, image.clone());
+                    }
+                }
+                let build_pages = |sheets: &HashMap<u128, Arc<Image>>| -> Vec<LivePage> {
+                    keys.iter()
+                        .zip(meta.iter())
+                        .filter_map(|(key, (w, h))| {
+                            sheets.get(key).map(|image| LivePage {
+                                width: *w,
+                                height: *h,
+                                image: image.clone(),
+                            })
+                        })
+                        .collect()
+                };
+                for (step, &ix) in dirty.iter().enumerate() {
+                    let page = &document.pages()[ix];
+                    let key = keys[ix];
+                    let (width, height) = meta[ix];
+                    let svg = typst_svg::svg(page, &typst_svg::SvgOptions::default());
+                    redrawn += 1;
+                    let image = sheet_image(svg, width, height);
+                    sheets.insert(key, image);
+                    if step == 0 && dirty.len() > 1 {
+                        let ready = build_pages(&sheets);
+                        crate::perf::mark(&format!(
+                            "typst_compile_partial rev={revision} ready={} pending={}",
+                            ready.len(),
+                            dirty.len() - 1
+                        ));
+                        on_partial(Compiled {
+                            revision,
+                            pages: Some(ready),
+                            diagnostics: diagnostics.clone(),
+                            elapsed: started.elapsed(),
+                            redrawn,
+                            highlights: highlights(self.world.main_source()),
+                            partial: true,
+                        });
+                    }
+                }
+                let pages = build_pages(&sheets);
+                debug_assert_eq!(pages.len(), document.pages().len());
+                self.sheets = sheets;
+                self.document = Some(document);
+                Some(pages)
+            }
+            Err(errors) => {
+                let mut errors: Vec<LiveDiagnostic> =
+                    errors.iter().map(|error| self.diagnostic(error)).collect();
+                errors.append(&mut diagnostics);
+                diagnostics = errors;
+                None
+            }
+        };
+        comemo::evict(10);
+        self.read = self.world.read_files();
+        self.stamp = Some(crate::typst_preview::stamp_of(&self.read));
+        let elapsed = started.elapsed();
+        crate::perf::mark(&format!(
+            "typst_compile_done rev={revision} redrawn={redrawn} pages={} elapsed_ms={:.1}",
+            pages.as_ref().map_or(0, Vec::len),
+            elapsed.as_secs_f64() * 1000.0
+        ));
+        log::debug!(
+            "typst live: compile {:.1} ms ({} page(s) redrawn, revision {revision})",
+            elapsed.as_secs_f64() * 1000.,
+            redrawn,
+        );
+        self.diagnostics = diagnostics.clone();
+        Compiled {
+            revision,
+            pages,
+            diagnostics,
+            elapsed,
+            redrawn,
+            highlights: highlights(self.world.main_source()),
+            partial: false,
         }
     }
 
@@ -475,7 +607,13 @@ impl LiveWorker {
                                 if Some(ix) != newest_compile {
                                     continue;
                                 }
-                                Response::Compiled(compiler.compile(&text, revision))
+                                let partial_tx = answers.clone();
+                                let compiled =
+                                    compiler.compile_progressive(&text, revision, move |partial| {
+                                        let _ =
+                                            partial_tx.unbounded_send(Response::Compiled(partial));
+                                    });
+                                Response::Compiled(compiled)
                             }
                             Request::SourceAt { page, x, y } => {
                                 if Some(ix) != newest_source {

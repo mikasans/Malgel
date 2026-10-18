@@ -176,11 +176,11 @@ pub struct Analysis {
     pub content_hash: u64,
 }
 
-/// Past this size the source is not parsed as Markdown: markdown-rs needs
-/// minutes for a 20 MB document. The outline then comes from a line scan
-/// for `#` headings, and there is no block index (a large document's
-/// preview shows only its beginning and does not follow the editor).
-pub const FULL_PARSE_LIMIT: usize = 2 * 1024 * 1024;
+/// Past this size the source is not parsed as Markdown: a full mdast walk
+/// on ~1 MB docs dominated RSS (~1 GB class). 512 KB keeps common notes on
+/// the fast path while megabyte files fall back to a line scan for `#`
+/// headings (preview shows only the beginning; no block index).
+pub const FULL_PARSE_LIMIT: usize = 512 * 1024;
 
 impl Analysis {
     pub fn of(source: &str) -> Self {
@@ -487,7 +487,12 @@ mod large_tests {
         let started = std::time::Instant::now();
         let analysis = Analysis::of(&source);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        assert!(analysis.stats.words > 400_000);
+        // ~20 words/line × lines past the parse limit (512 KB → ~100k words).
+        assert!(
+            analysis.stats.words > 80_000,
+            "words={}",
+            analysis.stats.words
+        );
         let outline: Vec<_> = analysis
             .outline
             .iter()

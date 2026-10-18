@@ -1,7 +1,9 @@
 //! Integrated terminal: a bottom panel with a real shell (Ctrl+`).
 //!
-//! Kept simple: one session, toggle / focus / clear / kill. Not a full
-//! terminal IDE (no tabs, splits, or profiles yet).
+//! Open/focus/refresh follow VS Code / Pebrel-style panel habits: summoning
+//! focuses the live PTY, output auto-scrolls to the end while the user is
+//! following the tail, and the pump keeps painting as bytes arrive. New
+//! Terminal is Ctrl+Shift+` (never the same chord as toggle).
 
 use std::{
     io::{Read, Write},
@@ -16,8 +18,9 @@ use std::{
 
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window,
+    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement as _, Render,
+    ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window,
     assets::IconName,
     base::Disableable as _,
     component::{
@@ -27,7 +30,7 @@ use gpui_kit::{
         input::{Input, InputEvent, InputState},
         v_flex,
     },
-    div,
+    div, point,
     prelude::FluentBuilder as _,
     px,
 };
@@ -52,6 +55,8 @@ pub struct TerminalPanel {
     rx: Option<Receiver<PtyMessage>>,
     _reader: Option<thread::JoinHandle<()>>,
     _pump: Option<gpui_kit::Task<()>>,
+    /// Stick output viewport to the end while the user has not scrolled up.
+    follow_tail: bool,
 }
 
 impl EventEmitter<()> for TerminalPanel {}
@@ -88,6 +93,7 @@ impl TerminalPanel {
             rx: None,
             _reader: None,
             _pump: None,
+            follow_tail: true,
         }
     }
 
@@ -113,8 +119,16 @@ impl TerminalPanel {
         }
     }
 
+    /// Keep the viewport on the newest output (Pebrel/VS Code follow-tail).
+    fn scroll_to_end(&self) {
+        // Large negative Y; GPUI clamps to the content bottom.
+        self.scroll.set_offset(point(px(0.), px(-1_000_000.)));
+    }
+
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.output.clear();
+        self.follow_tail = true;
+        self.scroll_to_end();
         cx.notify();
     }
 
@@ -122,6 +136,9 @@ impl TerminalPanel {
         if self.writer.is_none() {
             self.start_shell(cx);
         }
+        // Re-arm follow-tail so opening via shortcut always shows latest output.
+        self.follow_tail = true;
+        self.scroll_to_end();
         self.focus_input(window, cx);
         cx.notify();
     }
@@ -214,6 +231,9 @@ impl TerminalPanel {
     pub fn append(&mut self, text: &str, cx: &mut Context<Self>) {
         self.output.push_str(text);
         self.trim_output();
+        if self.follow_tail {
+            self.scroll_to_end();
+        }
         cx.notify();
     }
 
@@ -305,7 +325,7 @@ impl TerminalPanel {
         self._pump = Some(cx.spawn(async move |_, cx| {
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(50))
+                    .timer(Duration::from_millis(33))
                     .await;
                 let cont = entity
                     .update(cx, |this, cx| this.drain_pty(cx))
@@ -358,6 +378,9 @@ impl TerminalPanel {
         }
         if changed {
             self.trim_output();
+            if self.follow_tail {
+                self.scroll_to_end();
+            }
             cx.notify();
         }
         self.rx.is_some()
@@ -435,6 +458,30 @@ impl Render for TerminalPanel {
                     .text_sm()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
+                    // Clicking the transcript focuses the PTY so typing resumes
+                    // without hunting for a hidden composer (Pebrel/VS Code).
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.follow_tail = true;
+                            this.focus_input(window, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        // Scrolling up pauses follow; nudging down near the end resumes.
+                        let dy = match event.delta {
+                            ScrollDelta::Pixels(p) => f32::from(p.y),
+                            ScrollDelta::Lines(l) => l.y * 16.,
+                        };
+                        if dy > 0.5 {
+                            this.follow_tail = false;
+                        } else if dy < -0.5 {
+                            this.follow_tail = true;
+                            this.scroll_to_end();
+                        }
+                        cx.notify();
+                    }))
                     .child(div().w_full().child(output)),
             )
             // One input surface: while the PTY is alive, hide the secondary

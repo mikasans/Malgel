@@ -232,7 +232,10 @@ pub struct TabItem {
 pub struct TabsData {
     pub tabs: Vec<TabItem>,
     pub default_index: usize,
-    pub source: SharedString,
+    /// Byte range of this block in the preview source (`offset`, `len`) —
+    /// avoids retaining a second full copy beside [`MarkdownNode::markdown`].
+    #[allow(dead_code)]
+    pub source_range: (usize, usize),
 }
 
 /// Tracks the selected tab for each tab block in the preview.
@@ -514,6 +517,14 @@ pub fn parse_tabs_blockquote(source: &str) -> Option<(Vec<TabItem>, usize)> {
     }
 }
 
+/// Byte `(offset, len)` of an mdast node in the fragment being parsed.
+fn node_source_range(cx: &MarkdownParseContext<'_>, node: &Node) -> Option<(usize, usize)> {
+    let position = node.position()?;
+    let start = position.start.offset;
+    let end = position.end.offset;
+    Some((cx.offset() + start, end.saturating_sub(start)))
+}
+
 #[derive(Clone)]
 pub struct TabsPlugin {
     content_extensions: MarkdownExtensions,
@@ -552,11 +563,12 @@ impl MarkdownPlugin for TabsPlugin {
                             TabsData {
                                 tabs,
                                 default_index,
-                                source: source.to_string().into(),
+                                source_range: node_source_range(cx, node)
+                                    .unwrap_or((0, source.len())),
                             },
                         )
                         .accessibility_label("Tabbed content")
-                        .markdown(source.to_string()),
+                        .markdown(source),
                     )
                 } else {
                     None
@@ -571,11 +583,11 @@ impl MarkdownPlugin for TabsPlugin {
                         TabsData {
                             tabs,
                             default_index,
-                            source: source.to_string().into(),
+                            source_range: node_source_range(cx, node).unwrap_or((0, source.len())),
                         },
                     )
                     .accessibility_label("Tabbed content")
-                    .markdown(source.to_string()),
+                    .markdown(source),
                 )
             }
             Node::Paragraph(_) | Node::Html(_) => {
@@ -587,11 +599,11 @@ impl MarkdownPlugin for TabsPlugin {
                         TabsData {
                             tabs,
                             default_index,
-                            source: source.to_string().into(),
+                            source_range: node_source_range(cx, node).unwrap_or((0, source.len())),
                         },
                     )
                     .accessibility_label("Tabbed content")
-                    .markdown(source.to_string()),
+                    .markdown(source),
                 )
             }
             _ => None,
@@ -600,7 +612,7 @@ impl MarkdownPlugin for TabsPlugin {
 
     fn render(&self, node: &MarkdownNode, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let data = node.data::<TabsData>().expect("tabs node data");
-        let block_id = content_hash(&data.source);
+        let block_id = content_hash(node.as_markdown());
         let active_index = self
             .state
             .get_active(block_id, data.default_index, data.tabs.len());
@@ -689,7 +701,7 @@ fn formula_node(tex: &str, style: MathStyle, source: &str) -> MarkdownNode {
     )
     .text(tex.trim().to_string())
     .accessibility_label(format!("Formula: {}", tex.trim()))
-    .markdown(source.to_string())
+    .markdown(source)
 }
 
 /// A rendered formula ready to paint.
@@ -1112,7 +1124,10 @@ impl MarkdownPlugin for MermaidPlugin {
             MarkdownNode::new("mermaid", MermaidSource(code.value.clone()))
                 .text(code.value.clone())
                 .accessibility_label("Mermaid diagram")
-                .markdown(cx.node_source(node).unwrap_or(&code.value).to_string()),
+                .markdown({
+                    let raw = cx.node_source(node).unwrap_or(&code.value);
+                    raw
+                }),
         )
     }
 
@@ -1361,12 +1376,20 @@ Content 2
 
 /// Turn single newlines inside paragraphs into GFM hard breaks (`  \n`),
 /// leaving fenced code blocks and blank-line paragraph splits alone.
+///
+/// Iterates `split_inclusive` directly — no `Vec<&str>` of every line.
+#[allow(dead_code)] // exercised by unit tests; prepare uses apply_gfm_breaks_into
 pub fn apply_gfm_breaks(source: &str) -> String {
     let mut out = String::with_capacity(source.len() + 32);
+    apply_gfm_breaks_into(source, &mut out);
+    out
+}
+
+fn apply_gfm_breaks_into(source: &str, out: &mut String) {
     let mut in_fence = false;
     let mut fence_marker: Option<char> = None;
-    let lines: Vec<&str> = source.split_inclusive('\n').collect();
-    for (i, line) in lines.iter().enumerate() {
+    let mut lines = source.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
         let body = line.strip_suffix('\n').unwrap_or(line);
         let trimmed = body.trim_start();
         let mut fence_line = false;
@@ -1390,7 +1413,7 @@ pub fn apply_gfm_breaks(source: &str) -> String {
         out.push_str(body);
         if line.ends_with('\n') {
             let next_blank = lines
-                .get(i + 1)
+                .peek()
                 .map(|n| n.strip_suffix('\n').unwrap_or(n).trim().is_empty())
                 .unwrap_or(true);
             // Soft break → hard break unless blank line, fence marker, or already hard.
@@ -1406,7 +1429,28 @@ pub fn apply_gfm_breaks(source: &str) -> String {
             out.push('\n');
         }
     }
-    out
+}
+
+/// Build the Markdown preview source in **one** allocation: tab-container
+/// normalize, then optional GFM hard breaks, streamed into a single `String`.
+/// Avoids the prior normalize→String then gfm→String double copy.
+pub fn prepare_preview_markdown(source: &str, gfm_breaks: bool) -> String {
+    if !gfm_breaks {
+        return normalize_tab_containers(source);
+    }
+    // Normalize tabs first (rewrites :::tabs regions), then GFM into the
+    // same final buffer via a temporary only when tabs actually changed.
+    let normalized = normalize_tab_containers(source);
+    if normalized.as_str() == source {
+        // Common path: no tab containers — GFM straight from the original.
+        let mut out = String::with_capacity(source.len() + 32);
+        apply_gfm_breaks_into(source, &mut out);
+        out
+    } else {
+        let mut out = String::with_capacity(normalized.len() + 32);
+        apply_gfm_breaks_into(&normalized, &mut out);
+        out
+    }
 }
 
 #[cfg(test)]

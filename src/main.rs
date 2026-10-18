@@ -25,8 +25,10 @@ mod math;
 mod menus;
 mod pdf;
 pub mod pdf_view;
+mod perf;
 mod preview_ext;
 mod quick_open;
+mod render_budget;
 mod rich_copy;
 mod search;
 mod session;
@@ -42,7 +44,6 @@ mod title_menu_bar;
 mod typst_live;
 mod typst_preview;
 mod typst_world;
-mod perf;
 mod workspace;
 mod zoom;
 

@@ -352,7 +352,6 @@ enum DiskChange {
     Touched(Option<DiskStamp>),
 }
 
-
 /// Labels near the top of the editor-tab context menu (probe #15/#16).
 /// Kept as a pure list so tests can prove Select for Compare is registered
 /// even when Xvfb hit-testing is involved.
@@ -5197,13 +5196,11 @@ impl Workspace {
                             .item(PopupMenuItem::new("Copy Path").on_click(move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                             }))
-                            .item(
-                                PopupMenuItem::new("Reveal in File Manager").on_click(
-                                    move |_, _, cx| {
-                                        cx.reveal_path(&reveal);
-                                    },
-                                ),
-                            )
+                            .item(PopupMenuItem::new("Reveal in File Manager").on_click(
+                                move |_, _, cx| {
+                                    cx.reveal_path(&reveal);
+                                },
+                            ))
                     }
                     None => menu,
                 }
@@ -5216,13 +5213,12 @@ impl Workspace {
         }
 
         self._tab_context_menu_sub.take();
-        self._tab_context_menu_sub = Some(cx.subscribe_in(
-            &menu,
-            window,
-            |this, _, _: &DismissEvent, _, cx| {
-                this.dismiss_tab_context_menu(cx);
-            },
-        ));
+        self._tab_context_menu_sub =
+            Some(
+                cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, _, cx| {
+                    this.dismiss_tab_context_menu(cx);
+                }),
+            );
         self.tab_context_menu = Some(TabContextMenu { position, menu });
         cx.notify();
     }
@@ -6397,246 +6393,229 @@ impl Workspace {
                 // That helper overlays an absolute inset_0 Scrollbar whose
                 // full-area hitbox can swallow right-clicks. Tab menus now
                 // open programmatically; overflow_x_scroll + chevrons remain.
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(
-                        h_flex()
-                            .id("tabs-scroll-area")
-                            .size_full()
-                            .items_center()
-                            .gap_1()
-                            // Tracked by the workspace's own handle, so the active
-                            // tab can be scrolled into view; its children are the
-                            // tabs alone, so a child index is a tab index.
-                            .overflow_x_scroll()
-                            .track_scroll(&tab_scroll)
-                            .children(self.documents.iter().enumerate().map(|(ix, doc_entity)| {
-                                let doc = doc_entity.read(cx);
-                                let doc_id = doc_entity.entity_id();
-                                let active = ix == active_ix;
-                                let dirty = doc.is_dirty();
-                                // The preview tab reads like a draft: the next file
-                                // clicked replaces it until it is edited or opened
-                                // for good, the way VS Code marks its preview.
-                                let is_preview = self.preview == Some(doc_id);
-                                let is_pinned = self.pinned.contains(&doc_id);
-                                let name = doc.name().to_string();
-                                // The tab carries its file's type icon, as in VS Code.
-                                let tab_icon = doc.path().map(|path| file_icon(path));
-                                let theme = cx.theme();
-                                let drag_label: SharedString = name.clone().into();
+                div().relative().flex_1().min_w_0().h_full().child(
+                    h_flex()
+                        .id("tabs-scroll-area")
+                        .size_full()
+                        .items_center()
+                        .gap_1()
+                        // Tracked by the workspace's own handle, so the active
+                        // tab can be scrolled into view; its children are the
+                        // tabs alone, so a child index is a tab index.
+                        .overflow_x_scroll()
+                        .track_scroll(&tab_scroll)
+                        .children(self.documents.iter().enumerate().map(|(ix, doc_entity)| {
+                            let doc = doc_entity.read(cx);
+                            let doc_id = doc_entity.entity_id();
+                            let active = ix == active_ix;
+                            let dirty = doc.is_dirty();
+                            // The preview tab reads like a draft: the next file
+                            // clicked replaces it until it is edited or opened
+                            // for good, the way VS Code marks its preview.
+                            let is_preview = self.preview == Some(doc_id);
+                            let is_pinned = self.pinned.contains(&doc_id);
+                            let name = doc.name().to_string();
+                            // The tab carries its file's type icon, as in VS Code.
+                            let tab_icon = doc.path().map(|path| file_icon(path));
+                            let theme = cx.theme();
+                            let drag_label: SharedString = name.clone().into();
 
-                                h_flex()
-                                    .id(("tab", ix))
-                                    .group("tab")
-                                    .relative()
-                                    .h(px(28.))
-                                    .max_w(px(220.))
-                                    .flex_none()
-                                    .pl_2p5()
-                                    .pr_1p5()
-                                    .gap_1p5()
-                                    .items_center()
-                                    .rounded_md()
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    // Tabs drag to a new position, the way they
-                                    // reorder in VS Code.
-                                    .on_drag(TabDrag { index: ix }, move |_, _, _, cx| {
-                                        cx.new(|_| DragGhost {
-                                            label: drag_label.clone(),
+                            h_flex()
+                                .id(("tab", ix))
+                                .group("tab")
+                                .relative()
+                                .h(px(28.))
+                                .max_w(px(220.))
+                                .flex_none()
+                                .pl_2p5()
+                                .pr_1p5()
+                                .gap_1p5()
+                                .items_center()
+                                .rounded_md()
+                                .text_sm()
+                                .cursor_pointer()
+                                // Tabs drag to a new position, the way they
+                                // reorder in VS Code.
+                                .on_drag(TabDrag { index: ix }, move |_, _, _, cx| {
+                                    cx.new(|_| DragGhost {
+                                        label: drag_label.clone(),
+                                    })
+                                })
+                                .on_drag_move::<TabDrag>(cx.listener(
+                                    move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
+                                        this.set_tab_insertion(event, ix, cx);
+                                    },
+                                ))
+                                .when(active, |this| {
+                                    this.bg(theme.tab_active)
+                                        .text_color(theme.tab_active_foreground)
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                })
+                                .when(!active, |this| {
+                                    this.bg(theme.tab_bar)
+                                        .text_color(theme.muted_foreground)
+                                        .border_1()
+                                        .border_color(theme.tab_bar)
+                                        .hover(|style| {
+                                            style
+                                                .bg(theme.list_hover)
+                                                .text_color(theme.foreground)
+                                                .border_color(theme.border.opacity(0.5))
                                         })
-                                    })
-                                    .on_drag_move::<TabDrag>(cx.listener(
-                                        move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
-                                            this.set_tab_insertion(event, ix, cx);
-                                        },
-                                    ))
-                                    .when(active, |this| {
-                                        this.bg(theme.tab_active)
-                                            .text_color(theme.tab_active_foreground)
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .border_1()
-                                            .border_color(theme.border)
-                                    })
-                                    .when(!active, |this| {
-                                        this.bg(theme.tab_bar)
-                                            .text_color(theme.muted_foreground)
-                                            .border_1()
-                                            .border_color(theme.tab_bar)
-                                            .hover(|style| {
-                                                style
-                                                    .bg(theme.list_hover)
-                                                    .text_color(theme.foreground)
-                                                    .border_color(theme.border.opacity(0.5))
-                                            })
-                                    })
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_color(if active {
-                                                theme.tab_active_foreground
-                                            } else {
-                                                theme.muted_foreground
-                                            })
-                                            .child(
-                                                Icon::new(tab_icon.unwrap_or(IconName::FileText))
-                                                    .xsmall(),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .when(is_preview, |this| this.italic())
-                                            .child(name),
-                                    )
-                                    .child(
-                                        div()
-                                            .size(px(18.))
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded_sm()
-                                            .hover(|style| style.bg(theme.list_active))
-                                            // A pinned tab shows a pin where the
-                                            // close box would be, and the pin is
-                                            // what takes the click — the way VS
-                                            // Code's pinned tabs read.
-                                            .when(is_pinned, |this| {
+                                })
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(if active {
+                                            theme.tab_active_foreground
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .child(
+                                            Icon::new(tab_icon.unwrap_or(IconName::FileText))
+                                                .xsmall(),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .when(is_preview, |this| this.italic())
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .size(px(18.))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_sm()
+                                        .hover(|style| style.bg(theme.list_active))
+                                        // A pinned tab shows a pin where the
+                                        // close box would be, and the pin is
+                                        // what takes the click — the way VS
+                                        // Code's pinned tabs read.
+                                        .when(is_pinned, |this| {
+                                            this.child(
+                                                Icon::new(IconName::Pin)
+                                                    .xsmall()
+                                                    .text_color(theme.primary),
+                                            )
+                                        })
+                                        .when(!is_pinned, |this| {
+                                            this.child(div().when(dirty, |this| {
                                                 this.child(
-                                                    Icon::new(IconName::Pin)
-                                                        .xsmall()
-                                                        .text_color(theme.primary),
-                                                )
-                                            })
-                                            .when(!is_pinned, |this| {
-                                                this.child(div().when(dirty, |this| {
-                                                    this.child(
-                                                        div()
-                                                            .size(px(7.))
-                                                            .rounded_full()
-                                                            .bg(theme.primary),
-                                                    )
-                                                    .group_hover("tab", |style| style.invisible())
-                                                }))
-                                                .child(
                                                     div()
-                                                        .absolute()
-                                                        .invisible()
-                                                        .when(active && !dirty, |this| {
-                                                            this.visible()
-                                                        })
-                                                        .group_hover("tab", |style| style.visible())
-                                                        .child(Icon::new(IconName::Close).xsmall()),
+                                                        .size(px(7.))
+                                                        .rounded_full()
+                                                        .bg(theme.primary),
                                                 )
-                                            })
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    if is_pinned {
-                                                        this.toggle_pin_by_id(doc_id, cx);
-                                                        return;
-                                                    }
-                                                    let doc = this.documents[ix].clone();
-                                                    let id = doc.entity_id();
-                                                    this.confirm_unsaved(
-                                                        doc,
-                                                        AfterConfirm::CloseDocument(id),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }),
-                                            ),
-                                    )
-                                    // VS Code-style insertion line where a dragged
-                                    // tab would land: left edge of this tab, or the
-                                    // right edge of the last one.
-                                    .when(
-                                        self.tab_insertion.map(|insertion| insertion.gap)
-                                            == Some(ix),
-                                        |this| {
-                                            this.child(
+                                                .group_hover("tab", |style| style.invisible())
+                                            }))
+                                            .child(
                                                 div()
                                                     .absolute()
-                                                    .left_0()
-                                                    .top(px(4.))
-                                                    .bottom(px(4.))
-                                                    .w(px(2.))
-                                                    .rounded_full()
-                                                    .bg(theme.primary),
+                                                    .invisible()
+                                                    .when(active && !dirty, |this| this.visible())
+                                                    .group_hover("tab", |style| style.visible())
+                                                    .child(Icon::new(IconName::Close).xsmall()),
                                             )
-                                        },
-                                    )
-                                    .when(
-                                        ix + 1 == count
-                                            && self.tab_insertion.map(|insertion| insertion.gap)
-                                                == Some(count),
-                                        |this| {
-                                            this.child(
-                                                div()
-                                                    .absolute()
-                                                    .right_0()
-                                                    .top(px(4.))
-                                                    .bottom(px(4.))
-                                                    .w(px(2.))
-                                                    .rounded_full()
-                                                    .bg(theme.primary),
-                                            )
-                                        },
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Right,
-                                        cx.listener(
-                                            move |this, event: &MouseDownEvent, window, cx| {
-                                                // Probe #17: open menu programmatically.
-                                                // Declarative `.context_menu()` lost its
-                                                // element state when activate() notified
-                                                // and deferred editor focus under Xvfb.
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
                                                 cx.stop_propagation();
-                                                this.open_tab_context_menu(
-                                                    ix,
-                                                    event.position,
+                                                if is_pinned {
+                                                    this.toggle_pin_by_id(doc_id, cx);
+                                                    return;
+                                                }
+                                                let doc = this.documents[ix].clone();
+                                                let id = doc.entity_id();
+                                                this.confirm_unsaved(
+                                                    doc,
+                                                    AfterConfirm::CloseDocument(id),
                                                     window,
                                                     cx,
                                                 );
-                                            },
+                                            }),
                                         ),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(
-                                            move |this, event: &MouseDownEvent, window, cx| {
-                                                // A double click keeps the file: the
-                                                // preview slot is given up, as in VS
-                                                // Code.
-                                                if event.click_count > 1 {
-                                                    this.unpreview(doc_id);
-                                                }
-                                                this.activate(ix, window, cx)
-                                            },
-                                        ),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Middle,
-                                        cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            let doc = this.documents[ix].clone();
-                                            let id = doc.entity_id();
-                                            this.confirm_unsaved(
-                                                doc,
-                                                AfterConfirm::CloseDocument(id),
-                                                window,
-                                                cx,
-                                            );
-                                        }),
-                                    )
-                            })),
-                    ),
+                                )
+                                // VS Code-style insertion line where a dragged
+                                // tab would land: left edge of this tab, or the
+                                // right edge of the last one.
+                                .when(
+                                    self.tab_insertion.map(|insertion| insertion.gap) == Some(ix),
+                                    |this| {
+                                        this.child(
+                                            div()
+                                                .absolute()
+                                                .left_0()
+                                                .top(px(4.))
+                                                .bottom(px(4.))
+                                                .w(px(2.))
+                                                .rounded_full()
+                                                .bg(theme.primary),
+                                        )
+                                    },
+                                )
+                                .when(
+                                    ix + 1 == count
+                                        && self.tab_insertion.map(|insertion| insertion.gap)
+                                            == Some(count),
+                                    |this| {
+                                        this.child(
+                                            div()
+                                                .absolute()
+                                                .right_0()
+                                                .top(px(4.))
+                                                .bottom(px(4.))
+                                                .w(px(2.))
+                                                .rounded_full()
+                                                .bg(theme.primary),
+                                        )
+                                    },
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        // Probe #17: open menu programmatically.
+                                        // Declarative `.context_menu()` lost its
+                                        // element state when activate() notified
+                                        // and deferred editor focus under Xvfb.
+                                        cx.stop_propagation();
+                                        this.open_tab_context_menu(ix, event.position, window, cx);
+                                    }),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        // A double click keeps the file: the
+                                        // preview slot is given up, as in VS
+                                        // Code.
+                                        if event.click_count > 1 {
+                                            this.unpreview(doc_id);
+                                        }
+                                        this.activate(ix, window, cx)
+                                    }),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Middle,
+                                    cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        let doc = this.documents[ix].clone();
+                                        let id = doc.entity_id();
+                                        this.confirm_unsaved(
+                                            doc,
+                                            AfterConfirm::CloseDocument(id),
+                                            window,
+                                            cx,
+                                        );
+                                    }),
+                                )
+                        })),
+                ),
             )
             .when(count > 1, |this| {
                 this.child(
@@ -6708,15 +6687,13 @@ impl Workspace {
             .w_full()
             .child(bar)
             .when_some(self.tab_context_menu.as_ref(), |this, open| {
-                this.child(
-                    deferred(
-                        anchored()
-                            .position(open.position)
-                            .snap_to_window_with_margin(px(8.))
-                            .anchor(Anchor::TopLeft)
-                            .child(open.menu.clone()),
-                    ),
-                )
+                this.child(deferred(
+                    anchored()
+                        .position(open.position)
+                        .snap_to_window_with_margin(px(8.))
+                        .anchor(Anchor::TopLeft)
+                        .child(open.menu.clone()),
+                ))
             })
     }
 
@@ -7803,10 +7780,7 @@ impl Render for Workspace {
                             let size = window.viewport_size();
                             Some(Bounds::new(
                                 Point::new(px(0.), px(70.)),
-                                Size::new(
-                                    size.width,
-                                    (size.height - px(70.)).max(px(1.)),
-                                ),
+                                Size::new(size.width, (size.height - px(70.)).max(px(1.))),
                             ))
                         });
                         if let Some(vertical) = Self::edge_split_at(event.position, body) {

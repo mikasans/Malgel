@@ -148,6 +148,12 @@ pub struct DocumentView {
     reduced: bool,
     /// The large-file info bar was closed for this tab.
     bar_dismissed: bool,
+    /// Heavy-render consent: under budget / waiting for inline confirm / skipped.
+    render_gate: crate::render_budget::RenderConsent,
+    /// Last estimate shown on the render-budget banner (for the message).
+    render_estimate: Option<crate::render_budget::RenderEstimate>,
+    /// User confirmed a heavy render via the inline banner.
+    render_confirmed: bool,
     /// A heading to show once the outline is known, from following a link.
     pending_anchor: Option<String>,
 
@@ -292,6 +298,9 @@ impl DocumentView {
             large: false,
             reduced: false,
             bar_dismissed: false,
+            render_gate: crate::render_budget::RenderConsent::Allowed,
+            render_estimate: None,
+            render_confirmed: false,
             encoding: Default::default(),
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
@@ -486,6 +495,9 @@ impl DocumentView {
             large: false,
             reduced: false,
             bar_dismissed: false,
+            render_gate: crate::render_budget::RenderConsent::Allowed,
+            render_estimate: None,
+            render_confirmed: false,
             encoding: Default::default(),
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
@@ -550,6 +562,9 @@ impl DocumentView {
             large: false,
             reduced: false,
             bar_dismissed: false,
+            render_gate: crate::render_budget::RenderConsent::Allowed,
+            render_estimate: None,
+            render_confirmed: false,
             encoding: Default::default(),
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
@@ -1084,12 +1099,36 @@ impl DocumentView {
         // Source code and other text is not previewed at all, as in VS
         // Code: the editor is the whole view.
         if self.has_preview() {
-            let mut preview_source = crate::preview_ext::normalize_tab_containers(&source);
-            if crate::themes::AppSettings::get(cx).gfm_breaks {
-                preview_source = crate::preview_ext::apply_gfm_breaks(&preview_source);
+            let gfm = crate::themes::AppSettings::get(cx).gfm_breaks;
+            // One SharedString for analysis (`source`); preview runs normalize+GFM
+            // into a single String (no normalize→gfm double copy).
+            let estimate = crate::render_budget::estimate_markdown(&source);
+            if estimate.exceeds_budget() && !self.render_confirmed {
+                self.render_gate = crate::render_budget::RenderConsent::Pending;
+                self.render_estimate = Some(estimate.clone());
             }
-            self.preview
-                .update(cx, |preview, cx| preview.set_text(&preview_source, cx));
+            if matches!(
+                self.render_gate,
+                crate::render_budget::RenderConsent::Pending
+                    | crate::render_budget::RenderConsent::Skipped
+            ) {
+                self.render_estimate = Some(estimate);
+                // Lightweight stub — no mdast / Mermaid / math work.
+                let stub = format!(
+                    "> [!NOTE]\n> Heavy preview paused ({}). Use the banner above to render.\n",
+                    self.render_estimate
+                        .as_ref()
+                        .map(|e| e.summary())
+                        .unwrap_or_default()
+                );
+                self.preview
+                    .update(cx, |preview, cx| preview.set_text(&stub, cx));
+            } else {
+                let preview_source =
+                    crate::preview_ext::prepare_preview_markdown(source.as_ref(), gfm);
+                self.preview
+                    .update(cx, |preview, cx| preview.set_text(&preview_source, cx));
+            }
             self.preview_limited = false;
         } else if !debounce {
             self.preview
@@ -1390,7 +1429,25 @@ impl DocumentView {
                 cx.background_executor().timer(LIVE_DEBOUNCE).await;
             }
             _ = this.update(cx, |this, cx| {
-                let text = this.editor.read(cx).value().to_string();
+                // Prefer the already-held SharedString; avoid value()+to_string.
+                let text = if !this.source.is_empty() {
+                    this.source.to_string()
+                } else {
+                    this.editor.read(cx).value().to_string()
+                };
+                let image_bytes = estimate_typst_image_bytes(this.path.as_deref());
+                let estimate = crate::render_budget::estimate_typst(&text, image_bytes);
+                if estimate.exceeds_budget() && !this.render_confirmed {
+                    this.render_gate = crate::render_budget::RenderConsent::Pending;
+                    this.render_estimate = Some(estimate);
+                    cx.notify();
+                    return;
+                }
+                if this.render_gate == crate::render_budget::RenderConsent::Skipped {
+                    this.render_estimate = Some(estimate);
+                    cx.notify();
+                    return;
+                }
                 if let Some(live) = &this.live {
                     live.worker
                         .send(crate::typst_live::Request::Compile { text, revision });
@@ -1457,8 +1514,12 @@ impl DocumentView {
                             .collect(),
                     );
                     live.view.update(cx, |view, cx| view.reload(document, cx));
-                    live.compiled_once = true;
-                    if first {
+                    if compiled.partial {
+                        crate::perf::mark(&format!(
+                            "partial_typst_preview_pages_applied pages={n} redrawn={}",
+                            compiled.redrawn
+                        ));
+                    } else if first {
                         crate::perf::mark(&format!(
                             "first_typst_preview_pages_applied pages={n} redrawn={}",
                             compiled.redrawn
@@ -1468,6 +1529,9 @@ impl DocumentView {
                             "warm_typst_preview_pages_applied pages={n} redrawn={}",
                             compiled.redrawn
                         ));
+                    }
+                    if !compiled.partial {
+                        live.compiled_once = true;
                     }
                 }
                 live.diagnostics = compiled.diagnostics;
@@ -2674,6 +2738,73 @@ impl DocumentView {
     // ---------------------------------------------------------------------
     // Rendering
 
+    /// Confirm a heavy preview from the inline budget banner.
+    fn confirm_heavy_render(&mut self, cx: &mut Context<Self>) {
+        self.render_confirmed = true;
+        self.render_gate = crate::render_budget::RenderConsent::Allowed;
+        // Re-run preview / live compile now that consent is granted.
+        self.on_text_changed(false, cx);
+        cx.notify();
+    }
+
+    /// Skip heavy preview; reversible via the same banner.
+    fn skip_heavy_render(&mut self, cx: &mut Context<Self>) {
+        self.render_gate = crate::render_budget::RenderConsent::Skipped;
+        self.render_confirmed = false;
+        self.on_text_changed(false, cx);
+        cx.notify();
+    }
+
+    /// Inline banner when estimated render cost exceeds the soft budget.
+    fn render_budget_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let summary = self
+            .render_estimate
+            .as_ref()
+            .map(|e| e.summary())
+            .unwrap_or_else(|| "heavy preview".into());
+        let pending = self.render_gate == crate::render_budget::RenderConsent::Pending;
+        let skipped = self.render_gate == crate::render_budget::RenderConsent::Skipped;
+        let message = if pending {
+            format!("Heavy preview paused ({summary}). Rendering may use significant memory/CPU.")
+        } else {
+            format!("Heavy preview skipped ({summary}).")
+        };
+        h_flex()
+            .id("render-budget-bar")
+            .w_full()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .text_sm()
+            .text_color(cx.theme().foreground)
+            .child(
+                gpui_kit::component::Icon::new(gpui_kit::component::IconName::Info)
+                    .text_color(cx.theme().warning),
+            )
+            .child(div().flex_1().child(message))
+            .when(pending || skipped, |bar| {
+                bar.child(
+                    Button::new("confirm-heavy-render")
+                        .label("Render")
+                        .primary()
+                        .on_click(cx.listener(|this, _, _, cx| this.confirm_heavy_render(cx))),
+                )
+            })
+            .when(pending, |bar| {
+                bar.child(
+                    Button::new("skip-heavy-render")
+                        .label("Skip")
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| this.skip_heavy_render(cx))),
+                )
+            })
+    }
+
     /// The info bar over a large file, the way VS Code tells why tokenization
     /// and folding are off; it does not block anything.
     fn render_large_file_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3221,13 +3352,22 @@ impl Render for DocumentView {
             )
             .child(body)
             .into_any_element();
-        if !self.large || self.bar_dismissed {
+        let show_budget = matches!(
+            self.render_gate,
+            crate::render_budget::RenderConsent::Pending
+                | crate::render_budget::RenderConsent::Skipped
+        );
+        let show_large = self.large && !self.bar_dismissed;
+        if !show_budget && !show_large {
             return body;
         }
         v_flex()
             .size_full()
             .min_w_0()
-            .child(self.render_large_file_bar(cx))
+            .when(show_budget, |this| this.child(self.render_budget_bar(cx)))
+            .when(show_large, |this| {
+                this.child(self.render_large_file_bar(cx))
+            })
             .child(div().flex_1().min_h_0().min_w_0().child(body))
             .into_any_element()
     }
@@ -3348,6 +3488,37 @@ const LARGE_DOCUMENT_LINES: usize = 300_000;
 fn is_large_text(text: &str) -> bool {
     text.len() > LARGE_DOCUMENT_BYTES
         || text.bytes().filter(|&b| b == b'\n').count() > LARGE_DOCUMENT_LINES
+}
+
+/// Sum sizes of image files named beside a Typst source (cheap metadata only).
+fn estimate_typst_image_bytes(path: Option<&std::path::Path>) -> u64 {
+    let Some(path) = path else {
+        return 0;
+    };
+    let Some(dir) = path.parent() else {
+        return 0;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for raw in text.split('"') {
+        let lower = raw.to_ascii_lowercase();
+        if !(lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".gif")
+            || lower.ends_with(".webp")
+            || lower.ends_with(".svg"))
+        {
+            continue;
+        }
+        let candidate = dir.join(raw);
+        if let Ok(meta) = std::fs::metadata(candidate) {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
 }
 
 /// The preview of a large document: its beginning, cut at a line, under a

@@ -150,6 +150,7 @@ fn compile_in(
         root: source.parent().map(Path::to_path_buf).unwrap_or_default(),
         source: Source::new(file_id_for(source), text),
         read: Mutex::new(Vec::new()),
+        file_cache: Mutex::new(HashMap::new()),
         packages,
         package_roots: Mutex::new(HashMap::new()),
     };
@@ -193,6 +194,10 @@ pub(crate) struct DocumentWorld {
     /// The files this compilation read, for the watcher. `World`'s methods
     /// borrow, so the recording needs a lock rather than a field.
     read: Mutex<Vec<PathBuf>>,
+    /// Bytes of named files (images, includes), keyed by resolved path +
+    /// `(len, mtime)`. Survives `set_text` so warm edits do not re-read the
+    /// same PNG on every keystroke.
+    file_cache: Mutex<HashMap<PathBuf, CachedFile>>,
     /// The folders a package can be found in, in the order they are tried.
     packages: Vec<PathBuf>,
     /// The folder each imported package was found in. `None` records a
@@ -200,6 +205,11 @@ pub(crate) struct DocumentWorld {
     /// import is missing does not search the folders again for every path
     /// the failed import names.
     package_roots: Mutex<HashMap<PackageSpec, Option<PathBuf>>>,
+}
+
+struct CachedFile {
+    stamp: (u64, Option<std::time::SystemTime>),
+    bytes: Bytes,
 }
 
 impl DocumentWorld {
@@ -210,6 +220,7 @@ impl DocumentWorld {
             root: path.parent().map(Path::to_path_buf).unwrap_or_default(),
             source: Source::new(file_id_for(path), text),
             read: Mutex::new(Vec::new()),
+            file_cache: Mutex::new(HashMap::new()),
             packages: package_folders(),
             package_roots: Mutex::new(HashMap::new()),
         }
@@ -336,11 +347,44 @@ impl World for DocumentWorld {
                 format!("“{name}” is too large to be part of a document").into(),
             )));
         }
+        let stamp = (metadata.len(), metadata.modified().ok());
+        {
+            let cache = self
+                .file_cache
+                .lock()
+                .expect("a compile reads files on one thread");
+            if let Some(cached) = cache.get(&path)
+                && cached.stamp == stamp
+            {
+                if crate::perf::enabled() {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    crate::perf::mark(&format!(
+                        "typst_file_cache_hit {} bytes={}",
+                        name,
+                        cached.bytes.len()
+                    ));
+                }
+                self.read
+                    .lock()
+                    .expect("a compile reads files on one thread")
+                    .push(path);
+                return Ok(cached.bytes.clone());
+            }
+        }
         let bytes = std::fs::read(&path).map_err(|err| FileError::from_io(err, &path))?;
         if crate::perf::enabled() {
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let is_img = matches!(
-                path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .as_deref(),
                 Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg")
             );
             crate::perf::mark(&format!(
@@ -349,11 +393,22 @@ impl World for DocumentWorld {
                 bytes.len()
             ));
         }
+        let typed = Bytes::new(bytes);
+        self.file_cache
+            .lock()
+            .expect("a compile reads files on one thread")
+            .insert(
+                path.clone(),
+                CachedFile {
+                    stamp,
+                    bytes: typed.clone(),
+                },
+            );
         self.read
             .lock()
             .expect("a compile reads files on one thread")
             .push(path);
-        Ok(Bytes::new(bytes))
+        Ok(typed)
     }
 
     fn font(&self, index: usize) -> Option<Font> {

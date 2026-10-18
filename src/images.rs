@@ -162,7 +162,10 @@ fn decode_data_url(data: &str) -> Option<Arc<Image>> {
     let key = content_hash(data);
     let cache = CACHE.get_or_init(|| Mutex::new(InlineImageCache::new()));
     if let Some(image) = cache.lock().ok()?.get(key) {
-        crate::perf::mark(&format!("inline_image_cache_hit bytes={}", image.bytes().len()));
+        crate::perf::mark(&format!(
+            "inline_image_cache_hit bytes={}",
+            image.bytes().len()
+        ));
         return Some(image);
     }
 

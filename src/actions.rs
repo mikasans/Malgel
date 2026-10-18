@@ -307,11 +307,16 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-h", ReplaceInFiles, None),
         KeyBinding::new("secondary-alt-c", CopyRichText, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
-        // No key-context: the command palette resolves chords only for
-        // global (or currently focused) bindings; Workspace is not in the
-        // palette dialog's context stack, so Toggle Terminal would otherwise
-        // show no tip. Same pattern as Toggle Side Bar / preview.
-        KeyBinding::new("secondary-`", SummonTerminal, None),
+        // Terminal chords match VS Code and must stay platform-correct:
+        // Ctrl+` toggles on Windows/Linux *and* macOS (not Cmd+`, which is
+        // window-cycle on macOS). Ctrl+Shift+` always creates a new terminal.
+        // macOS also gets Cmd+J (Toggle Panel), which commonly reveals the
+        // terminal — a separate chord, never shared with Ctrl+`.
+        // No key-context: palette tip resolution (same as Toggle Side Bar).
+        KeyBinding::new("ctrl-`", SummonTerminal, None),
+        KeyBinding::new("ctrl-shift-`", NewTerminal, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-j", SummonTerminal, None),
         KeyBinding::new("secondary-q", Quit, None),
         // No key-context: layout must switch even when the Typst/PDF viewer or
         // Markdown preview holds focus (those entities do not inherit Workspace).

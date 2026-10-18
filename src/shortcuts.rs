@@ -26,7 +26,12 @@ pub const SHORTCUTS: &[ShortcutRow] = &[
     ShortcutRow {
         command: "Toggle Terminal",
         when: "Workspace",
-        chord: "Ctrl+`  (⌘`)",
+        chord: "Ctrl+`  (macOS also ⌘J)",
+    },
+    ShortcutRow {
+        command: "New Terminal",
+        when: "Workspace",
+        chord: "Ctrl+Shift+`",
     },
     ShortcutRow {
         command: "Toggle Side Bar",
