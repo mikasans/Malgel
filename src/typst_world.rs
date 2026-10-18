@@ -532,7 +532,7 @@ mod tests {
 ";
         std::fs::write(&path, source).unwrap();
         let mut live = crate::typst_live::LiveCompiler::new(&path);
-        let compiled = live.compile(&source, 1);
+        let compiled = live.compile(source, 1);
         assert!(
             compiled.pages.as_ref().is_some_and(|p| !p.is_empty()),
             "Chinese Typst preview failed: {:?}",
