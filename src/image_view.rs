@@ -92,9 +92,9 @@ pub fn load_image(path: &Path, bytes: Vec<u8>) -> Result<(Arc<Image>, f32, f32),
 /// Pixels decoded for display at most: 4096 × 4096, 64 MB as RGBA.
 const MAX_DECODED_PIXELS: f32 = 4096. * 4096.;
 
-/// `bytes` decoded and scaled to fit 4096 × 4096, as JPEG for the display
-/// cache (smaller than PNG; fidelity OK to trade). Full-size bitmap lives
-/// only while this runs.
+/// `bytes` decoded and scaled to fit 4096 × 4096, as lossless WebP (or
+/// JPEG/PNG fallback) for the display cache. Full-size bitmap lives only
+/// while this runs.
 fn downscaled_display(bytes: &[u8], format: ImageFormat) -> Option<(ImageFormat, Vec<u8>)> {
     let fmt = match format {
         ImageFormat::Png => image::ImageFormat::Png,
@@ -121,8 +121,8 @@ fn downscaled_display(bytes: &[u8], format: ImageFormat) -> Option<(ImageFormat,
         image::DynamicImage::ImageRgba8(rgba) => image::imageops::thumbnail(&rgba, tw, th),
         other => other.thumbnail_exact(tw, th).into_rgba8(),
     });
-    if let Some(jpeg) = crate::display_raster::encode_dynamic_jpeg(&small) {
-        return Some((ImageFormat::Jpeg, jpeg));
+    if let Some(encoded) = crate::display_raster::encode_dynamic_display(&small) {
+        return Some(encoded);
     }
     let mut out = std::io::Cursor::new(Vec::new());
     small.write_to(&mut out, image::ImageFormat::Png).ok()?;

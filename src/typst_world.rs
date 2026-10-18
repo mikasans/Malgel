@@ -15,10 +15,7 @@ use typst::{
     diag::{FileError, FileResult},
     foundations::{Bytes, Datetime, Duration},
     syntax::{FileId, Source},
-    text::{
-        Coverage, Font, FontBook, FontFlags, FontInfo, FontStretch, FontStyle, FontVariant,
-        FontWeight,
-    },
+    text::{Font, FontBook, FontInfo},
     utils::LazyHash,
 };
 use typst_layout::PagedDocument;
@@ -99,23 +96,10 @@ pub static SYSTEM_FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
     db
 });
 
-/// Latin / common punctuation coverage for metadata-only system faces.
-///
-/// **Do not** advertise the full Unicode plane here: that made Typst pick an
-/// early Latin/emoji face for CJK codepoints (it trusted the fake cmap), load
-/// it, and leave 中文 as tofu / wrong glyphs. Real CJK faces get accurate
-/// coverage via [`FontInfo::iter`] below.
-static LATINISH_COVERAGE: LazyLock<Coverage> = LazyLock::new(|| {
-    // Basic Latin + Latin-1 Supplement + a few punctuation/symbol blocks that
-    // Western UI fonts commonly cover — enough for fallback of ASCII markup.
-    Coverage::from_vec(
-        (0x20..0xFF)
-            .chain([0x2013, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2026])
-            .collect(),
-    )
-});
-
 /// Family / path names that strongly suggest a CJK or emoji face.
+///
+/// Used only by tests that assert CJK faces were indexed with real coverage.
+#[cfg(test)]
 fn is_cjk_or_emoji_face(family: &str, path: &std::path::Path) -> bool {
     let family = family.to_ascii_lowercase();
     let path = path.to_string_lossy().to_ascii_lowercase();
@@ -167,124 +151,54 @@ fn is_cjk_or_emoji_face(family: &str, path: &std::path::Path) -> bool {
     NEEDLES.iter().any(|n| hay.contains(n))
 }
 
-/// Build Typst [`FontInfo`] from fontdb face metadata.
-///
-/// Ordinary faces stay metadata-only (no `std::fs::read`) with Latin-ish
-/// coverage. CJK / emoji candidates read real [`FontInfo::iter`] coverage so
-/// Typst's glyph fallback can find them — that is a handful of large fonts,
-/// not the whole system catalogue.
-fn font_infos_for_face(face: &fontdb::FaceInfo) -> Vec<(FontInfo, u32)> {
-    let family = match face.families.first() {
-        Some((name, _)) => name.clone(),
-        None => return Vec::new(),
-    };
-    let path = match &face.source {
-        fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path,
-        _ => return Vec::new(),
-    };
-    if is_cjk_or_emoji_face(&family, path) {
-        let Ok(data) = std::fs::read(path) else {
-            return Vec::new();
-        };
-        // Prefer the collection index fontdb already resolved; fall back to
-        // every face in the file when the index is missing from FontInfo::iter.
-        let mut infos: Vec<(FontInfo, u32)> = FontInfo::iter(&data)
-            .enumerate()
-            .map(|(ix, info)| (info, ix as u32))
-            .collect();
-        if infos.iter().any(|(_, ix)| *ix == face.index) {
-            infos.retain(|(_, ix)| *ix == face.index);
-        }
-        return infos;
-    }
-    let style = match face.style {
-        fontdb::Style::Normal => FontStyle::Normal,
-        fontdb::Style::Italic => FontStyle::Italic,
-        fontdb::Style::Oblique => FontStyle::Oblique,
-    };
-    let mut flags = FontFlags::empty();
-    if face.monospaced {
-        flags.insert(FontFlags::MONOSPACE);
-    }
-    vec![(
-        FontInfo {
-            family,
-            variant: FontVariant {
-                style,
-                weight: FontWeight::from(face.weight),
-                stretch: FontStretch::from_number(face.stretch.to_number()),
-            },
-            flags,
-            axes: Vec::new(),
-            coverage: LATINISH_COVERAGE.clone(),
-        },
-        face.index,
-    )]
-}
-
 /// The bundled fonts first, then the system's, so documents keep their
 /// designed look while scripts and symbols the bundled fonts lack (CJK,
 /// emoji, …) fall back to installed fonts.
 ///
-/// Most faces are indexed from fontdb metadata only. CJK / emoji faces get a
-/// one-time real cmap read so Chinese / Japanese / Korean preview shapes
-/// correctly without restoring the old GB-heap eager scan of every font.
+/// Every system face is indexed with Typst's own [`FontInfo`] (family trim,
+/// flags, axes, real cmap coverage) so `#set text(font: …)` and glyph
+/// fallback match `typst` / LaTeX-like selection — not a fabricated Latin-ish
+/// stub that made arbitrary faces look wrong. Face bytes are read through
+/// fontdb's memmap ([`fontdb::Database::with_face_data`]) once per file while
+/// building the book; the heap keeps only `FontInfo` + path slots until Typst
+/// selects a face (then [`FontSlot`] loads it).
 pub static DOCUMENT_FONTS: LazyLock<FontSet> = LazyLock::new(|| {
     let _span = crate::perf::Span::new("document_fonts_index");
     let (mut book, mut slots) = bundled_fonts();
-    let mut cjk_files = 0usize;
-    // One read per CJK/emoji file — TTC collections expose many fontdb faces.
-    let mut cjk_infos: HashMap<PathBuf, Vec<FontInfo>> = HashMap::new();
+    // One memmap parse per font file — TTC collections expose many faces.
+    let mut infos_by_path: HashMap<PathBuf, Vec<FontInfo>> = HashMap::new();
+    let mut files_parsed = 0usize;
     for face in SYSTEM_FONT_DB.faces() {
         let path = match &face.source {
             fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path.clone(),
             _ => continue,
         };
-        let family = match face.families.first() {
-            Some((name, _)) => name.as_str(),
-            None => continue,
-        };
-        if is_cjk_or_emoji_face(family, &path) {
-            if !cjk_infos.contains_key(&path) {
-                match std::fs::read(&path) {
-                    Ok(data) => {
-                        cjk_files += 1;
-                        cjk_infos.insert(path.clone(), FontInfo::iter(&data).collect());
-                    }
-                    Err(_) => {
-                        cjk_infos.insert(path.clone(), Vec::new());
-                    }
-                }
-            }
-            let Some(infos) = cjk_infos.get(&path) else {
-                continue;
-            };
-            let Some(info) = infos.get(face.index as usize).cloned() else {
-                continue;
-            };
-            book.push(info);
-            slots.push(FontSlot::System {
-                path,
-                index: face.index,
-                font: OnceLock::new(),
-            });
+        if !infos_by_path.contains_key(&path) {
+            let infos = SYSTEM_FONT_DB
+                .with_face_data(face.id, |data, _| FontInfo::iter(data).collect::<Vec<_>>())
+                .unwrap_or_default();
+            files_parsed += 1;
+            infos_by_path.insert(path.clone(), infos);
+        }
+        let Some(infos) = infos_by_path.get(&path) else {
             continue;
-        }
-        for (info, index) in font_infos_for_face(face) {
-            book.push(info);
-            slots.push(FontSlot::System {
-                path: path.clone(),
-                index,
-                font: OnceLock::new(),
-            });
-        }
+        };
+        let Some(info) = infos.get(face.index as usize).cloned() else {
+            continue;
+        };
+        book.push(info);
+        slots.push(FontSlot::System {
+            path,
+            index: face.index,
+            font: OnceLock::new(),
+        });
     }
     let set = FontSet {
         book: LazyHash::new(book),
         slots,
     };
     crate::perf::mark(&format!(
-        "document_fonts_slots={} cjk_or_emoji_files={cjk_files}",
+        "document_fonts_slots={} font_files_parsed={files_parsed}",
         set.slots.len()
     ));
     set
@@ -459,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn system_font_index_avoids_eager_heap_reads() {
+    fn system_font_index_uses_typst_fontinfo() {
         use std::time::Instant;
         let t0 = Instant::now();
         let faces = SYSTEM_FONT_DB.faces().count();
@@ -482,8 +396,94 @@ mod tests {
         );
         assert!(
             index.as_secs() < 5,
-            "DOCUMENT_FONTS index took {index:?}; expected path/metadata-only"
+            "DOCUMENT_FONTS index took {index:?}; expected memmap FontInfo index"
         );
+    }
+
+    #[test]
+    fn document_fonts_use_real_typst_fontinfo() {
+        let fonts = &*DOCUMENT_FONTS;
+        let mut book_len = 0usize;
+        while fonts.book.info(book_len).is_some() {
+            book_len += 1;
+        }
+        assert!(book_len > 1, "empty font book");
+        // Bundled New Computer Modern / Libertinus should expose MATH or SERIF
+        // flags from real FontInfo — fabricated stubs never set those.
+        let has_math_or_serif = (0..book_len).any(|ix| {
+            fonts.book.info(ix).is_some_and(|info| {
+                info.flags.contains(typst::text::FontFlags::MATH)
+                    || info.flags.contains(typst::text::FontFlags::SERIF)
+            })
+        });
+        assert!(
+            has_math_or_serif,
+            "expected real FontInfo flags (MATH/SERIF) from Typst-parsed faces"
+        );
+        // A Latin-named system face must not advertise the old fake Latin-ish
+        // stub alone: real cmap coverage for 'A' is expected, and family names
+        // come from Typst's trim (not raw fontdb strings with style suffixes).
+        let latin_ok = (0..book_len).any(|ix| {
+            fonts.book.info(ix).is_some_and(|info| {
+                info.coverage.contains(u32::from(b'A'))
+                    && !info.family.to_ascii_lowercase().contains("bold")
+            })
+        });
+        assert!(
+            latin_ok,
+            "expected Typst FontInfo with real coverage for Latin"
+        );
+    }
+
+    #[test]
+    fn arbitrary_system_font_selects_like_typst() {
+        // Pick a real system family Typst indexed (not a fabricated stub).
+        let fonts = &*DOCUMENT_FONTS;
+        let mut book_len = 0usize;
+        while fonts.book.info(book_len).is_some() {
+            book_len += 1;
+        }
+        let family = (0..book_len).find_map(|ix| {
+            let info = fonts.book.info(ix)?;
+            let name = info.family.as_str();
+            let lower = name.to_ascii_lowercase();
+            // Prefer a distinctive installed face over bundled Liber* / New CM.
+            if lower.contains("dejavu sans")
+                || lower.contains("liberation sans")
+                || lower.contains("noto sans")
+                || lower.contains("inter")
+                || lower.contains("passion one")
+            {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        });
+        let Some(family) = family else {
+            eprintln!("skip arbitrary_system_font_selects_like_typst: no distinctive system face");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("malgel-arbfont-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("arb.typ");
+        let source = format!(
+            "#set text(font: {family:?}, size: 14pt)\n\nHello from {{family}}.\n\nThe quick brown fox.\n"
+        );
+        std::fs::write(&path, &source).unwrap();
+        let mut live = crate::typst_live::LiveCompiler::new(&path);
+        let compiled = live.compile(&source, 1);
+        assert!(
+            compiled.pages.as_ref().is_some_and(|p| !p.is_empty()),
+            "Typst failed to shape with font {family:?}: {:?}",
+            compiled.diagnostics
+        );
+        let img = &compiled.pages.as_ref().unwrap()[0].image;
+        let b = img.bytes();
+        assert!(
+            b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP",
+            "live sheet should be WebP for font {family}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -532,7 +532,7 @@ mod tests {
 ";
         std::fs::write(&path, source).unwrap();
         let mut live = crate::typst_live::LiveCompiler::new(&path);
-        let compiled = live.compile(source, 1);
+        let compiled = live.compile(&source, 1);
         assert!(
             compiled.pages.as_ref().is_some_and(|p| !p.is_empty()),
             "Chinese Typst preview failed: {:?}",

@@ -14,9 +14,9 @@ use std::{
 };
 
 use gpui_kit::{
-    AppContext as _, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, Modifiers,
-    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Render, SharedString,
+    AppContext as _, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
+    Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle,
     Window,
     assets::IconName,
@@ -1602,20 +1602,43 @@ impl Render for FileTree {
             .text_xs()
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.muted_foreground)
-            .child(
+            .child({
+                let tip = if full_path.is_empty() {
+                    SharedString::from("")
+                } else {
+                    SharedString::from(format!("{full_path} — click to copy"))
+                };
+                let root_for_copy = self.root.clone();
                 div()
                     .id("tree-root-name")
                     .min_w_0()
                     .flex_1()
                     .truncate()
+                    .when(!full_path.is_empty(), |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.text_color(theme.foreground))
+                            .tooltip(move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(tip.clone())
+                                    .build(window, cx)
+                            })
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                let Some(root) = root_for_copy.clone() else {
+                                    return;
+                                };
+                                let abs = root
+                                    .canonicalize()
+                                    .unwrap_or(root)
+                                    .to_string_lossy()
+                                    .into_owned();
+                                cx.write_to_clipboard(ClipboardItem::new_string(abs.clone()));
+                                window.push_notification(
+                                    Notification::info(format!("Copied {abs}")),
+                                    cx,
+                                );
+                            }))
+                    })
                     .child(name.to_uppercase())
-                    .when(!full_path.is_empty(), |name| {
-                        name.tooltip(move |window, cx| {
-                            gpui_kit::component::tooltip::Tooltip::new(full_path.clone())
-                                .build(window, cx)
-                        })
-                    }),
-            )
+            })
             .relative()
             // The actions float over the end of the name instead of keeping
             // their width while hidden, which cut a long name short.

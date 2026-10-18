@@ -780,7 +780,10 @@ mod tests {
         ));
         assert!(svg.ends_with(r#"<rect width="10" height="10"/></svg>"#));
         let (fmt, bytes) = draw_view(&drawn, view).unwrap();
-        assert!(matches!(fmt, ImageFormat::Jpeg | ImageFormat::Png));
+        assert!(matches!(
+            fmt,
+            ImageFormat::Webp | ImageFormat::Jpeg | ImageFormat::Png
+        ));
         assert!(!bytes.is_empty());
     }
 

@@ -66,8 +66,8 @@ fn sheet_image(svg: String, width_pt: f32, height_pt: f32) -> Arc<Image> {
     }
 }
 
-/// Rasterize a Typst SVG page for the live sheet cache. Prefers JPEG over PNG
-/// so cached `Arc<Image>` payloads stay small (display fidelity OK to trade).
+/// Rasterize a Typst SVG page for the live sheet cache. Prefers lossless WebP
+/// so cached `Arc<Image>` payloads stay small (see `display_raster`).
 fn rasterize_svg_display(
     svg: &str,
     width_pt: f32,
@@ -834,8 +834,10 @@ mod tests {
         );
         let b = img.bytes();
         assert!(
-            b.starts_with(&[0xFF, 0xD8]) || (b.len() >= 4 && b[0] == 0x89 && &b[1..4] == b"PNG"),
-            "expected JPEG or PNG sheet cache encoding"
+            (b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP")
+                || b.starts_with(&[0xFF, 0xD8])
+                || (b.len() >= 4 && b[0] == 0x89 && &b[1..4] == b"PNG"),
+            "expected WebP, JPEG, or PNG sheet cache encoding"
         );
     }
 }
