@@ -1448,6 +1448,8 @@ impl DocumentView {
                     );
                 }
                 if let Some(pages) = compiled.pages {
+                    let n = pages.len();
+                    let first = !live.compiled_once;
                     let document = crate::pdf_view::PdfDocument::from_rendered(
                         pages
                             .into_iter()
@@ -1456,6 +1458,17 @@ impl DocumentView {
                     );
                     live.view.update(cx, |view, cx| view.reload(document, cx));
                     live.compiled_once = true;
+                    if first {
+                        crate::perf::mark(&format!(
+                            "first_typst_preview_pages_applied pages={n} redrawn={}",
+                            compiled.redrawn
+                        ));
+                    } else {
+                        crate::perf::mark(&format!(
+                            "warm_typst_preview_pages_applied pages={n} redrawn={}",
+                            compiled.redrawn
+                        ));
+                    }
                 }
                 live.diagnostics = compiled.diagnostics;
                 if compiled.revision == current {

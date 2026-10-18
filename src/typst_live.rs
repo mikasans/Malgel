@@ -49,6 +49,11 @@ const IMPORT_POLL: Duration = Duration::from_secs(1);
 /// pages sharp on HiDPI without handing huge SVGs to the UI paint path.
 const SHEET_SCALE: f32 = 2.;
 
+/// Longest edge of a live-preview page raster. Poster-sized pages are
+/// downsampled so a single sheet cannot allocate multi‑hundred‑MiB
+/// pixmaps on the compiler thread (same bound as Mermaid display).
+const MAX_SHEET_EDGE: u32 = 2048;
+
 /// Turn a Typst SVG page into a PNG `Image` on the compiler thread so GPUI
 /// never runs resvg on the UI thread for live preview pages.
 fn sheet_image(svg: String, width_pt: f32, height_pt: f32) -> Arc<Image> {
@@ -64,8 +69,19 @@ fn sheet_image(svg: String, width_pt: f32, height_pt: f32) -> Arc<Image> {
 fn rasterize_svg_png(svg: &str, width_pt: f32, height_pt: f32) -> Option<Vec<u8>> {
     let options = resvg::usvg::Options::default();
     let tree = resvg::usvg::Tree::from_str(svg, &options).ok()?;
-    let width = ((width_pt * SHEET_SCALE).ceil() as u32).max(1);
-    let height = ((height_pt * SHEET_SCALE).ceil() as u32).max(1);
+    let mut width = ((width_pt * SHEET_SCALE).ceil() as u32).max(1);
+    let mut height = ((height_pt * SHEET_SCALE).ceil() as u32).max(1);
+    let longest = width.max(height);
+    if longest > MAX_SHEET_EDGE {
+        let scale = MAX_SHEET_EDGE as f32 / longest as f32;
+        width = ((width as f32) * scale).round().max(1.) as u32;
+        height = ((height as f32) * scale).round().max(1.) as u32;
+    }
+    let px_bytes = (width as u64) * (height as u64) * 4;
+    let _span = crate::perf::Span::new("sheet_raster").detail(format!(
+        "{width}x{height} pixmap≈{:.1}MiB",
+        px_bytes as f64 / (1024.0 * 1024.0)
+    ));
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
     // Fit the SVG's own size into the pixmap. A plain SHEET_SCALE assumept=px
     // clip when typst_svg's user space does not match page points 1:1.
@@ -73,7 +89,9 @@ fn rasterize_svg_png(svg: &str, width_pt: f32, height_pt: f32) -> Option<Vec<u8>
     let sy = height as f32 / tree.size().height().max(1.);
     let transform = resvg::tiny_skia::Transform::from_scale(sx, sy);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-    pixmap.encode_png().ok()
+    let png = pixmap.encode_png().ok();
+    drop(_span);
+    png
 }
 
 /// A drawn page: its size in points and its sheet.
@@ -162,6 +180,7 @@ impl LiveCompiler {
     /// Compile `text`, drawing only pages that changed.
     pub fn compile(&mut self, text: &str, revision: usize) -> Compiled {
         let started = Instant::now();
+        crate::perf::mark(&format!("typst_compile_begin rev={revision}"));
         // Same source as last success: reuse sheets — no recompile, no redraw.
         if text == self.text && self.document.is_some() && !self.sheets.is_empty() {
             self.revision = revision;
@@ -185,6 +204,11 @@ impl LiveCompiler {
                     })
                     .collect()
             });
+            crate::perf::mark(&format!(
+                "typst_compile_reuse_sheets pages={} elapsed_ms={:.1}",
+                pages.as_ref().map_or(0, Vec::len),
+                started.elapsed().as_secs_f64() * 1000.0
+            ));
             return Compiled {
                 revision,
                 pages,
@@ -199,7 +223,10 @@ impl LiveCompiler {
         }
         self.revision = revision;
         self.world.set_text(text);
-        let warned = typst::compile::<PagedDocument>(&self.world);
+        let warned = {
+            let _span = crate::perf::Span::new("typst_compile_core");
+            typst::compile::<PagedDocument>(&self.world)
+        };
         let mut diagnostics: Vec<LiveDiagnostic> = warned
             .warnings
             .iter()
@@ -251,6 +278,11 @@ impl LiveCompiler {
         self.read = self.world.read_files();
         self.stamp = Some(crate::typst_preview::stamp_of(&self.read));
         let elapsed = started.elapsed();
+        crate::perf::mark(&format!(
+            "typst_compile_done rev={revision} redrawn={redrawn} pages={} elapsed_ms={:.1}",
+            pages.as_ref().map_or(0, Vec::len),
+            elapsed.as_secs_f64() * 1000.0
+        ));
         log::debug!(
             "typst live: compile {:.1} ms ({} page(s) redrawn, revision {revision})",
             elapsed.as_secs_f64() * 1000.,
@@ -639,6 +671,22 @@ mod tests {
             "typst live: 31 pages, mean {:?}, worst {:?}",
             total / 10,
             worst
+        );
+    }
+
+    #[test]
+    fn large_page_sheet_is_downsampled() {
+        let mut live = compiler("poster");
+        // 80cm square → uncapped 2× raster would be ~4535² (~78 MiB RGBA).
+        let text = "#set page(width: 80cm, height: 80cm, margin: 1cm)\n= Poster\n";
+        let compiled = live.compile(text, 1);
+        let pages = compiled.pages.expect("poster should compile");
+        assert_eq!(pages.len(), 1);
+        let img = &pages[0].image;
+        assert!(
+            img.bytes().len() < 8 * 1024 * 1024,
+            "poster sheet PNG too large: {} bytes",
+            img.bytes().len()
         );
     }
 }

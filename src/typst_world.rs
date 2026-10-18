@@ -43,8 +43,13 @@ impl FontSlot {
             FontSlot::Bundled(font) => Some(font.clone()),
             FontSlot::System { path, index, font } => font
                 .get_or_init(|| {
+                    let _span = crate::perf::Span::new("font_slot_first_load").detail(
+                        format!("{} face={index}", path.display()),
+                    );
                     let data = std::fs::read(path).ok()?;
-                    Font::new(Bytes::new(data), *index)
+                    let font = Font::new(Bytes::new(data), *index);
+                    drop(_span);
+                    font
                 })
                 .clone(),
         }
@@ -87,9 +92,12 @@ pub static BUNDLED_FONTS: LazyLock<FontSet> = LazyLock::new(|| {
 /// memmap-backed scan; never copies font files into the heap. Typst and Mermaid
 /// both reuse this so a second full disk scan never runs.
 pub static SYSTEM_FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
+    let _span = crate::perf::Span::new("system_font_db_scan");
     let mut database = fontdb::Database::new();
     database.load_system_fonts();
-    Arc::new(database)
+    let db = Arc::new(database);
+    crate::perf::mark(&format!("system_font_db_faces={}", db.faces().count()));
+    db
 });
 
 /// Coverage claim used when indexing system faces from fontdb metadata only.
@@ -135,6 +143,7 @@ fn font_info_from_face(face: &fontdb::FaceInfo) -> Option<FontInfo> {
 /// Font *bytes* are never `std::fs::read` into a `Vec` here — that happens
 /// once inside [`FontSlot`] when Typst actually selects the face.
 pub static DOCUMENT_FONTS: LazyLock<FontSet> = LazyLock::new(|| {
+    let _span = crate::perf::Span::new("document_fonts_index");
     let (mut book, mut slots) = bundled_fonts();
     for face in SYSTEM_FONT_DB.faces() {
         let path = match &face.source {
@@ -151,10 +160,12 @@ pub static DOCUMENT_FONTS: LazyLock<FontSet> = LazyLock::new(|| {
             font: OnceLock::new(),
         });
     }
-    FontSet {
+    let set = FontSet {
         book: LazyHash::new(book),
         slots,
-    }
+    };
+    crate::perf::mark(&format!("document_fonts_slots={}", set.slots.len()));
+    set
 });
 
 /// Files available to the document, keyed by their path from the project

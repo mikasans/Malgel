@@ -42,6 +42,7 @@ mod title_menu_bar;
 mod typst_live;
 mod typst_preview;
 mod typst_world;
+mod perf;
 mod workspace;
 mod zoom;
 
@@ -153,6 +154,7 @@ fn log_level(value: Option<&str>) -> log::LevelFilter {
 }
 
 fn main() {
+    crate::perf::init();
     let _ = log::set_boxed_logger(Box::new(StdErrLogger {
         quiet: std::env::var_os("RUST_LOG").is_none(),
     }));
@@ -366,11 +368,14 @@ fn open_window(
             handle: window.window_handle(),
             workspace: workspace.downgrade(),
         });
+        crate::perf::mark("window_workspace_built");
         workspace
     });
     if let Err(err) = result {
         eprintln!("malgel: could not open a window: {err:#}");
         cx.quit();
+    } else {
+        crate::perf::mark("open_window_ok");
     }
 }
 

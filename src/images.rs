@@ -162,6 +162,7 @@ fn decode_data_url(data: &str) -> Option<Arc<Image>> {
     let key = content_hash(data);
     let cache = CACHE.get_or_init(|| Mutex::new(InlineImageCache::new()));
     if let Some(image) = cache.lock().ok()?.get(key) {
+        crate::perf::mark(&format!("inline_image_cache_hit bytes={}", image.bytes().len()));
         return Some(image);
     }
 
@@ -169,6 +170,10 @@ fn decode_data_url(data: &str) -> Option<Arc<Image>> {
     let format = ImageFormat::from_mime_type(mime)
         .or_else(|| (mime == "image/svg").then_some(ImageFormat::Svg))?;
 
+    crate::perf::mark(&format!(
+        "inline_image_cache_miss mime={mime} bytes={}",
+        bytes.len()
+    ));
     let image = Arc::new(Image::from_bytes(format, bytes));
     if let Ok(mut cache) = cache.lock() {
         cache.insert(key, image.clone());
