@@ -53,7 +53,7 @@ use crate::{
     document::{self, LineEnding, display_name},
     document_view::{DocumentEvent, DocumentView},
     docx, export,
-    file_icon::{file_icon, file_icon_color, folder_icon_color, activity_icon_color, ActivityIcon},
+    file_icon::{ActivityIcon, activity_icon_color, file_icon, file_icon_color, folder_icon_color},
     file_tree::{
         FileTree, FileTreeEvent, TreeDrag, absolute_paths_for_clipboard, invert_key_held,
         relative_paths_for_clipboard,
@@ -2403,19 +2403,41 @@ impl Workspace {
         window.defer(cx, move |window, cx| focus.focus(window, cx));
         let workspace = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            let items: Vec<(usize, String)> = recent
+            // Icons (not text "File"/"Folder") distinguish entries, matching
+            // Quick Open / Explorer — VS Code–like visual language.
+            let items: Vec<(usize, String, IconName, gpui_kit::Hsla)> = recent
                 .iter()
                 .enumerate()
                 .map(|(ix, path)| {
                     let name = display_name(Some(path));
-                    let kind = if path.is_dir() { "Folder" } else { "File" };
-                    (ix, format!("{name}  —  {kind}  —  {}", path.display()))
+                    let label = format!("{name}  —  {}", path.display());
+                    let (icon, color) = if path.is_dir() {
+                        (IconName::Folder, folder_icon_color())
+                    } else {
+                        (file_icon(path), file_icon_color(path))
+                    };
+                    (ix, label, icon, color)
                 })
                 .collect();
-            let pick_items = items.clone();
+            let pick_items: Vec<(usize, String)> = items
+                .iter()
+                .map(|(ix, label, _, _)| (*ix, label.clone()))
+                .collect();
             let mut group = CommandGroup::new().label("Recent");
-            for (_, label) in &items {
-                group = group.item(CommandItem::new().label(label.clone()));
+            for (_, label, icon, color) in &items {
+                group = group.item(
+                    CommandItem::new()
+                        .label(label.clone())
+                        .keywords([
+                            label.as_str(),
+                            if *icon == IconName::Folder {
+                                "folder"
+                            } else {
+                                "file"
+                            },
+                        ])
+                        .icon(Icon::new(*icon).text_color(*color)),
+                );
             }
             dialog.close_button(false).p_0().child(esc_closes(
                 Command::new(&state)
