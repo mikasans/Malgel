@@ -338,9 +338,15 @@ impl World for DocumentWorld {
         }
         let bytes = std::fs::read(&path).map_err(|err| FileError::from_io(err, &path))?;
         if crate::perf::enabled() {
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let is_img = matches!(
-                path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .as_deref(),
                 Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg")
             );
             crate::perf::mark(&format!(

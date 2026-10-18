@@ -43,9 +43,8 @@ impl FontSlot {
             FontSlot::Bundled(font) => Some(font.clone()),
             FontSlot::System { path, index, font } => font
                 .get_or_init(|| {
-                    let _span = crate::perf::Span::new("font_slot_first_load").detail(
-                        format!("{} face={index}", path.display()),
-                    );
+                    let _span = crate::perf::Span::new("font_slot_first_load")
+                        .detail(format!("{} face={index}", path.display()));
                     let data = std::fs::read(path).ok()?;
                     let font = Font::new(Bytes::new(data), *index);
                     drop(_span);
