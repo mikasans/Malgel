@@ -17,8 +17,9 @@ use image::codecs::webp::WebPEncoder;
 /// JPEG quality if WebP encode fails (legacy / fallback).
 const DISPLAY_JPEG_QUALITY: u8 = 82;
 
-/// Encode an RGBA pixmap for display cache. Prefers lossless WebP; then JPEG;
-/// then PNG.
+/// Encode an RGBA pixmap for display cache. Prefers lossless WebP for
+/// page-like sheets (Typst / Mermaid); falls back to JPEG when it is
+/// meaningfully smaller (noisy photos), then PNG.
 pub fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<(ImageFormat, Vec<u8>)> {
     if width == 0 || height == 0 {
         return None;
@@ -30,19 +31,31 @@ pub fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<(ImageFormat,
         return None;
     }
     let slice = &rgba[..expected];
-    if let Some(webp) = encode_webp_lossless_rgba(width, height, slice) {
-        return Some((ImageFormat::Webp, webp));
+    let webp = encode_webp_lossless_rgba(width, height, slice);
+    let jpeg = encode_jpeg_from_rgba(width, height, slice);
+    match (webp, jpeg) {
+        (Some(webp), Some(jpeg)) if jpeg_beats_webp(&jpeg, &webp) => {
+            Some((ImageFormat::Jpeg, jpeg))
+        }
+        (Some(webp), _) => Some((ImageFormat::Webp, webp)),
+        (None, Some(jpeg)) => Some((ImageFormat::Jpeg, jpeg)),
+        (None, None) => {
+            // PNG fallback keeps alpha if both preferred codecs fail.
+            let png =
+                image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width, height, slice.to_vec())?;
+            let mut out = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(png)
+                .write_to(&mut out, image::ImageFormat::Png)
+                .ok()?;
+            Some((ImageFormat::Png, out.into_inner()))
+        }
     }
-    if let Some(jpeg) = encode_jpeg_from_rgba(width, height, slice) {
-        return Some((ImageFormat::Jpeg, jpeg));
-    }
-    // PNG fallback keeps alpha if both preferred codecs fail.
-    let png = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width, height, slice.to_vec())?;
-    let mut out = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(png)
-        .write_to(&mut out, image::ImageFormat::Png)
-        .ok()?;
-    Some((ImageFormat::Png, out.into_inner()))
+}
+
+/// JPEG wins when it is at least ~12% smaller (plus a small absolute margin),
+/// so photo-like caches stay compact while flat document sheets keep WebP.
+fn jpeg_beats_webp(jpeg: &[u8], webp: &[u8]) -> bool {
+    jpeg.len() + 512 < webp.len() && (jpeg.len() as f64) < (webp.len() as f64) * 0.88
 }
 
 /// Lossless WebP (VP8L) — best RAM for document/diagram display caches under
@@ -158,15 +171,35 @@ mod tests {
     }
 
     #[test]
-    fn webp_preferred_on_photoish_rgba() {
+    fn photoish_rgba_picks_smaller_of_webp_or_jpeg() {
         let w = 128u32;
         let h = 128u32;
         let rgba = sample_rgba(w, h);
         let (fmt, bytes) = encode_rgba(w, h, &rgba).expect("encode");
-        assert_eq!(fmt, ImageFormat::Webp);
-        assert!(bytes.starts_with(b"RIFF"));
+        assert!(
+            matches!(fmt, ImageFormat::Webp | ImageFormat::Jpeg),
+            "unexpected {fmt:?}"
+        );
+        assert!(!bytes.is_empty());
+        let jpeg = encode_jpeg_from_rgba(w, h, &rgba).expect("jpeg");
+        let webp = encode_webp_lossless_rgba(w, h, &rgba).expect("webp");
+        if jpeg_beats_webp(&jpeg, &webp) {
+            assert_eq!(fmt, ImageFormat::Jpeg);
+            assert_eq!(bytes, jpeg);
+        } else {
+            assert_eq!(fmt, ImageFormat::Webp);
+            assert_eq!(bytes, webp);
+        }
         let _ = encode_dynamic_jpeg(&image::DynamicImage::ImageRgba8(
             image::ImageBuffer::from_raw(w, h, rgba).unwrap(),
         ));
+    }
+
+    #[test]
+    fn jpeg_beats_webp_needs_meaningful_savings() {
+        assert!(!jpeg_beats_webp(&[0; 10_000], &[0; 10_000]));
+        assert!(!jpeg_beats_webp(&[0; 9_000], &[0; 10_000])); // 10% < 12%
+        // ~50% smaller and well past the 512-byte absolute margin.
+        assert!(jpeg_beats_webp(&[0; 5_000], &[0; 12_000]));
     }
 }

@@ -21,9 +21,9 @@
 
 use std::{
     collections::HashMap,
-    panic::{self, AssertUnwindSafe},
     num::NonZeroUsize,
     ops::Range,
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     time::{Duration, Instant},

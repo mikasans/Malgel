@@ -170,10 +170,13 @@ fn refresh_pulse() {
         (None, None) => String::new(),
     };
     if let Ok(mut state) = PULSE.lock() {
+        // Only advance generation when the label changes — otherwise the
+        // status-bar task wakes every 1.5s and forces a full UI repaint for
+        // an identical "128M · 12%" string.
         if state.label != label {
             state.label = label;
+            state.generation = state.generation.wrapping_add(1);
         }
-        state.generation = state.generation.wrapping_add(1);
     }
 }
 
@@ -263,5 +266,25 @@ mod pulse_tests {
             label.contains('M') || label.contains('K') || label.contains('G'),
             "expected RSS in label, got {label:?}"
         );
+    }
+
+    #[test]
+    fn pulse_generation_stays_put_when_label_unchanged() {
+        ensure_pulse();
+        let pinned = "128M · 0%".to_string();
+        if let Ok(mut state) = PULSE.lock() {
+            state.label = pinned.clone();
+        }
+        let (_, before) = pulse_snapshot();
+        // Same label re-applied: generation must not advance (mirrors refresh_pulse).
+        if let Ok(mut state) = PULSE.lock() {
+            if state.label != pinned {
+                state.label = pinned.clone();
+                state.generation = state.generation.wrapping_add(1);
+            }
+        }
+        let (label, after) = pulse_snapshot();
+        assert_eq!(label, pinned);
+        assert_eq!(after, before, "identical label must not bump generation");
     }
 }

@@ -77,8 +77,7 @@ pub fn estimate_typst(source: &str, embedded_image_bytes: u64) -> RenderEstimate
     // ~2.5 KB of source ≈ one dense page of body text once laid out.
     let length_pages = (source_bytes / 2500).max(1);
     let pages = (pagebreaks + 1).max(length_pages);
-    let pixmap_mib =
-        pages as f64 * 7.7 + (embedded_image_bytes as f64 / (1024.0 * 1024.0));
+    let pixmap_mib = pages as f64 * 7.7 + (embedded_image_bytes as f64 / (1024.0 * 1024.0));
     let mut reasons = Vec::new();
     if pixmap_mib >= BUDGET_PIXMAP_MIB {
         reasons.push("heavy rasters");
@@ -143,7 +142,10 @@ mod tests {
             src.push_str(&format!("\n#pagebreak()\n== S{i}\n"));
         }
         let e = estimate_typst(&src, 0);
-        assert!(!e.exceeds_budget(), "15 pages should be under 150 MiB: {e:?}");
+        assert!(
+            !e.exceeds_budget(),
+            "15 pages should be under 150 MiB: {e:?}"
+        );
         assert!(e.pixmap_mib < BUDGET_PIXMAP_MIB);
     }
 
@@ -185,6 +187,43 @@ mod tests {
             src.push_str(&format!("```mermaid\ngraph TD; A{i}-->B{i}\n```\n\n"));
         }
         let e = estimate_markdown(&src);
+        assert!(e.exceeds_budget(), "{e:?}");
+    }
+
+    #[test]
+    fn mermaid_budget_boundary_is_inclusive_at_150() {
+        // 37 × 4.0 = 148 < 150; 38 × 4.0 = 152 ≥ 150.
+        let mut under = String::new();
+        for i in 0..37 {
+            under.push_str(&format!("```mermaid\ngraph TD; A{i}-->B{i}\n```\n\n"));
+        }
+        assert!(!estimate_markdown(&under).exceeds_budget());
+
+        let mut over = String::new();
+        for i in 0..38 {
+            over.push_str(&format!("```mermaid\ngraph TD; A{i}-->B{i}\n```\n\n"));
+        }
+        let e = estimate_markdown(&over);
+        assert!(e.exceeds_budget(), "{e:?}");
+        assert!(e.pixmap_mib >= BUDGET_PIXMAP_MIB);
+    }
+
+    #[test]
+    fn typst_budget_boundary_around_nineteen_pages() {
+        // 19 × 7.7 = 146.3 < 150; 20 × 7.7 = 154 ≥ 150.
+        let mut under = String::from("= Doc\n");
+        for i in 0..18 {
+            under.push_str(&format!("\n#pagebreak()\n== S{i}\n"));
+        }
+        let e = estimate_typst(&under, 0);
+        assert!(!e.exceeds_budget(), "{e:?}");
+        assert!(e.pixmap_mib < BUDGET_PIXMAP_MIB);
+
+        let mut over = String::from("= Doc\n");
+        for i in 0..19 {
+            over.push_str(&format!("\n#pagebreak()\n== S{i}\n"));
+        }
+        let e = estimate_typst(&over, 0);
         assert!(e.exceeds_budget(), "{e:?}");
     }
 }

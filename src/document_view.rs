@@ -1103,9 +1103,19 @@ impl DocumentView {
             // One SharedString for analysis (`source`); preview runs normalize+GFM
             // into a single String (no normalize→gfm double copy).
             let estimate = crate::render_budget::estimate_markdown(&source);
-            if estimate.exceeds_budget() && !self.render_confirmed {
-                self.render_gate = crate::render_budget::RenderConsent::Pending;
+            if estimate.exceeds_budget() {
+                if !self.render_confirmed
+                    && self.render_gate != crate::render_budget::RenderConsent::Skipped
+                {
+                    self.render_gate = crate::render_budget::RenderConsent::Pending;
+                }
                 self.render_estimate = Some(estimate.clone());
+            } else {
+                // Under budget again: drop a sticky Pending/Skipped banner so
+                // light edits after a heavy moment resume auto-preview.
+                self.render_gate = crate::render_budget::RenderConsent::Allowed;
+                self.render_confirmed = false;
+                self.render_estimate = None;
             }
             if matches!(
                 self.render_gate,
@@ -1435,18 +1445,27 @@ impl DocumentView {
                 } else {
                     this.editor.read(cx).value().to_string()
                 };
-                let image_bytes = estimate_typst_image_bytes(this.path.as_deref());
+                let image_bytes = estimate_typst_image_bytes(this.path.as_deref(), &text);
                 let estimate = crate::render_budget::estimate_typst(&text, image_bytes);
-                if estimate.exceeds_budget() && !this.render_confirmed {
-                    this.render_gate = crate::render_budget::RenderConsent::Pending;
+                if estimate.exceeds_budget() {
+                    if !this.render_confirmed
+                        && this.render_gate != crate::render_budget::RenderConsent::Skipped
+                    {
+                        this.render_gate = crate::render_budget::RenderConsent::Pending;
+                    }
                     this.render_estimate = Some(estimate);
-                    cx.notify();
-                    return;
-                }
-                if this.render_gate == crate::render_budget::RenderConsent::Skipped {
-                    this.render_estimate = Some(estimate);
-                    cx.notify();
-                    return;
+                    if matches!(
+                        this.render_gate,
+                        crate::render_budget::RenderConsent::Pending
+                            | crate::render_budget::RenderConsent::Skipped
+                    ) {
+                        cx.notify();
+                        return;
+                    }
+                } else {
+                    this.render_gate = crate::render_budget::RenderConsent::Allowed;
+                    this.render_confirmed = false;
+                    this.render_estimate = None;
                 }
                 if let Some(live) = &this.live {
                     live.worker
@@ -3512,26 +3531,31 @@ fn is_large_text(text: &str) -> bool {
 }
 
 /// Sum sizes of image files named beside a Typst source (cheap metadata only).
-fn estimate_typst_image_bytes(path: Option<&std::path::Path>) -> u64 {
+/// Uses the in-memory `source` text — never re-reads a large buffer from disk.
+fn estimate_typst_image_bytes(path: Option<&std::path::Path>, source: &str) -> u64 {
     let Some(path) = path else {
         return 0;
     };
     let Some(dir) = path.parent() else {
         return 0;
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return 0;
-    };
     let mut total = 0u64;
-    for raw in text.split('"') {
+    for raw in source.split('"') {
         let lower = raw.to_ascii_lowercase();
         if !(lower.ends_with(".png")
             || lower.ends_with(".jpg")
             || lower.ends_with(".jpeg")
             || lower.ends_with(".gif")
             || lower.ends_with(".webp")
-            || lower.ends_with(".svg"))
+            || lower.ends_with(".svg")
+            || lower.ends_with(".bmp")
+            || lower.ends_with(".tif")
+            || lower.ends_with(".tiff"))
         {
+            continue;
+        }
+        // Skip absurd paths (whole paragraphs that happen to end in .png).
+        if raw.len() > 512 || raw.contains('\n') || Path::new(raw).is_absolute() {
             continue;
         }
         let candidate = dir.join(raw);
