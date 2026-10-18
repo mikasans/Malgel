@@ -499,6 +499,26 @@ mod tests {
                 .info(ix)
                 .is_some_and(|info| info.coverage.contains('中' as u32))
         });
+        // CI without a CJK package (or a stripped container) has nothing to
+        // index; skip rather than false-fail. When CJK-named faces exist we
+        // require real cmap coverage — that is the regression this catches.
+        let system_has_cjk_named = SYSTEM_FONT_DB.faces().any(|face| {
+            let family = face.families.first().map(|(n, _)| n.as_str()).unwrap_or("");
+            let path = match &face.source {
+                fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path.as_path(),
+                _ => return false,
+            };
+            is_cjk_or_emoji_face(family, path)
+                && !family.to_ascii_lowercase().contains("emoji")
+                && !path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("emoji")
+        });
+        if !system_has_cjk_named {
+            eprintln!("skip chinese_text_selects_a_real_cjk_face: no CJK-named system fonts");
+            return;
+        }
         assert!(
             has_cjk,
             "no DOCUMENT_FONTS entry covers U+4E2D (中); CJK faces mis-indexed"
