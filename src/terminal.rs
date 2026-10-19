@@ -295,7 +295,6 @@ impl TerminalPanel {
         {
             self.write_bytes(&[0x03]);
             cx.stop_propagation();
-            return;
         }
         #[cfg(target_os = "macos")]
         {

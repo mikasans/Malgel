@@ -254,6 +254,8 @@ mod pulse_tests {
         assert_eq!(format_cpu_compact(Some(0.0)), Some("0%".into()));
     }
 
+    // RSS comes from /proc/self/status, so the label is only populated on Linux.
+    #[cfg(target_os = "linux")]
     #[test]
     fn pulse_sampler_produces_a_label() {
         ensure_pulse();
@@ -277,11 +279,11 @@ mod pulse_tests {
         }
         let (_, before) = pulse_snapshot();
         // Same label re-applied: generation must not advance (mirrors refresh_pulse).
-        if let Ok(mut state) = PULSE.lock() {
-            if state.label != pinned {
-                state.label = pinned.clone();
-                state.generation = state.generation.wrapping_add(1);
-            }
+        if let Ok(mut state) = PULSE.lock()
+            && state.label != pinned
+        {
+            state.label = pinned.clone();
+            state.generation = state.generation.wrapping_add(1);
         }
         let (label, after) = pulse_snapshot();
         assert_eq!(label, pinned);
