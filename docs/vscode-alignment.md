@@ -22,10 +22,11 @@ is not considered).
   beside each label and dispatches the confirmed row itself, from the window's
   own focus path. Without that, every row looked right and did nothing.
 
-- **File-type icons.** `src/file_icon.rs` maps an extension to a bundled
-  Lucide icon, and the file tree, the tab strip and Quick Open all draw it.
-  VS Code uses coloured Seti icons; Malgel uses the single-colour GPUI Kit
-  set, so files differ by shape, not colour.
+- **File-type icons.** `src/file_icon.rs` loads a VS Code–compatible icon
+  theme (`icon-themes/material/theme.json` + SVGs from Material Icon Theme).
+  The file tree, tab strip, Quick Open and Recent draw those icons; Lucide
+  glyphs remain the fallback. Swap packages by dropping another theme folder
+  with the same JSON shape.
 
 - **Find in Files** (Ctrl+Shift+F). Asks what to look for, searches the text
   of every file under the open folder — the same ignore-aware walk Quick Open

@@ -7,3 +7,8 @@ It bundles the American English Hunspell dictionary from SCOWL
 (http://wordlist.aspell.net/), whose license is in
 dictionaries/en_US-LICENSE.txt, and themes from GPUI Kit, licensed under
 the Apache License, Version 2.0.
+
+It bundles a VS Code–compatible file icon theme derived from
+Material Icon Theme (https://github.com/material-extensions/vscode-material-icon-theme),
+licensed under the MIT License; see icon-themes/material/LICENSE.
+

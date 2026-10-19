@@ -53,7 +53,7 @@ use crate::{
     document::{self, LineEnding, display_name},
     document_view::{DocumentEvent, DocumentView},
     docx, export,
-    file_icon::{ActivityIcon, activity_icon_color, file_icon, file_icon_color, folder_icon_color},
+    file_icon::{ActivityIcon, activity_icon_color, file_type_icon, folder_type_icon},
     file_tree::{
         FileTree, FileTreeEvent, TreeDrag, absolute_paths_for_clipboard, invert_key_held,
         relative_paths_for_clipboard,
@@ -355,14 +355,20 @@ enum DiskChange {
 /// Command palette default rows force icon paint to muted/accent
 /// (`CommandState::render_item_with_binding`), so `.icon(...).text_color(…)`
 /// is ignored. Own the row via `.child` — same accent path as Explorer/tabs.
-fn command_item_with_colored_icon(
+/// Command row using the declarative file-icon theme (SVG) when available.
+fn command_item_with_path_icon(
     label: impl Into<SharedString>,
     keywords: impl IntoIterator<Item = impl Into<SharedString>>,
-    icon: IconName,
-    color: gpui_kit::Hsla,
+    path: &std::path::Path,
+    is_dir: bool,
 ) -> CommandItem {
     let label: SharedString = label.into();
     let row_label = label.clone();
+    let icon = if is_dir {
+        folder_type_icon(path, false)
+    } else {
+        file_type_icon(path)
+    };
     CommandItem::new()
         .label(label)
         .keywords(keywords)
@@ -371,9 +377,18 @@ fn command_item_with_colored_icon(
                 .flex_1()
                 .gap_2()
                 .items_center()
-                .child(Icon::new(icon).size_4().text_color(color))
+                .child(icon.clone().size_4())
                 .child(row_label.clone())
         })
+}
+
+/// Which document indices the pinned-preview layout mounts in the editor
+/// column vs the preview column. Each index appears in exactly one column
+/// so GPUI never hosts the same `DocumentView` twice (focus / undo safe).
+fn pinned_preview_mounts(doc_count: usize, active: usize, pin_ix: usize) -> (Vec<usize>, usize) {
+    debug_assert_ne!(active, pin_ix);
+    let editor: Vec<usize> = (0..doc_count).filter(|&ix| ix != pin_ix).collect();
+    (editor, pin_ix)
 }
 
 /// Labels near the top of the editor-tab context menu (probe #15/#16).
@@ -2507,18 +2522,13 @@ impl Workspace {
         window.open_dialog(cx, move |dialog, _window, _cx| {
             // Icons (not text "File"/"Folder") distinguish entries, matching
             // Quick Open / Explorer — VS Code–like visual language.
-            let items: Vec<(usize, String, IconName, gpui_kit::Hsla)> = recent
+            let items: Vec<(usize, String, std::path::PathBuf, bool)> = recent
                 .iter()
                 .enumerate()
                 .map(|(ix, path)| {
                     let name = display_name(Some(path));
                     let label = format!("{name}  —  {}", path.display());
-                    let (icon, color) = if path.is_dir() {
-                        (IconName::Folder, folder_icon_color())
-                    } else {
-                        (file_icon(path), file_icon_color(path))
-                    };
-                    (ix, label, icon, color)
+                    (ix, label, path.clone(), path.is_dir())
                 })
                 .collect();
             let pick_items: Vec<(usize, String)> = items
@@ -2526,17 +2536,13 @@ impl Workspace {
                 .map(|(ix, label, _, _)| (*ix, label.clone()))
                 .collect();
             let mut group = CommandGroup::new().label("Recent");
-            for (_, label, icon, color) in &items {
-                let kind = if *icon == IconName::Folder {
-                    "folder"
-                } else {
-                    "file"
-                };
-                group = group.item(command_item_with_colored_icon(
+            for (_, label, path, is_dir) in &items {
+                let kind = if *is_dir { "folder" } else { "file" };
+                group = group.item(command_item_with_path_icon(
                     label.clone(),
                     [label.as_str(), kind],
-                    *icon,
-                    *color,
+                    path,
+                    *is_dir,
                 ));
             }
             dialog.close_button(false).p_0().child(esc_closes(
@@ -3089,7 +3095,9 @@ impl Workspace {
     /// sit beside a different active editor without live-following it.
     fn sync_preview_pin_roles(&mut self, cx: &mut Context<Self>) {
         use crate::document_view::PaneRole;
-        let pin = self.pinned_preview.filter(|&id| self.document_index(id).is_some());
+        let pin = self
+            .pinned_preview
+            .filter(|&id| self.document_index(id).is_some());
         self.pinned_preview = pin;
         let active_id = self.active_document().entity_id();
         for doc in &self.documents {
@@ -3619,12 +3627,7 @@ impl Workspace {
                     .to_string_lossy()
                     .replace('\\', "/");
                 let label: SharedString = format!("{shown}:{}  {}", hit.line, hit.text).into();
-                command_item_with_colored_icon(
-                    label,
-                    [shown, hit.text.clone()],
-                    file_icon(&hit.path),
-                    file_icon_color(&hit.path),
-                )
+                command_item_with_path_icon(label, [shown, hit.text.clone()], &hit.path, false)
             });
             let picked = hits.clone();
             let confirm_ws = workspace.clone();
@@ -5754,21 +5757,11 @@ impl Workspace {
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_default()
                     .into();
-                let icon = if row.is_dir {
-                    IconName::Folder
-                } else {
-                    file_icon(&row.path)
-                };
                 let mut keywords = vec![shown.clone(), name];
                 if let Some(keyword) = &row.keyword {
                     keywords.push(keyword.clone().into());
                 }
-                let icon_color = if row.is_dir {
-                    folder_icon_color()
-                } else {
-                    file_icon_color(&row.path)
-                };
-                command_item_with_colored_icon(shown, keywords, icon, icon_color)
+                command_item_with_path_icon(shown, keywords, &row.path, row.is_dir)
             };
             let recent_items = first.iter().map(item).collect::<Vec<_>>();
             let items = rows.iter().map(item).collect::<Vec<_>>();
@@ -6632,7 +6625,7 @@ impl Workspace {
                             let is_pinned = self.pinned.contains(&doc_id);
                             let name = doc.name().to_string();
                             // The tab carries its file's type icon, as in VS Code.
-                            let tab_icon = doc.path().map(|path| file_icon(path));
+                            let tab_icon = doc.path().map(|path| file_type_icon(path));
                             let theme = cx.theme();
                             let drag_label: SharedString = name.clone().into();
 
@@ -6684,13 +6677,24 @@ impl Workspace {
                                 .child(
                                     div()
                                         .flex_none()
-                                        .text_color(match doc.path() {
-                                            Some(path) => file_icon_color(path),
-                                            None if active => theme.tab_active_foreground,
-                                            None => theme.muted_foreground,
+                                        .when(doc.path().is_none(), |this| {
+                                            this.text_color(if active {
+                                                theme.tab_active_foreground
+                                            } else {
+                                                theme.muted_foreground
+                                            })
                                         })
                                         .child(
-                                            Icon::new(tab_icon.unwrap_or(IconName::FileText))
+                                            tab_icon
+                                                .unwrap_or_else(|| {
+                                                    Icon::new(IconName::FileText).text_color(
+                                                        if active {
+                                                            theme.tab_active_foreground
+                                                        } else {
+                                                            theme.muted_foreground
+                                                        },
+                                                    )
+                                                })
                                                 .xsmall(),
                                         ),
                                 )
@@ -7088,6 +7092,15 @@ impl Workspace {
                     })
                     .when(doc.preview_limited(), |this| {
                         this.child(item("Preview limited (large file)".to_string()))
+                    })
+                    .children({
+                        let pinned_name = self.pinned_preview.and_then(|id| {
+                            self.documents
+                                .iter()
+                                .find(|d| d.entity_id() == id)
+                                .map(|d| d.read(cx).name())
+                        });
+                        pinned_name.map(|name| item(format!("Pinned: {name}")))
                     })
                     .children({
                         let pulse = crate::perf::pulse_label();
@@ -8106,27 +8119,62 @@ impl Workspace {
 
         // Pinned preview of another tab: editor (active) | preview (pinned).
         // Roles are already EditorOnly / PreviewOnly via sync_preview_pin_roles.
-        if let Some(pin_ix) = pin_ix {
-            if split.is_none() {
-                let panes = h_flex()
-                    .id("pinned-preview-split")
-                    .size_full()
-                    .min_w_0()
-                    .items_stretch()
-                    .overflow_hidden()
-                    .child(stack(active, "doc-stack-active-editor").w_full().overflow_hidden())
-                    .child(div().w(px(1.)).h_full().bg(cx.theme().border).flex_none())
-                    .child(stack(pin_ix, "doc-stack-pinned-preview").w_full().overflow_hidden())
-                    .into_any_element();
-                return div()
-                    .id("document-stack")
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .child(panes)
-                    .into_any_element();
-            }
+        //
+        // Critical: each DocumentView entity must appear in the tree **once**.
+        // Mounting every doc in both stacks (the old behaviour) duplicated the
+        // active editor under the preview column — invisible but still focusable
+        // — so Ctrl+Z / shortcuts hit the wrong instance or none at all.
+        if let Some(pin_ix) = pin_ix
+            && split.is_none()
+        {
+            let editor_stack = div()
+                .id("doc-stack-active-editor")
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .relative()
+                .w_full()
+                .overflow_hidden()
+                .children({
+                    let (editor_ixs, _) =
+                        pinned_preview_mounts(self.documents.len(), active, pin_ix);
+                    editor_ixs.into_iter().map(|ix| {
+                        let doc = self.documents[ix].clone();
+                        let shown = ix == active;
+                        div()
+                            .id(("doc-stack-active-editor", ix))
+                            .absolute()
+                            .inset_0()
+                            .when(!shown, |this| this.invisible())
+                            .child(doc)
+                    })
+                });
+            let preview_pane = div()
+                .id("doc-stack-pinned-preview")
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .w_full()
+                .overflow_hidden()
+                .child(self.documents[pin_ix].clone());
+            let panes = h_flex()
+                .id("pinned-preview-split")
+                .size_full()
+                .min_w_0()
+                .items_stretch()
+                .overflow_hidden()
+                .child(editor_stack)
+                .child(div().w(px(1.)).h_full().bg(cx.theme().border).flex_none())
+                .child(preview_pane)
+                .into_any_element();
+            return div()
+                .id("document-stack")
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_hidden()
+                .child(panes)
+                .into_any_element();
         }
 
         let drop_listener = cx.listener(|this, drag: &TabDrag, window, cx| {
@@ -9655,6 +9703,22 @@ mod tests {
         assert_eq!(
             Workspace::split_panes_after_cross_group_move(2, 0, 1, 3, false),
             (2, 1)
+        );
+    }
+
+    #[test]
+    fn pinned_preview_mounts_keeps_each_doc_once() {
+        // docs [0,1,2], active=1, pin=0 → editor hosts 1+2, preview hosts 0.
+        let (editor, preview) = super::pinned_preview_mounts(3, 1, 0);
+        assert_eq!(preview, 0);
+        assert_eq!(editor, vec![1, 2]);
+        let mut all = editor;
+        all.push(preview);
+        all.sort();
+        assert_eq!(all, vec![0, 1, 2]);
+        assert_eq!(
+            all.len(),
+            all.iter().collect::<std::collections::BTreeSet<_>>().len()
         );
     }
 }

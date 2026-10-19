@@ -277,11 +277,11 @@ mod pulse_tests {
         }
         let (_, before) = pulse_snapshot();
         // Same label re-applied: generation must not advance (mirrors refresh_pulse).
-        if let Ok(mut state) = PULSE.lock() {
-            if state.label != pinned {
-                state.label = pinned.clone();
-                state.generation = state.generation.wrapping_add(1);
-            }
+        if let Ok(mut state) = PULSE.lock()
+            && state.label != pinned
+        {
+            state.label = pinned.clone();
+            state.generation = state.generation.wrapping_add(1);
         }
         let (label, after) = pulse_snapshot();
         assert_eq!(label, pinned);

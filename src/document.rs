@@ -342,6 +342,7 @@ pub fn is_typst_path(path: &Path) -> bool {
 /// Kept in one place so Explorer icons, Quick Open and `load_path` agree on
 /// the kind (PDF ≠ Typst ≠ Markdown ≠ image ≠ plain/code text).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // used by tests; load_path still branches on path helpers
 pub enum OpenRenderer {
     Markdown,
     Typst,
@@ -352,6 +353,7 @@ pub enum OpenRenderer {
 }
 
 /// The renderer Malgel uses when the user casually opens `path`.
+#[allow(dead_code)] // covered by unit tests; call sites use path helpers today
 pub fn open_renderer(path: &Path) -> OpenRenderer {
     if is_pdf_path(path) {
         OpenRenderer::Pdf

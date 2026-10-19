@@ -41,7 +41,7 @@ use gpui_kit::{
 use crate::workspace::DragGhost;
 
 use crate::actions::{FILE_TREE_CONTEXT, OpenFolder};
-use crate::file_icon::{file_icon, file_icon_color, folder_icon_color};
+use crate::file_icon::{file_type_icon, folder_type_icon};
 
 /// Entries hidden by default, matching VS Code's `files.exclude`.
 pub(crate) const DEFAULT_EXCLUDED: &[&str] =
@@ -1257,11 +1257,11 @@ impl FileTree {
                 let entry = row.entry.clone();
                 let is_active = Some(&entry.path) == self.active.as_ref();
                 let expanded = entry.is_dir && self.expanded.contains(&entry.path);
-                let icon = match (entry.is_dir, expanded) {
-                    (true, true) => IconName::FolderOpen,
-                    (true, false) => IconName::Folder,
-                    // Each file shows its type's icon, as in VS Code.
-                    (false, _) => file_icon(&entry.path),
+                // Theme SVGs (VS Code icon package) when mapped; Lucide fallback.
+                let type_icon = if entry.is_dir {
+                    folder_type_icon(&entry.path, expanded)
+                } else {
+                    file_type_icon(&entry.path)
                 };
                 let path = entry.path.clone();
                 let drop_path = entry.path.clone();
@@ -1346,16 +1346,7 @@ impl FileTree {
                                     this.child(div().w(px(6.)).h(px(6.)).rounded(px(3.)).bg(marker))
                                 }),
                         )
-                        .child(
-                            Icon::new(icon)
-                                .small()
-                                .text_color(if entry.is_dir {
-                                    folder_icon_color()
-                                } else {
-                                    file_icon_color(&entry.path)
-                                })
-                                .flex_none(),
-                        )
+                        .child(type_icon.small().flex_none())
                         .child(if renaming_path.as_ref() == Some(&entry.path) {
                             if let Some(input) = rename_input.clone() {
                                 div()

@@ -22,9 +22,8 @@ use gpui_kit::{
     },
     canvas,
     component::{
-        ActiveTheme as _, ElementExt as _, RopeExt as _, Selectable as _,
+        ActiveTheme as _, ElementExt as _, RopeExt as _, Selectable as _, Sizable as _,
         button::{Button, ButtonVariants as _},
-        Sizable as _,
         clipboard::Clipboard,
         h_flex,
         input::{
@@ -490,15 +489,12 @@ impl DocumentView {
         }
     }
 
-
     pub fn set_preview_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
         if self.preview_pinned != pinned {
             self.preview_pinned = pinned;
             cx.notify();
         }
     }
-
-
 
     /// A document displaying an image (PNG, JPEG, SVG, …) with zoom.
     pub fn new_image(
@@ -1748,11 +1744,17 @@ impl DocumentView {
 
     /// Preview pane with a pin control so the user can freeze this document's
     /// pages while editing another file.
-    fn render_preview_chrome(&self, window: &Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_preview_chrome(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let theme = cx.theme();
         let pinned = self.preview_pinned;
         let name = self.name();
         let can_pin = self.has_preview() || self.live.is_some();
+        // Pinned vs live-follow: different glyph (Pin vs PinOff), label, and
+        // chrome — not a tint-only toggle.
         let bar = h_flex()
             .id("preview-chrome")
             .w_full()
@@ -1762,23 +1764,36 @@ impl DocumentView {
             .gap_2()
             .items_center()
             .border_b_1()
-            .border_color(theme.border)
-            .bg(theme.sidebar.opacity(0.55))
+            .border_color(if pinned {
+                theme.primary.opacity(0.65)
+            } else {
+                theme.border
+            })
+            .bg(if pinned {
+                theme.primary.opacity(0.12)
+            } else {
+                theme.sidebar.opacity(0.55)
+            })
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
                     .text_xs()
+                    .font_weight(if pinned {
+                        gpui_kit::FontWeight::SEMIBOLD
+                    } else {
+                        gpui_kit::FontWeight::NORMAL
+                    })
                     .text_color(if pinned {
-                        theme.accent_foreground
+                        theme.primary
                     } else {
                         theme.muted_foreground
                     })
                     .child(if pinned {
-                        format!("Pinned preview — {name}")
+                        format!("Pinned: {name}")
                     } else {
-                        format!("Preview — {name}")
+                        format!("Following active — {name}")
                     }),
             )
             .when(can_pin, |this| {
@@ -1787,13 +1802,20 @@ impl DocumentView {
                         .ghost()
                         .small()
                         .compact()
-                        .icon(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Pin))
-                        .tooltip(if pinned {
-                            "Unpin preview (follow active file again)"
+                        .icon(gpui_kit::component::Icon::new(if pinned {
+                            // Filled / stuck pin while frozen.
+                            gpui_kit::assets::IconName::Pin
                         } else {
-                            "Pin preview (keep these pages while editing other files)"
+                            // Outline / free pin while live-following.
+                            gpui_kit::assets::IconName::PinOff
+                        }))
+                        .label(if pinned { "Pinned" } else { "Follow" })
+                        .tooltip(if pinned {
+                            "Pinned — click to follow the active file again"
+                        } else {
+                            "Following active — click to pin these pages"
                         })
-                        .selected(self.preview_pinned)
+                        .selected(pinned)
                         .on_click(cx.listener(|_, _, _, cx| {
                             cx.emit(DocumentEvent::TogglePinPreview);
                         })),
