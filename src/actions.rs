@@ -70,6 +70,7 @@ actions!(
         ToggleSpellCheck,
         ToggleFocusMode,
         TogglePreviewLayout,
+        TogglePinPreview,
         SplitEditorRight,
         SplitEditorDown,
         CloseEditorSplit,

@@ -205,6 +205,7 @@ fn keywords(label: &'static str) -> Vec<&'static str> {
         "Source Control" => vec![label, "git", "scm", "source control", "version control"],
         "Extensions" => vec![label, "extensions", "extension", "plugins", "marketplace"],
         "Pin Tab" => vec![label, "pin", "unpin", "pin tab", "unpin tab", "pin editor"],
+        "Pin Preview" => vec![label, "pin preview", "unpin preview", "freeze preview", "detach preview"],
         "Show Explorer" => vec![label, "explorer", "show explorer", "files"],
         "Show Search" => vec![label, "search", "show search", "find in files view"],
         // Probe #10: Close Others / Close Saved / group close discoverability.
@@ -390,6 +391,11 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Split Editor Down", IconName::Rows2, SplitEditorDown),
             cmd("Tabs", IconName::ListTree, ToggleTabs),
             cmd("Pin Tab", IconName::Pin, PinTab),
+            cmd(
+                "Pin Preview",
+                IconName::Pin,
+                TogglePinPreview,
+            ),
             cmd(
                 "PDF page thumbnails",
                 IconName::PanelLeft,

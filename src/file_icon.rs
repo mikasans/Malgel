@@ -1,5 +1,9 @@
 //! The icon a file draws with, by type — and a colour so types stay
 //! distinguishable (VS Code–ish file icons, not monochrome mud).
+//!
+//! Common kinds use **distinct glyphs and accents**: PDF (`FileType`, red) is
+//! not Typst (`FilePen`, teal), Markdown (`FileText`, blue) is not plain text
+//! (`NotepadText`, grey), and popular languages get their own hues.
 
 use std::path::Path;
 
@@ -19,35 +23,44 @@ pub fn file_icon(path: &Path) -> IconName {
         .map(str::to_ascii_lowercase);
 
     match extension.as_deref() {
+        // Markdown vs plain text: lines-of-text vs notepad.
         Some("md" | "markdown" | "mdx" | "mdown" | "mkd" | "mkdn") => IconName::FileText,
+        Some("txt" | "text" | "log" | "rst" | "adoc" | "org" | "nfo") => IconName::NotepadText,
+        // Typesetting source (Typst / TeX) vs compiled PDF vs office docs.
+        Some("typ") => IconName::FilePen,
+        Some("tex" | "latex" | "ltx" | "bib" | "sty" | "cls") => IconName::BookOpen,
+        Some("pdf") => IconName::FileType,
+        Some("doc" | "docx" | "odt" | "rtf" | "pages" | "epub") => IconName::NotebookText,
+        // Code: shared glyph, colours differ below.
         Some(
             "rs" | "py" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" | "go" | "c"
             | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "cs" | "java" | "kt" | "kts" | "swift"
             | "rb" | "php" | "scala" | "zig" | "lua" | "ex" | "exs" | "erl" | "hs" | "clj" | "cljs"
             | "vue" | "svelte" | "astro" | "dart" | "r" | "nim" | "v" | "ml" | "mli" | "fs" | "fsx"
-            | "f90" | "f95" | "jl" | "groovy" | "gradle",
+            | "f90" | "f95" | "jl" | "groovy" | "gradle" | "ipynb",
         ) => IconName::FileCode,
-        Some("html" | "htm" | "xhtml" | "css" | "scss" | "sass" | "less" | "styl") => {
-            IconName::CodeXml
-        }
+        // Web: HTML keeps markup glyph; CSS uses braces (shape ≠ HTML).
+        Some("html" | "htm" | "xhtml") => IconName::CodeXml,
+        Some("css" | "scss" | "sass" | "less" | "styl") => IconName::Braces,
         Some("sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" | "psm1") => {
             IconName::FileTerminal
         }
+        // Config families: JSON braces, TOML corner-braces, YAML hash-ish corner.
+        Some("json" | "jsonc" | "json5") => IconName::FileBraces,
+        Some("toml") => IconName::FileBracesCorner,
+        Some("yaml" | "yml") => IconName::FileCodeCorner,
         Some(
-            "json" | "jsonc" | "json5" | "toml" | "yaml" | "yml" | "xml" | "ini" | "cfg" | "conf"
-            | "env" | "properties" | "editorconfig" | "graphql" | "gql" | "prisma" | "proto"
-            | "cmake" | "nix" | "tf" | "tfvars" | "hcl",
+            "xml" | "ini" | "cfg" | "conf" | "env" | "properties" | "editorconfig" | "graphql"
+            | "gql" | "prisma" | "proto" | "cmake" | "nix" | "tf" | "tfvars" | "hcl",
         ) => IconName::FileBraces,
         Some(
-            "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico" | "avif" | "tif"
-            | "tiff" | "heic" | "heif",
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "avif" | "tif" | "tiff"
+            | "heic" | "heif",
         ) => IconName::FileImage,
+        // SVG is markup-as-image: distinct glyph from raster.
+        Some("svg") => IconName::Image,
         Some("csv" | "tsv" | "ods" | "xls" | "xlsx") => IconName::FileSpreadsheet,
         Some("sql" | "sqlite" | "db" | "mdb") => IconName::Database,
-        Some("pdf" | "doc" | "docx" | "odt" | "rtf" | "pages" | "epub") => IconName::FileType,
-        // A Typst source shares the icon of what its preview compiles to.
-        Some("typ" | "tex" | "latex" | "ltx" | "bib" | "sty" | "cls") => IconName::FileType,
-        Some("txt" | "text" | "log" | "rst" | "adoc" | "org" | "nfo") => IconName::FileText,
         Some(
             "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "zst" | "lz4" | "cab"
             | "deb" | "rpm" | "apk",
@@ -68,7 +81,6 @@ pub fn file_icon(path: &Path) -> IconName {
         Some("diff" | "patch") => IconName::FileDiff,
         Some("dockerfile" | "containerfile") => IconName::FileBox,
         Some("mk" | "mak" | "makefile") => IconName::FileCog,
-        Some("ipynb") => IconName::FileCode,
         _ => IconName::File,
     }
 }
@@ -86,38 +98,47 @@ pub fn file_icon_color(path: &Path) -> Hsla {
         .map(str::to_ascii_lowercase);
 
     match extension.as_deref() {
+        Some("md" | "markdown" | "mdx" | "mdown" | "mkd" | "mkdn") => rgb(0x519aba).into(), // blue
+        Some("txt" | "text" | "log" | "rst" | "adoc" | "org" | "nfo") => {
+            rgb(0x90a4ae).into() // blue-grey — ≠ Markdown
+        }
+        // Typst brand-ish teal; TeX indigo; PDF red; office soft blue.
+        Some("typ") => rgb(0x239dad).into(),
+        Some("tex" | "latex" | "ltx" | "bib" | "sty" | "cls") => rgb(0x5c6bc0).into(),
+        Some("pdf") => rgb(0xef5350).into(),
+        Some("doc" | "docx" | "odt" | "rtf" | "pages" | "epub") => rgb(0x42a5f5).into(),
+        // Popular languages: own accents (VS Code–ish).
+        Some("rs") => rgb(0xdea584).into(),       // rust
+        Some("py") => rgb(0x42a5f5).into(),       // python blue
+        Some("js" | "jsx" | "mjs" | "cjs") => rgb(0xffca28).into(), // yellow
+        Some("ts" | "tsx" | "mts" | "cts") => rgb(0x039be5).into(), // TS blue
+        Some("go") => rgb(0x00acc1).into(),
         Some(
-            "md" | "markdown" | "mdx" | "mdown" | "mkd" | "mkdn" | "txt" | "text" | "log" | "rst"
-            | "adoc" | "org" | "nfo",
-        ) => rgb(0x519aba).into(), // blue
-        Some(
-            "rs" | "py" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" | "go" | "c"
-            | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "cs" | "java" | "kt" | "kts" | "swift"
-            | "rb" | "php" | "scala" | "zig" | "lua" | "ex" | "exs" | "erl" | "hs" | "clj" | "cljs"
-            | "vue" | "svelte" | "astro" | "dart" | "r" | "nim" | "v" | "ml" | "mli" | "fs" | "fsx"
-            | "f90" | "f95" | "jl" | "groovy" | "gradle" | "ipynb",
+            "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "cs" | "java" | "kt" | "kts"
+            | "swift" | "rb" | "php" | "scala" | "zig" | "lua" | "ex" | "exs" | "erl" | "hs"
+            | "clj" | "cljs" | "vue" | "svelte" | "astro" | "dart" | "r" | "nim" | "v" | "ml"
+            | "mli" | "fs" | "fsx" | "f90" | "f95" | "jl" | "groovy" | "gradle" | "ipynb",
         ) => rgb(0x8bc34a).into(), // green
         Some("html" | "htm" | "xhtml") => rgb(0xe57373).into(), // soft red
         Some("css" | "scss" | "sass" | "less" | "styl") => rgb(0x64b5f6).into(), // light blue
         Some("sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" | "psm1") => {
             rgb(0x4db6ac).into() // teal
         }
+        Some("json" | "jsonc" | "json5") => rgb(0xffca28).into(), // amber
+        Some("toml") => rgb(0x8d6e63).into(),                     // brown
+        Some("yaml" | "yml") => rgb(0xab47bc).into(),             // purple
         Some(
-            "json" | "jsonc" | "json5" | "toml" | "yaml" | "yml" | "xml" | "ini" | "cfg" | "conf"
-            | "env" | "properties" | "editorconfig" | "graphql" | "gql" | "prisma" | "proto"
-            | "cmake" | "nix" | "tf" | "tfvars" | "hcl",
-        ) => rgb(0xffca28).into(), // amber
+            "xml" | "ini" | "cfg" | "conf" | "properties" | "editorconfig" | "graphql" | "gql"
+            | "prisma" | "proto" | "cmake" | "nix" | "tf" | "tfvars" | "hcl",
+        ) => rgb(0xffca28).into(),
+        Some("env") => rgb(0xc0ca33).into(), // lime — env files stand out
         Some(
-            "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico" | "avif" | "tif"
-            | "tiff" | "heic" | "heif",
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "avif" | "tif" | "tiff"
+            | "heic" | "heif",
         ) => rgb(0xec407a).into(), // pink
-        Some("csv" | "tsv" | "ods" | "xls" | "xlsx" | "sql" | "sqlite" | "db" | "mdb") => {
-            rgb(0x66bb6a).into() // soft green
-        }
-        Some(
-            "pdf" | "doc" | "docx" | "odt" | "rtf" | "pages" | "epub" | "typ" | "tex" | "latex"
-            | "ltx" | "bib" | "sty" | "cls",
-        ) => rgb(0xef5350).into(), // red
+        Some("svg") => rgb(0xff7043).into(), // deep orange
+        Some("csv" | "tsv" | "ods" | "xls" | "xlsx") => rgb(0x66bb6a).into(),
+        Some("sql" | "sqlite" | "db" | "mdb") => rgb(0x66bb6a).into(),
         Some(
             "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "zst" | "lz4" | "cab"
             | "deb" | "rpm" | "apk",
@@ -245,15 +266,13 @@ fn color_for_special_name(path: &Path) -> Option<Hsla> {
         | "settings.gradle.kts" => rgb(0xffca28).into(),
         "cargo.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" | "go.sum"
         | "gemfile.lock" | "poetry.lock" | "composer.lock" | "bun.lockb" => rgb(0x78909c).into(),
+        ".env" | ".env.local" | ".env.example" => rgb(0xc0ca33).into(),
         ".gitignore"
         | ".gitattributes"
         | ".gitmodules"
         | ".gitkeep"
         | ".dockerignore"
         | ".editorconfig"
-        | ".env"
-        | ".env.local"
-        | ".env.example"
         | ".npmrc"
         | ".nvmrc"
         | ".eslintrc"
@@ -284,15 +303,18 @@ mod tests {
     #[test]
     fn each_family_gets_its_own_icon() {
         assert_eq!(file_icon(Path::new("notes.md")), IconName::FileText);
+        assert_eq!(file_icon(Path::new("notes.txt")), IconName::NotepadText);
         assert_eq!(file_icon(Path::new("main.rs")), IconName::FileCode);
         assert_eq!(file_icon(Path::new("run.sh")), IconName::FileTerminal);
         assert_eq!(file_icon(Path::new("Cargo.toml")), IconName::FileBraces);
         assert_eq!(file_icon(Path::new("logo.png")), IconName::FileImage);
+        assert_eq!(file_icon(Path::new("logo.svg")), IconName::Image);
         assert_eq!(file_icon(Path::new("data.csv")), IconName::FileSpreadsheet);
         assert_eq!(file_icon(Path::new("paper.pdf")), IconName::FileType);
-        assert_eq!(file_icon(Path::new("paper.typ")), IconName::FileType);
+        assert_eq!(file_icon(Path::new("paper.typ")), IconName::FilePen);
+        assert_eq!(file_icon(Path::new("paper.tex")), IconName::BookOpen);
         assert_eq!(file_icon(Path::new("index.html")), IconName::CodeXml);
-        assert_eq!(file_icon(Path::new("styles.css")), IconName::CodeXml);
+        assert_eq!(file_icon(Path::new("styles.css")), IconName::Braces);
         assert_eq!(file_icon(Path::new("query.sql")), IconName::Database);
         assert_eq!(file_icon(Path::new("bundle.zip")), IconName::FileArchive);
         assert_eq!(file_icon(Path::new("track.mp3")), IconName::FileMusic);
@@ -301,6 +323,22 @@ mod tests {
         assert_eq!(file_icon(Path::new("Cargo.lock")), IconName::FileLock);
         assert_eq!(file_icon(Path::new("fix.diff")), IconName::FileDiff);
         assert_eq!(file_icon(Path::new("schema.proto")), IconName::FileBraces);
+        assert_eq!(file_icon(Path::new("config.yaml")), IconName::FileCodeCorner);
+        assert_eq!(file_icon(Path::new("app.toml")), IconName::FileBracesCorner);
+    }
+
+    #[test]
+    fn pdf_typst_and_markdown_differ_by_glyph() {
+        let pdf = file_icon(Path::new("a.pdf"));
+        let typ = file_icon(Path::new("a.typ"));
+        let md = file_icon(Path::new("a.md"));
+        let txt = file_icon(Path::new("a.txt"));
+        assert_ne!(pdf, typ);
+        assert_ne!(pdf, md);
+        assert_ne!(typ, md);
+        assert_ne!(md, txt);
+        assert_eq!(pdf, IconName::FileType);
+        assert_eq!(typ, IconName::FilePen);
     }
 
     #[test]
@@ -308,6 +346,8 @@ mod tests {
         assert_eq!(file_icon(Path::new("README.MARKDOWN")), IconName::FileText);
         assert_eq!(file_icon(Path::new("Photo.JPG")), IconName::FileImage);
         assert_eq!(file_icon(Path::new("Archive.ZIP")), IconName::FileArchive);
+        assert_eq!(file_icon(Path::new("Paper.TYP")), IconName::FilePen);
+        assert_eq!(file_icon(Path::new("Paper.PDF")), IconName::FileType);
     }
 
     #[test]
@@ -329,17 +369,29 @@ mod tests {
     #[test]
     fn colours_differ_across_families() {
         let md = file_icon_color(Path::new("a.md"));
+        let typ = file_icon_color(Path::new("a.typ"));
+        let pdf = file_icon_color(Path::new("a.pdf"));
         let rs = file_icon_color(Path::new("a.rs"));
+        let py = file_icon_color(Path::new("a.py"));
         let png = file_icon_color(Path::new("a.png"));
         let toml = file_icon_color(Path::new("a.toml"));
+        let yaml = file_icon_color(Path::new("a.yaml"));
         let html = file_icon_color(Path::new("a.html"));
         let zip = file_icon_color(Path::new("a.zip"));
-        assert_ne!(md, rs);
+        let txt = file_icon_color(Path::new("a.txt"));
+        assert_ne!(md, typ);
+        assert_ne!(typ, pdf);
+        assert_ne!(md, pdf);
+        assert_ne!(md, txt);
+        assert_ne!(rs, py);
+        assert_ne!(toml, yaml);
         assert_ne!(rs, png);
         assert_ne!(png, toml);
         assert_ne!(html, rs);
         assert_ne!(zip, png);
         assert_ne!(md, folder_icon_color());
+        assert_ne!(typ, folder_icon_color());
+        assert_ne!(pdf, folder_icon_color());
         assert_ne!(
             file_icon_color(Path::new("Dockerfile")),
             folder_icon_color()

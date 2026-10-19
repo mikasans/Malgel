@@ -495,6 +495,9 @@ pub struct Workspace {
     /// Tabs held open: Close Other Tabs and Close All Editors leave them
     /// alone, and their close box becomes a pin, as in VS Code.
     pinned: HashSet<EntityId>,
+    /// Document whose preview stays on screen while another tab is edited.
+    /// `None` = preview follows the active document (default).
+    pinned_preview: Option<EntityId>,
     /// Explorer “Select for Compare” left path (probe #12).
     compare_selection: Option<PathBuf>,
     /// While dragging a tab: which split edge is hovered for drop preview.
@@ -712,6 +715,7 @@ impl Workspace {
             approved_opens: HashMap::new(),
             closed_documents: Vec::new(),
             pinned: HashSet::new(),
+            pinned_preview: None,
             compare_selection: None,
             tab_split_preview: None,
             nav_history: Vec::new(),
@@ -1037,6 +1041,9 @@ impl Workspace {
                         cx.notify();
                     }
                 }
+                DocumentEvent::TogglePinPreview => {
+                    this.toggle_pin_preview(window, cx);
+                }
             }),
         ];
         self.document_subscriptions
@@ -1056,6 +1063,9 @@ impl Workspace {
         self.document_subscriptions
             .retain(|(subscribed, _)| *subscribed != id);
         self.pinned.remove(&id);
+        if self.pinned_preview == Some(id) {
+            self.pinned_preview = None;
+        }
         self.unpreview(id);
         // Probe #13: keep split indices valid; collapse empty/orphan groups.
         if let Some(split) = self.editor_split {
@@ -1288,6 +1298,7 @@ impl Workspace {
         }
         self.sync_file_tree(cx);
         self.save_session(window, cx);
+        self.sync_preview_pin_roles(cx);
         cx.notify();
     }
 
@@ -1677,10 +1688,16 @@ impl Workspace {
         let task = cx
             .background_executor()
             .spawn(async move { document::load(&read_path) });
+        // Immediate tab feedback (same as PDF/image): avoid a blank wait on
+        // large text / Typst sources. Placeholder must not spawn Typst.
+        let placeholder = self.place_loading(&path, placement, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(loaded) => {
+                    let Some(slot) = this.loading_slot(placeholder) else {
+                        return;
+                    };
                     AppSettings::update(cx, |settings| settings.push_recent(&path));
                     let doc = cx.new(|cx| {
                         let mut doc = DocumentView::new(
@@ -1696,7 +1713,11 @@ impl Workspace {
                         }
                         doc
                     });
-                    this.place_document(doc.clone(), placement, window, cx);
+                    match slot {
+                        Some((id, ix)) => this.swap_in_loaded(id, ix, doc.clone(), window, cx),
+                        None => this.place_document(doc.clone(), placement, window, cx),
+                    }
+                    this.sync_preview_pin_roles(cx);
                     match target {
                         Target::Top => {}
                         Target::Heading(anchor) => this.reveal_anchor(&doc, &anchor, window, cx),
@@ -1706,6 +1727,7 @@ impl Workspace {
                     }
                 }
                 Err(err) => {
+                    this.drop_loading(placeholder, &path, window, cx);
                     AppSettings::update(cx, |settings| {
                         settings.recent_files.retain(|recent| recent != &path)
                     });
@@ -2848,6 +2870,9 @@ impl Workspace {
                     .update(cx, |tree, cx| tree.set_root(Some(folder.clone()), cx));
                 this.sync_file_tree(cx);
                 AppSettings::update(cx, |settings| settings.file_sidebar = true);
+                // Same as CLI folder open: prefer README, never mass-open /
+                // compile every file under the tree.
+                this.open_folder_default_doc(&folder, window, cx);
                 this.save_session(window, cx);
             });
         })
@@ -3017,6 +3042,69 @@ impl Workspace {
     fn pin_tab(&mut self, _: &PinTab, _: &mut Window, cx: &mut Context<Self>) {
         let id = self.active_document().entity_id();
         self.toggle_pin_by_id(id, cx);
+    }
+
+    /// Pin the active document's preview so it stays visible while editing
+    /// another tab, or unpin to resume following the active file.
+    fn toggle_pin_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.active_document().entity_id();
+        let can_pin = self.active_document().read(cx).has_preview();
+        if self.pinned_preview == Some(id) {
+            self.pinned_preview = None;
+            log::info!("ui: preview unpinned");
+        } else if can_pin {
+            self.pinned_preview = Some(id);
+            // Need a visible preview pane beside the editor.
+            let layout = AppSettings::get(cx).layout;
+            if layout == Layout::Editor {
+                AppSettings::update(cx, |settings| {
+                    settings.layout = Layout::Split;
+                    settings.focus_mode = false;
+                });
+            }
+            log::info!("ui: preview pinned to {id:?}");
+        } else {
+            window.push_notification(
+                Notification::info(
+                    "Nothing to pin — open a Markdown or Typst file with a preview.",
+                ),
+                cx,
+            );
+            return;
+        }
+        self.sync_preview_pin_roles(cx);
+        cx.notify();
+    }
+
+    fn toggle_pin_preview_action(
+        &mut self,
+        _: &crate::actions::TogglePinPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_pin_preview(window, cx);
+    }
+
+    /// Assign EditorOnly / PreviewOnly / Full roles so a pinned preview can
+    /// sit beside a different active editor without live-following it.
+    fn sync_preview_pin_roles(&mut self, cx: &mut Context<Self>) {
+        use crate::document_view::PaneRole;
+        let pin = self.pinned_preview.filter(|&id| self.document_index(id).is_some());
+        self.pinned_preview = pin;
+        let active_id = self.active_document().entity_id();
+        for doc in &self.documents {
+            let id = doc.entity_id();
+            let role = match pin {
+                Some(p) if p != active_id && id == active_id => PaneRole::EditorOnly,
+                Some(p) if p != active_id && id == p => PaneRole::PreviewOnly,
+                _ => PaneRole::Full,
+            };
+            let pinned_flag = pin == Some(id);
+            doc.update(cx, |doc, cx| {
+                doc.set_pane_role(role, cx);
+                doc.set_preview_pinned(pinned_flag, cx);
+            });
+        }
     }
 
     /// Bring back the most recently closed editor, the way Ctrl+Shift+T
@@ -7624,6 +7712,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::close_all_tabs))
             .on_action(cx.listener(Self::reopen_closed_editor))
             .on_action(cx.listener(Self::pin_tab))
+            .on_action(cx.listener(Self::toggle_pin_preview_action))
             .on_action(cx.listener(Self::show_tab_context_menu))
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
@@ -7990,9 +8079,13 @@ impl Workspace {
     /// preview/editor (scroll and preview state stay put, VS Code-like).
     /// When [`editor_split`] is set, two document panes show side-by-side or
     /// stacked (Split Editor Right / Down).
-    fn render_document_stack(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_document_stack(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let active = self.active;
         let split = self.editor_split;
+        let pin_ix = self
+            .pinned_preview
+            .and_then(|id| self.document_index(id))
+            .filter(|&ix| ix != active);
         let stack = |active_ix: usize, id: &'static str| {
             div()
                 .id(id)
@@ -8010,6 +8103,31 @@ impl Workspace {
                         .child(doc.clone())
                 }))
         };
+
+        // Pinned preview of another tab: editor (active) | preview (pinned).
+        // Roles are already EditorOnly / PreviewOnly via sync_preview_pin_roles.
+        if let Some(pin_ix) = pin_ix {
+            if split.is_none() {
+                let panes = h_flex()
+                    .id("pinned-preview-split")
+                    .size_full()
+                    .min_w_0()
+                    .items_stretch()
+                    .overflow_hidden()
+                    .child(stack(active, "doc-stack-active-editor").w_full().overflow_hidden())
+                    .child(div().w(px(1.)).h_full().bg(cx.theme().border).flex_none())
+                    .child(stack(pin_ix, "doc-stack-pinned-preview").w_full().overflow_hidden())
+                    .into_any_element();
+                return div()
+                    .id("document-stack")
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(panes)
+                    .into_any_element();
+            }
+        }
 
         let drop_listener = cx.listener(|this, drag: &TabDrag, window, cx| {
             this.tab_drag_index.set(Some(drag.index));

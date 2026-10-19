@@ -141,6 +141,7 @@ pub fn build(cx: &App) -> Vec<Menu> {
                 MenuItem::action("Close all editors", CloseAllTabs),
                 MenuItem::separator(),
                 MenuItem::action("Pin Tab", PinTab),
+                MenuItem::action("Pin Preview", TogglePinPreview),
             ],
         ),
         MenuItem::action("Reopen closed editor", ReopenClosedEditor),

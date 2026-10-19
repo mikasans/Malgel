@@ -22,8 +22,9 @@ use gpui_kit::{
     },
     canvas,
     component::{
-        ActiveTheme as _, ElementExt as _, RopeExt as _,
+        ActiveTheme as _, ElementExt as _, RopeExt as _, Selectable as _,
         button::{Button, ButtonVariants as _},
+        Sizable as _,
         clipboard::Clipboard,
         h_flex,
         input::{
@@ -104,6 +105,19 @@ pub enum DocumentEvent {
     /// Show the editor pane (leave preview-only layout) so a jump to source
     /// is visible — used after a Typst preview click or go-to-definition.
     ShowEditor,
+    /// Pin or unpin this document's preview so it stays visible while the
+    /// user edits another file (workspace-level detached preview).
+    TogglePinPreview,
+}
+
+/// How the workspace asks this document to paint when a preview is pinned
+/// to another tab: editor only, preview only, or the normal layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaneRole {
+    #[default]
+    Full,
+    EditorOnly,
+    PreviewOnly,
 }
 
 pub struct DocumentView {
@@ -191,6 +205,10 @@ pub struct DocumentView {
     preview_width: Pixels,
     /// A stand-in tab for a PDF or picture still being read off the UI
     /// thread; the workspace swaps the finished document in, or removes it.
+    /// Workspace pin: force editor-only / preview-only / full layout.
+    pane_role: PaneRole,
+    /// Whether the workspace has pinned this document's preview.
+    preview_pinned: bool,
     loading: bool,
     /// Where the caret goes once a loading tab's text arrives, reported as
     /// its cursor meanwhile so a session saved now keeps it.
@@ -322,6 +340,8 @@ impl DocumentView {
             synced_preview_rows: 0,
             editor_width: px(0.),
             preview_width: px(0.),
+            pane_role: PaneRole::Full,
+            preview_pinned: false,
             loading: false,
             last_shape: None,
             shown_line: None,
@@ -442,7 +462,11 @@ impl DocumentView {
     /// A placeholder for `path` while it loads in the background: its tab
     /// carries the file's name and its body says it is loading.
     pub fn new_loading(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut doc = Self::new(String::new(), Some(path), LineEnding::Lf, window, cx);
+        // Build without a path so `load_text` does not spawn a Typst worker
+        // (or Markdown preview work) for an empty stand-in tab.
+        let mut doc = Self::new(String::new(), None, LineEnding::Lf, window, cx);
+        doc.path = Some(path);
+        doc.disk = None;
         doc.loading = true;
         doc
     }
@@ -457,6 +481,24 @@ impl DocumentView {
     pub fn is_loading(&self) -> bool {
         self.loading
     }
+
+    /// Workspace-driven layout role when a preview is pinned to another tab.
+    pub fn set_pane_role(&mut self, role: PaneRole, cx: &mut Context<Self>) {
+        if self.pane_role != role {
+            self.pane_role = role;
+            cx.notify();
+        }
+    }
+
+
+    pub fn set_preview_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
+        if self.preview_pinned != pinned {
+            self.preview_pinned = pinned;
+            cx.notify();
+        }
+    }
+
+
 
     /// A document displaying an image (PNG, JPEG, SVG, …) with zoom.
     pub fn new_image(
@@ -519,6 +561,8 @@ impl DocumentView {
             synced_preview_rows: 0,
             editor_width: px(0.),
             preview_width: px(0.),
+            pane_role: PaneRole::Full,
+            preview_pinned: false,
             loading: false,
             last_shape: None,
             shown_line: None,
@@ -586,6 +630,8 @@ impl DocumentView {
             synced_preview_rows: 0,
             editor_width: px(0.),
             preview_width: px(0.),
+            pane_role: PaneRole::Full,
+            preview_pinned: false,
             loading: false,
             last_shape: None,
             shown_line: None,
@@ -1366,7 +1412,7 @@ impl DocumentView {
     /// and a page viewer beside the editor. Clicking a page moves the caret
     /// to the text it came from.
     fn start_typst_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.live.is_some() || self.reduced {
+        if self.live.is_some() || self.reduced || self.loading {
             return;
         }
         let Some(path) = self
@@ -1698,6 +1744,75 @@ impl DocumentView {
         log::debug!("typst live: request definition at {offset}");
         live.worker
             .send(crate::typst_live::Request::DefinitionAt { offset });
+    }
+
+    /// Preview pane with a pin control so the user can freeze this document's
+    /// pages while editing another file.
+    fn render_preview_chrome(&self, window: &Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let theme = cx.theme();
+        let pinned = self.preview_pinned;
+        let name = self.name();
+        let can_pin = self.has_preview() || self.live.is_some();
+        let bar = h_flex()
+            .id("preview-chrome")
+            .w_full()
+            .flex_none()
+            .h(px(28.))
+            .px_2()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar.opacity(0.55))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(if pinned {
+                        theme.accent_foreground
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .child(if pinned {
+                        format!("Pinned preview — {name}")
+                    } else {
+                        format!("Preview — {name}")
+                    }),
+            )
+            .when(can_pin, |this| {
+                this.child(
+                    Button::new("pin-preview")
+                        .ghost()
+                        .small()
+                        .compact()
+                        .icon(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Pin))
+                        .tooltip(if pinned {
+                            "Unpin preview (follow active file again)"
+                        } else {
+                            "Pin preview (keep these pages while editing other files)"
+                        })
+                        .selected(self.preview_pinned)
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(DocumentEvent::TogglePinPreview);
+                        })),
+                )
+            });
+        v_flex()
+            .id("preview-with-chrome")
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .child(bar)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(self.render_side(window, cx)),
+            )
+            .into_any_element()
     }
 
     /// The preview pane: a live Typst preview's pages, under the compiler's
@@ -3337,14 +3452,17 @@ impl Render for DocumentView {
             });
         }
         let settings = AppSettings::get(cx);
-        let layout = if settings.focus_mode || !self.has_preview() {
-            Layout::Editor
-        } else {
-            settings.layout
+        // Pinned-preview roles win over the global layout: the active tab may
+        // be editor-only while another tab's preview stays on screen.
+        let layout = match self.pane_role {
+            PaneRole::EditorOnly => Layout::Editor,
+            PaneRole::PreviewOnly => Layout::Preview,
+            PaneRole::Full if settings.focus_mode || !self.has_preview() => Layout::Editor,
+            PaneRole::Full => settings.layout,
         };
         let body = match layout {
             Layout::Editor => self.render_editor(window, cx).into_any_element(),
-            Layout::Preview => self.render_side(window, cx),
+            Layout::Preview => self.render_preview_chrome(window, cx),
             Layout::Split => h_resizable("document-split")
                 .child(
                     resizable_panel()
@@ -3365,7 +3483,7 @@ impl Render for DocumentView {
                                 .size_full()
                                 .min_w_0()
                                 .min_h_0()
-                                .child(self.render_side(window, cx)),
+                                .child(self.render_preview_chrome(window, cx)),
                         ),
                 )
                 .into_any_element(),

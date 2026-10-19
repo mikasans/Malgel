@@ -337,6 +337,35 @@ pub fn is_typst_path(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("typ"))
 }
 
+/// How Malgel opens `path`: which viewer / editor surface to use.
+///
+/// Kept in one place so Explorer icons, Quick Open and `load_path` agree on
+/// the kind (PDF ≠ Typst ≠ Markdown ≠ image ≠ plain/code text).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenRenderer {
+    Markdown,
+    Typst,
+    Pdf,
+    Image,
+    /// Source / config / unknown text — editor only (no Markdown preview).
+    Text,
+}
+
+/// The renderer Malgel uses when the user casually opens `path`.
+pub fn open_renderer(path: &Path) -> OpenRenderer {
+    if is_pdf_path(path) {
+        OpenRenderer::Pdf
+    } else if is_image_path(path) {
+        OpenRenderer::Image
+    } else if is_typst_path(path) {
+        OpenRenderer::Typst
+    } else if is_markdown_path(path) {
+        OpenRenderer::Markdown
+    } else {
+        OpenRenderer::Text
+    }
+}
+
 /// The language a file is shown as in the status bar, the way VS Code names
 /// the language mode: `Rust` for `main.rs`, `Plain Text` for a file it has
 /// no mode for. A document that has never been saved is Markdown, Malgel's
@@ -538,7 +567,9 @@ pub fn open_check(path: &Path) -> OpenCheck {
         return OpenCheck::Fine;
     };
     let size = metadata.len();
-    let media = is_pdf_path(path) || is_image_path(path) || is_typst_path(path);
+    // PDF / image are opaque viewers. Typst is a text source (live pages
+    // beside the editor), so it uses the text size / binary sniff path.
+    let media = is_pdf_path(path) || is_image_path(path);
     if media {
         return if size > PROMPT_MEDIA_BYTES {
             OpenCheck::Large(size)
@@ -822,6 +853,29 @@ mod tests {
         assert!(!is_typst_path(Path::new("paper.typo")));
         assert!(!is_typst_path(Path::new("notes.md")));
         assert!(!is_typst_path(Path::new("typ")));
+    }
+
+    #[test]
+    fn open_renderer_matches_common_kinds() {
+        use super::OpenRenderer::*;
+        assert_eq!(open_renderer(Path::new("a.md")), Markdown);
+        assert_eq!(open_renderer(Path::new("a.typ")), Typst);
+        assert_eq!(open_renderer(Path::new("a.pdf")), Pdf);
+        assert_eq!(open_renderer(Path::new("a.png")), Image);
+        assert_eq!(open_renderer(Path::new("a.rs")), Text);
+        assert_eq!(open_renderer(Path::new("a.unknown")), Text);
+    }
+
+    #[test]
+    fn typst_uses_text_open_check_not_media_threshold() {
+        // A small .typ must not be treated as opaque media (no binary skip).
+        let dir = std::env::temp_dir().join(format!("malgel-typ-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let typ = dir.join("paper.typ");
+        std::fs::write(&typ, "= Hello\n").unwrap();
+        assert_eq!(open_check(&typ), OpenCheck::Fine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
