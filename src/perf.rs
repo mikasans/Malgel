@@ -254,6 +254,8 @@ mod pulse_tests {
         assert_eq!(format_cpu_compact(Some(0.0)), Some("0%".into()));
     }
 
+    // RSS comes from /proc/self/status, so the pulse label is only populated on Linux.
+    #[cfg(target_os = "linux")]
     #[test]
     fn pulse_sampler_produces_a_label() {
         ensure_pulse();
