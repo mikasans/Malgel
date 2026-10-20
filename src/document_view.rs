@@ -209,6 +209,9 @@ pub struct DocumentView {
     /// Whether the workspace has pinned this document's preview.
     preview_pinned: bool,
     loading: bool,
+    /// Why opening this path failed (magic-byte / format / IO). Shown in the
+    /// tab body instead of dropping the stand-in silently.
+    load_error: Option<SharedString>,
     /// Where the caret goes once a loading tab's text arrives, reported as
     /// its cursor meanwhile so a session saved now keeps it.
     pending_cursor: usize,
@@ -342,6 +345,7 @@ impl DocumentView {
             pane_role: PaneRole::Full,
             preview_pinned: false,
             loading: false,
+            load_error: None,
             last_shape: None,
             shown_line: None,
             gutter_anchor: None,
@@ -481,6 +485,13 @@ impl DocumentView {
         self.loading
     }
 
+    /// Turn a loading stand-in into a visible error pane for `path`.
+    pub fn set_load_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.loading = false;
+        self.load_error = Some(message.into());
+        cx.notify();
+    }
+
     /// Workspace-driven layout role when a preview is pinned to another tab.
     pub fn set_pane_role(&mut self, role: PaneRole, cx: &mut Context<Self>) {
         if self.pane_role != role {
@@ -560,6 +571,7 @@ impl DocumentView {
             pane_role: PaneRole::Full,
             preview_pinned: false,
             loading: false,
+            load_error: None,
             last_shape: None,
             shown_line: None,
             gutter_anchor: None,
@@ -629,6 +641,7 @@ impl DocumentView {
             pane_role: PaneRole::Full,
             preview_pinned: false,
             loading: false,
+            load_error: None,
             last_shape: None,
             shown_line: None,
             gutter_anchor: None,
@@ -3457,6 +3470,28 @@ impl Render for DocumentView {
                 .text_color(cx.theme().muted_foreground)
                 .child(gpui_kit::component::spinner::Spinner::new())
                 .child(format!("Loading \u{201c}{}\u{201d}\u{2026}", self.name()))
+                .into_any_element();
+        }
+        if let Some(err) = &self.load_error {
+            return v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .gap_3()
+                .px_8()
+                .child(
+                    div()
+                        .text_color(cx.theme().danger)
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .child(format!("Couldn\u{2019}t open \u{201c}{}\u{201d}", self.name())),
+                )
+                .child(
+                    div()
+                        .max_w(px(520.))
+                        .text_center()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(err.clone()),
+                )
                 .into_any_element();
         }
         if let Some(pdf) = &self.pdf {

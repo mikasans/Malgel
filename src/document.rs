@@ -387,7 +387,8 @@ pub fn language_name(path: Option<&Path>) -> &'static str {
         "pdf" => "PDF",
         "csv" => "CSV",
         "tsv" => "TSV",
-        "xml" | "svg" => "XML",
+        "xml" => "XML",
+        "svg" => "SVG",
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "ico" => "Image",
         _ => match language_tag(path) {
             Some("rust") => "Rust",

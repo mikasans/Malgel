@@ -123,8 +123,10 @@ pub fn build(cx: &App) -> Vec<Menu> {
         MenuItem::action(
             if macos {
                 "Reveal in Finder"
+            } else if cfg!(windows) {
+                "Reveal in File Explorer"
             } else {
-                "Show in folder"
+                "Reveal in File Manager"
             },
             RevealInFolder,
         ),

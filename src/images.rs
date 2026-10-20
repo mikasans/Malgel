@@ -69,8 +69,10 @@ pub fn load(url: &str, base_dir: Option<&Path>) -> Option<ImageData> {
 }
 
 /// Identify an image format from its first bytes.
-fn sniff_format(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn sniff_format(bytes: &[u8]) -> Option<&'static str> {
     let head = &bytes[..bytes.len().min(512)];
+    // Skip a UTF-8 BOM so `<?xml …><svg` still sniffs as SVG.
+    let head = head.strip_prefix(b"\xef\xbb\xbf").unwrap_or(head);
     Some(if head.starts_with(b"\x89PNG") {
         "png"
     } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -81,11 +83,17 @@ fn sniff_format(bytes: &[u8]) -> Option<&'static str> {
         "webp"
     } else if head.starts_with(b"BM") {
         "bmp"
-    } else if String::from_utf8_lossy(head).contains("<svg") {
+    } else if looks_like_svg(head) {
         "svg"
     } else {
         return None;
     })
+}
+
+/// SVG is XML text: look for an `<svg` tag (any ASCII case) in the head.
+fn looks_like_svg(head: &[u8]) -> bool {
+    let lower = head.to_ascii_lowercase();
+    lower.windows(4).any(|w| w == b"<svg")
 }
 
 /// The bytes and MIME type of a `data:` URL (without the `data:` prefix).
@@ -273,5 +281,18 @@ mod tests {
         assert_eq!(decode_base64("aGVsbG8=").unwrap(), b"hello");
         assert_eq!(decode_base64("aGk").unwrap(), b"hi");
         assert!(decode_base64("a$b").is_none());
+    }
+
+    #[test]
+    fn sniffs_svg_case_insensitively_and_after_bom() {
+        assert_eq!(sniff_format(b"<svg xmlns='http://www.w3.org/2000/svg'/>"), Some("svg"));
+        assert_eq!(
+            sniff_format(br#"<?xml version="1.0"?><SVG viewBox="0 0 1 1"></SVG>"#),
+            Some("svg")
+        );
+        let mut with_bom = vec![0xef, 0xbb, 0xbf];
+        with_bom.extend(b"<svg width='1' height='1'/>");
+        assert_eq!(sniff_format(&with_bom), Some("svg"));
+        assert_eq!(sniff_format(b"not an image"), None);
     }
 }

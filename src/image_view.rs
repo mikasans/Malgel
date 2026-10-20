@@ -67,16 +67,27 @@ pub struct ImageView {
 
 /// Decode `bytes` as the image `path` names; returns the image with its
 /// natural size in logical pixels.
+///
+/// Extension and magic bytes are cross-checked so a mislabeled or damaged
+/// file fails here (visible in the tab) instead of hanging on a blank viewer.
+/// SVG is validated with `resvg` so dimensions are real and bad XML is caught.
 pub fn load_image(path: &Path, bytes: Vec<u8>) -> Result<(Arc<Image>, f32, f32), String> {
-    let format = image_format(path).ok_or_else(|| {
+    let by_ext = image_format(path);
+    let sniffed = crate::images::sniff_format(&bytes);
+    let format = resolve_image_format(path, by_ext, sniffed)?;
+
+    if format == ImageFormat::Svg {
+        let (width, height) = svg_dimensions(&bytes)?;
+        let image = Arc::new(Image::from_bytes(ImageFormat::Svg, bytes));
+        return Ok((image, width, height));
+    }
+
+    let (width, height) = probe_dimensions(&bytes, format).ok_or_else(|| {
         format!(
-            "unknown image format ({})",
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("no extension")
+            "Couldn\u{2019}t read image dimensions ({})",
+            format_label(format)
         )
     })?;
-    let (width, height) = probe_dimensions(&bytes, format).unwrap_or((1024., 768.));
     // A photo of tens of megapixels would be decoded whole onto the GPU;
     // past what any screen shows, keep a copy at display resolution instead.
     // The layout still uses the full size, so zoom and fit are unchanged.
@@ -87,6 +98,80 @@ pub fn load_image(path: &Path, bytes: Vec<u8>) -> Result<(Arc<Image>, f32, f32),
     };
     let image = Arc::new(Image::from_bytes(format, bytes));
     Ok((image, width, height))
+}
+
+fn format_label(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "PNG",
+        ImageFormat::Jpeg => "JPEG",
+        ImageFormat::Webp => "WebP",
+        ImageFormat::Gif => "GIF",
+        ImageFormat::Svg => "SVG",
+        ImageFormat::Bmp => "BMP",
+        ImageFormat::Tiff => "TIFF",
+        ImageFormat::Ico => "ICO",
+        _ => "image",
+    }
+}
+
+fn sniff_to_format(sniffed: &str) -> Option<ImageFormat> {
+    Some(match sniffed {
+        "png" => ImageFormat::Png,
+        "jpg" => ImageFormat::Jpeg,
+        "webp" => ImageFormat::Webp,
+        "gif" => ImageFormat::Gif,
+        "svg" => ImageFormat::Svg,
+        "bmp" => ImageFormat::Bmp,
+        _ => return None,
+    })
+}
+
+fn resolve_image_format(
+    path: &Path,
+    by_ext: Option<ImageFormat>,
+    sniffed: Option<&'static str>,
+) -> Result<ImageFormat, String> {
+    let by_sniff = sniffed.and_then(sniff_to_format);
+    match (by_ext, by_sniff, sniffed) {
+        // Prefer magic bytes when they name a format we can show — a
+        // `.svg` that is really a PNG still opens, and a real SVG opens
+        // even when the extension was wrong.
+        (_, Some(format), _) => Ok(format),
+        (Some(ImageFormat::Svg), None, _) => {
+            // Extension says SVG but the head has no `<svg` — still try
+            // parsing; usvg will return a clear error if it is not SVG.
+            Ok(ImageFormat::Svg)
+        }
+        (Some(format), None, _) => Err(format!(
+            "File header does not look like {} (extension \u{201c}.{}\u{201d})",
+            format_label(format),
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("?")
+        )),
+        (None, None, _) => Err(format!(
+            "unknown image format ({})",
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("no extension")
+        )),
+    }
+}
+
+fn svg_dimensions(bytes: &[u8]) -> Result<(f32, f32), String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        "SVG is not valid UTF-8 text".to_string()
+    })?;
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_str(text, &options).map_err(|err| {
+        format!("Couldn\u{2019}t parse SVG. {err}")
+    })?;
+    let size = tree.size();
+    let (width, height) = (size.width(), size.height());
+    if !(width.is_finite() && height.is_finite() && width > 0. && height > 0.) {
+        return Err("SVG has no usable width/height".into());
+    }
+    Ok((width, height))
 }
 
 /// Pixels decoded for display at most: 4096 × 4096, 64 MB as RGBA.
@@ -583,6 +668,34 @@ mod tests {
             .1;
         let decoded = image::load_from_memory(&small).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (4096, 32));
+    }
+
+    #[test]
+    fn svg_opens_with_real_dimensions_and_rejects_garbage() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40"><rect width="120" height="40"/></svg>"#;
+        let (image, width, height) = load_image(Path::new("figure.svg"), svg.to_vec()).unwrap();
+        assert_eq!(image.format(), ImageFormat::Svg);
+        assert!((width - 120.).abs() < 0.01, "got {width}");
+        assert!((height - 40.).abs() < 0.01, "got {height}");
+
+        // XML prologue + viewBox (no width/height) still sniffs and sizes.
+        let fancy = br#"<?xml version="1.0"?><svg viewBox="0 0 10 5" xmlns="http://www.w3.org/2000/svg"></svg>"#;
+        let (_, w, h) = load_image(Path::new("x.SVG"), fancy.to_vec()).unwrap();
+        assert!((w - 10.).abs() < 0.01 && (h - 5.).abs() < 0.01, "{w}x{h}");
+
+        let err = load_image(Path::new("broken.svg"), b"not svg at all".to_vec()).unwrap_err();
+        assert!(
+            err.contains("parse") || err.contains("SVG") || err.contains("header"),
+            "{err}"
+        );
+
+        // Extension says PNG but bytes are SVG — open as SVG via magic bytes.
+        let (_, w, h) = load_image(Path::new("misnamed.png"), svg.to_vec()).unwrap();
+        assert!((w - 120.).abs() < 0.01 && (h - 40.).abs() < 0.01);
+
+        // Extension says PNG but bytes are garbage.
+        let err = load_image(Path::new("bad.png"), b"hello".to_vec()).unwrap_err();
+        assert!(err.contains("header") || err.contains("PNG"), "{err}");
     }
 
     #[test]

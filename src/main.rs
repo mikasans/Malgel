@@ -25,6 +25,7 @@ mod links;
 mod math;
 mod menus;
 mod pdf;
+mod paths;
 pub mod pdf_view;
 mod perf;
 mod preview_ext;

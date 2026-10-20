@@ -1813,11 +1813,12 @@ fn display_name(path: &Path) -> String {
 }
 
 /// Absolute path text for the clipboard: the OS display form, one path per
-/// line when several entries are picked (as in VS Code).
+/// line when several entries are picked (as in VS Code). Win32 `\\?\`
+/// prefixes are stripped so paste targets get a normal `D:\…` path.
 pub(crate) fn absolute_paths_for_clipboard(paths: &[PathBuf]) -> String {
     paths
         .iter()
-        .map(|path| path.display().to_string())
+        .map(|path| crate::paths::path_for_clipboard(path))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1832,7 +1833,7 @@ pub(crate) fn relative_path_for_clipboard(path: &Path, root: Option<&Path>) -> S
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string()),
-        None => path.display().to_string(),
+        None => crate::paths::path_for_clipboard(path),
     }
 }
 
@@ -2124,6 +2125,12 @@ mod tests {
         assert_eq!(
             relative_paths_for_clipboard(&paths, Some(root)),
             "a.md\nb/c.md"
+        );
+        // Win32 extended-length paths must not leak onto the clipboard.
+        let win = vec![PathBuf::from(r"\\?\D:\work\leo\glint.svg")];
+        assert_eq!(
+            absolute_paths_for_clipboard(&win),
+            r"D:\work\leo\glint.svg"
         );
     }
 }

@@ -1211,6 +1211,33 @@ impl Workspace {
         }
     }
 
+    /// Keep the loading tab and show why the open failed, so magic-byte /
+    /// format mistakes are visible in the editor instead of vanishing.
+    fn fail_loading(
+        &mut self,
+        placeholder: Option<EntityId>,
+        path: &Path,
+        err: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let err = err.into();
+        let message = format!(
+            "Couldn\u{2019}t open \u{201c}{}\u{201d}. {err}",
+            document::display_name(Some(&path.to_path_buf()))
+        );
+        if let Some(id) = placeholder
+            && let Some(doc) = self.documents.iter().find(|doc| doc.entity_id() == id)
+        {
+            doc.update(cx, |doc, cx| doc.set_load_error(err, cx));
+            // Toast as well so the failure is noticed if the tab is buried.
+            self.notify_error(message, window, cx);
+            return;
+        }
+        self.drop_loading(placeholder, path, window, cx);
+        self.notify_error(message, window, cx);
+    }
+
     /// Put a finished document in the place of its loading tab `id` at
     /// `ix`, keeping that tab's preview slot and pin.
     fn swap_in_loaded(
@@ -1676,19 +1703,15 @@ impl Workspace {
                         }
                     }
                     Err(err) => {
-                        // No empty tab is left behind: the stand-in goes,
-                        // and the error says why.
-                        this.drop_loading(placeholder, &path, window, cx);
                         if pdf {
                             AppSettings::update(cx, |settings| {
                                 settings.recent_files.retain(|recent| recent != &path)
                             });
                         }
-                        this.notify_error(
-                            format!(
-                                "Couldn\u{2019}t open \u{201c}{}\u{201d}. {err}",
-                                document::display_name(Some(&path))
-                            ),
+                        this.fail_loading(
+                            placeholder,
+                            &path,
+                            err,
                             window,
                             cx,
                         );
@@ -1742,15 +1765,10 @@ impl Workspace {
                     }
                 }
                 Err(err) => {
-                    this.drop_loading(placeholder, &path, window, cx);
                     AppSettings::update(cx, |settings| {
                         settings.recent_files.retain(|recent| recent != &path)
                     });
-                    this.notify_error(
-                        format!("Couldn’t open “{}”. {err}", display_name(Some(&path))),
-                        window,
-                        cx,
-                    );
+                    this.fail_loading(placeholder, &path, err.to_string(), window, cx);
                 }
             });
         })
@@ -3309,7 +3327,7 @@ impl Workspace {
                 }
             }
         };
-        cx.reveal_path(&path);
+        reveal_path_in_file_manager(cx, &path);
     }
 
     fn tree_select_up(&mut self, _: &TreeSelectUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -5034,7 +5052,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match self.active_document().read(cx).path().cloned() {
-            Some(path) => cx.reveal_path(&path),
+            Some(path) => reveal_path_in_file_manager(cx, &path),
             None => window.push_notification(
                 Notification::info("Save the document to give it a location."),
                 cx,
@@ -5407,7 +5425,7 @@ impl Workspace {
                     );
                 match path.clone() {
                     Some(path) => {
-                        let text = path.display().to_string();
+                        let text = crate::paths::path_for_clipboard(&path);
                         let reveal = path.clone();
                         menu.separator()
                             .item(PopupMenuItem::new("Copy Path").on_click(move |_, _, cx| {
@@ -5415,7 +5433,7 @@ impl Workspace {
                             }))
                             .item(PopupMenuItem::new("Reveal in File Manager").on_click(
                                 move |_, _, cx| {
-                                    cx.reveal_path(&reveal);
+                                    reveal_path_in_file_manager(cx, &reveal);
                                 },
                             ))
                     }
@@ -8079,11 +8097,7 @@ impl Workspace {
             return;
         }
         self.last_path_copy = Some(now);
-        let abs = path
-            .canonicalize()
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
+        let abs = crate::paths::path_for_clipboard(&path.canonicalize().unwrap_or(path));
         cx.write_to_clipboard(ClipboardItem::new_string(abs.clone()));
         window.push_notification(Notification::info(format!("Copied {abs}")), cx);
     }
@@ -9330,6 +9344,13 @@ fn placeholder_is_safe(placement: Placement, active_blank: bool, tabs: bool) -> 
 
 /// Whether the tab strip should scroll its active tab into view: on the
 /// first frame, and whenever the active tab or the number of tabs changed.
+/// Reveal `path` in the OS file manager, after stripping a Win32 `\\?\`
+/// prefix that otherwise breaks Explorer / `ParseDisplayName`.
+fn reveal_path_in_file_manager(cx: &App, path: &Path) {
+    let path = crate::paths::path_for_shell(path);
+    cx.reveal_path(&path);
+}
+
 fn tab_needs_reveal(revealed: Option<(usize, usize)>, now: (usize, usize)) -> bool {
     revealed != Some(now)
 }
