@@ -145,9 +145,7 @@ fn resolve_image_format(
         (Some(format), None, _) => Err(format!(
             "File header does not look like {} (extension \u{201c}.{}\u{201d})",
             format_label(format),
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("?")
+            path.extension().and_then(|ext| ext.to_str()).unwrap_or("?")
         )),
         (None, None, _) => Err(format!(
             "unknown image format ({})",
@@ -159,13 +157,10 @@ fn resolve_image_format(
 }
 
 fn svg_dimensions(bytes: &[u8]) -> Result<(f32, f32), String> {
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        "SVG is not valid UTF-8 text".to_string()
-    })?;
+    let text = std::str::from_utf8(bytes).map_err(|_| "SVG is not valid UTF-8 text".to_string())?;
     let options = resvg::usvg::Options::default();
-    let tree = resvg::usvg::Tree::from_str(text, &options).map_err(|err| {
-        format!("Couldn\u{2019}t parse SVG. {err}")
-    })?;
+    let tree = resvg::usvg::Tree::from_str(text, &options)
+        .map_err(|err| format!("Couldn\u{2019}t parse SVG. {err}"))?;
     let size = tree.size();
     let (width, height) = (size.width(), size.height());
     if !(width.is_finite() && height.is_finite() && width > 0. && height > 0.) {

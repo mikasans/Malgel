@@ -3483,7 +3483,10 @@ impl Render for DocumentView {
                     div()
                         .text_color(cx.theme().danger)
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                        .child(format!("Couldn\u{2019}t open \u{201c}{}\u{201d}", self.name())),
+                        .child(format!(
+                            "Couldn\u{2019}t open \u{201c}{}\u{201d}",
+                            self.name()
+                        )),
                 )
                 .child(
                     div()

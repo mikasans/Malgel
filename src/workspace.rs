@@ -1708,13 +1708,7 @@ impl Workspace {
                                 settings.recent_files.retain(|recent| recent != &path)
                             });
                         }
-                        this.fail_loading(
-                            placeholder,
-                            &path,
-                            err,
-                            window,
-                            cx,
-                        );
+                        this.fail_loading(placeholder, &path, err, window, cx);
                     }
                 });
             })

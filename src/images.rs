@@ -285,7 +285,10 @@ mod tests {
 
     #[test]
     fn sniffs_svg_case_insensitively_and_after_bom() {
-        assert_eq!(sniff_format(b"<svg xmlns='http://www.w3.org/2000/svg'/>"), Some("svg"));
+        assert_eq!(
+            sniff_format(b"<svg xmlns='http://www.w3.org/2000/svg'/>"),
+            Some("svg")
+        );
         assert_eq!(
             sniff_format(br#"<?xml version="1.0"?><SVG viewBox="0 0 1 1"></SVG>"#),
             Some("svg")
