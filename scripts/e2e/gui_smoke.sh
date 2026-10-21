@@ -466,16 +466,18 @@ sleep 0.5
   || fail "Ctrl+K Ctrl+T in the editor changed the text (Insert Link ate the chord)"
 pass "Ctrl+K Ctrl+T in the editor opens the theme picker"
 # Ctrl+K followed by any other key is still Insert Link (the chord only
-# holds the first key back), and the other key is typed after it.
+# holds the first key back), and the other key is typed after it. The key
+# must not start a chord of its own: Ctrl+K Z is Zen Mode and Ctrl+K S is
+# Save All, as in VS Code, so use J.
 xdotool key --clearmodifiers ctrl+End
 xdotool key --clearmodifiers ctrl+k
 sleep 0.15
-xdotool type --delay 30 'zq'
+xdotool type --delay 30 'jq'
 sleep 0.4
 xdotool key --clearmodifiers ctrl+s
 wait_for 5 grep -q '\](' "$WS/README.md" \
   || fail "Ctrl+K then another key did not insert a link: $(tail -c 80 "$WS/README.md")"
-grep -q 'zq' "$WS/README.md" || fail "the key after Ctrl+K was lost"
+grep -q 'jq' "$WS/README.md" || fail "the key after Ctrl+K was lost"
 # Put it back from inside the editor (an external rewrite races the reload).
 for _ in 1 2 3 4 5 6; do
   [[ "$(cat "$WS/README.md")" == "$before_chord" ]] && break
