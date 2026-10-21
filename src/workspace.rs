@@ -3274,6 +3274,13 @@ impl Workspace {
     }
 
     fn tree_rename(&mut self, _: &RenameInTree, window: &mut Window, cx: &mut Context<Self>) {
+        // A single-line input lets Enter propagate after it emits PressEnter,
+        // so Enter in the rename box also reaches the tree's Enter (= rename)
+        // binding. Restarting the rename there replaced the input before its
+        // PressEnter was handled, and the rename was never committed.
+        if self.file_tree.read(cx).is_typing_a_rename(window, cx) {
+            return;
+        }
         let Some((path, is_dir)) = self.file_tree.read(cx).single_selection() else {
             return;
         };
@@ -3861,20 +3868,21 @@ impl Workspace {
                             focus.trap(
                                 DialogFooter::new()
                                     .justify_end()
-                                    .child(
-                                        Button::new("rif-cancel")
-                                            .label("Cancel")
-                                            .outline()
-                                            .on_click({
-                                                let ws = ws.clone();
-                                                move |_, window, cx| {
-                                                    window.close_dialog(cx);
-                                                    _ = ws.update(cx, |this, cx| {
-                                                        this.focus_active(window, cx)
-                                                    });
-                                                }
-                                            }),
-                                    )
+                                    .child(focus.secondary(
+                                        0,
+                                        Button::new("rif-cancel").label("Cancel").outline(),
+                                        {
+                                            let ws = ws.clone();
+                                            move |window, cx| {
+                                                window.close_dialog(cx);
+                                                _ = ws.update(cx, |this, cx| {
+                                                    this.focus_active(window, cx)
+                                                });
+                                            }
+                                        },
+                                        window,
+                                        cx,
+                                    ))
                                     .child(focus.primary(
                                         Button::new("rif-replace-all")
                                             .label("Replace All")
@@ -4299,37 +4307,41 @@ impl Workspace {
                     focus.trap(
                         DialogFooter::new()
                             .justify_end()
-                            .child(
-                                Button::new("discard-all")
-                                    .label("Don’t Save All")
-                                    .outline()
-                                    .on_click(move |_, window, cx| {
-                                        window.close_dialog(cx);
-                                        let next = discard_next.clone();
-                                        let ids = discard_ids.clone();
-                                        _ = discard.update(cx, |this, cx| {
-                                            for id in ids {
-                                                if let Some(ix) = this.document_index(id) {
-                                                    this.documents[ix].update(cx, |doc, _| {
-                                                        doc.discard_recovery()
-                                                    });
-                                                }
-                                                this.discarded.insert(id);
+                            .child(focus.secondary(
+                                0,
+                                Button::new("discard-all").label("Don’t Save All").outline(),
+                                move |window, cx| {
+                                    window.close_dialog(cx);
+                                    let next = discard_next.clone();
+                                    let ids = discard_ids.clone();
+                                    _ = discard.update(cx, |this, cx| {
+                                        for id in ids {
+                                            if let Some(ix) = this.document_index(id) {
+                                                this.documents[ix]
+                                                    .update(cx, |doc, _| doc.discard_recovery());
                                             }
-                                            this.focus_active(window, cx);
-                                            this.run_after_confirm(next, window, cx);
-                                        });
-                                    }),
-                            )
+                                            this.discarded.insert(id);
+                                        }
+                                        this.focus_active(window, cx);
+                                        this.run_after_confirm(next, window, cx);
+                                    });
+                                },
+                                window,
+                                cx,
+                            ))
                             .child(div().flex_1())
-                            .child(Button::new("cancel").label("Cancel").outline().on_click(
-                                move |_, window, cx| {
+                            .child(focus.secondary(
+                                1,
+                                Button::new("cancel").label("Cancel").outline(),
+                                move |window, cx| {
                                     window.close_dialog(cx);
                                     _ = cancel.update(cx, |this, cx| {
                                         this.discarded.clear();
                                         this.focus_active(window, cx);
                                     });
                                 },
+                                window,
+                                cx,
                             ))
                             .child(
                                 focus.primary(
@@ -4420,31 +4432,36 @@ impl Workspace {
                     focus.trap(
                         DialogFooter::new()
                             .justify_end()
-                            .child(
-                                Button::new("discard")
-                                    .label("Don’t Save")
-                                    .outline()
-                                    .on_click(move |_, window, cx| {
-                                        window.close_dialog(cx);
-                                        let next = discard_next.clone();
-                                        let id = discard_doc.entity_id();
-                                        discard_doc.update(cx, |doc, _| doc.discard_recovery());
-                                        _ = discard.update(cx, |this, cx| {
-                                            this.discarded.insert(id);
-                                            this.focus_active(window, cx);
-                                            this.run_after_confirm(next, window, cx)
-                                        });
-                                    }),
-                            )
+                            .child(focus.secondary(
+                                0,
+                                Button::new("discard").label("Don’t Save").outline(),
+                                move |window, cx| {
+                                    window.close_dialog(cx);
+                                    let next = discard_next.clone();
+                                    let id = discard_doc.entity_id();
+                                    discard_doc.update(cx, |doc, _| doc.discard_recovery());
+                                    _ = discard.update(cx, |this, cx| {
+                                        this.discarded.insert(id);
+                                        this.focus_active(window, cx);
+                                        this.run_after_confirm(next, window, cx)
+                                    });
+                                },
+                                window,
+                                cx,
+                            ))
                             .child(div().flex_1())
-                            .child(Button::new("cancel").label("Cancel").outline().on_click(
-                                move |_, window, cx| {
+                            .child(focus.secondary(
+                                1,
+                                Button::new("cancel").label("Cancel").outline(),
+                                move |window, cx| {
                                     window.close_dialog(cx);
                                     _ = cancel.update(cx, |this, cx| {
                                         this.discarded.clear();
                                         this.focus_active(window, cx);
                                     });
                                 },
+                                window,
+                                cx,
                             ))
                             .child(focus.primary(
                                 Button::new("save").label("Save").primary().on_click(

@@ -2,23 +2,33 @@
 //! button focused and ringed, and Tab / Shift+Tab cycle through the buttons
 //! without leaving the dialog.
 //!
-//! gpui-component's buttons keep their focus handles private, so the primary
-//! button is wrapped in an element with a handle of ours; the button itself
-//! leaves the tab order and the wrapper draws the ring.
+//! gpui-component's buttons keep their focus handles private, so each button
+//! is wrapped in an element with a handle of ours; the button itself leaves
+//! the tab order and the wrapper draws the ring.
+//!
+//! The dialog binds Enter to its OK handler (the primary button). The other
+//! buttons' wrappers answer that Enter themselves, so Enter presses the button
+//! that has the keyboard — Tab to Don't Save, Enter must not save.
+
+use std::rc::Rc;
 
 use gpui_kit::{
-    App, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _,
-    Window,
-    base::FocusTrapElement as _,
+    App, ClickEvent, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _, Window,
+    base::{FocusTrapElement as _, actions::Confirm},
     component::{ActiveTheme as _, button::Button},
     div, px,
 };
+
+/// How many non-primary buttons an alert can have.
+const SECONDARY_BUTTONS: usize = 3;
 
 /// The focus handles of one alert's buttons (one alert shows at a time, so
 /// an owner keeps a single pair and reuses it).
 pub struct DialogFocus {
     trap: FocusHandle,
     primary: FocusHandle,
+    secondary: [FocusHandle; SECONDARY_BUTTONS],
 }
 
 impl DialogFocus {
@@ -26,6 +36,7 @@ impl DialogFocus {
         Self {
             trap: cx.focus_handle(),
             primary: cx.focus_handle().tab_stop(true),
+            secondary: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
         }
     }
 
@@ -49,6 +60,54 @@ impl DialogFocus {
             .border_2()
             .border_color(ring)
             .child(button.tab_stop(false))
+    }
+
+    /// Non-primary button number `ix` (0-based, at most three per dialog):
+    /// in the tab order through our handle, ringed while focused, and pressed
+    /// by Enter or Space while it has the keyboard, as well as by a click.
+    /// `press` replaces the button's own `on_click`.
+    pub fn secondary(
+        &self,
+        ix: usize,
+        button: Button,
+        press: impl Fn(&mut Window, &mut App) + 'static,
+        window: &Window,
+        cx: &App,
+    ) -> impl IntoElement {
+        let handle = &self.secondary[ix.min(SECONDARY_BUTTONS - 1)];
+        let ring = if handle.is_focused(window) {
+            cx.theme().ring
+        } else {
+            gpui_kit::transparent_black()
+        };
+        let press = Rc::new(press);
+        div()
+            .id(("alert-secondary", ix))
+            .track_focus(handle)
+            .rounded(cx.theme().radius + px(2.))
+            .border_2()
+            .border_color(ring)
+            // Enter: the dialog's Confirm binding fires before any key
+            // listener, so answer it here, below the dialog's OK handler.
+            .on_action({
+                let press = press.clone();
+                move |_: &Confirm, window, cx| press(window, cx)
+            })
+            // Space: the focused wrapper's native keyboard click. A mouse
+            // click lands on the button below, so skip it here.
+            .on_click({
+                let press = press.clone();
+                move |event: &ClickEvent, window, cx| {
+                    if event.is_keyboard() {
+                        press(window, cx)
+                    }
+                }
+            })
+            .child(
+                button
+                    .tab_stop(false)
+                    .on_click(move |_, window, cx| press(window, cx)),
+            )
     }
 
     /// Keep Tab inside `footer`: past the last button it wraps to the first.

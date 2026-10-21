@@ -731,12 +731,17 @@ pass "dragging a zoomed-in page moves it"
 #     has nothing to scroll and has to leave the frame alone. It is opened by
 #     clicking the Explorer: keyboard shortcuts do not reach a focused viewer
 #     (see scripts/e2e/README.md), and the PDF viewer was just closed over.
+# Find in Files (step 9) left the Search view in the sidebar, the way VS
+# Code keeps it after a hit is opened; bring the Explorer back first.
+xdotool key --clearmodifiers ctrl+shift+e
+sleep 0.8
+shot 24b-explorer
 xdotool mousemove $((win_x + 83)) $((win_y + 285))
 sleep 0.3
 xdotool click 1
 sleep 1.5
 shot 25-image-open
-[[ "$(pixels_differ 24-pdf-dragged 25-image-open)" -gt 1000 ]] \
+[[ "$(pixels_differ 24b-explorer 25-image-open)" -gt 1000 ]] \
   || fail "clicking the Explorer did not open the image"
 xdotool mousemove $((win_x + 640)) $((win_y + 420))
 sleep 0.3
@@ -1288,12 +1293,14 @@ shot 47-quit-confirm
 kill -0 "$APP_PID" 2>/dev/null || fail "Ctrl+Q with unsaved changes quit without asking"
 [[ "$(pixels_differ 46-quit-dirty 47-quit-confirm)" -gt 1000 ]] \
   || fail "Ctrl+Q with unsaved changes showed no dialog"
+# The region is the dialog itself, buttons included: it grew when the
+# dialog started listing the unsaved files, and the old one missed the row.
 # The dialog opens with Save (primary) ringed; Tab moves the ring, and three
 # Tabs (Don't save, Cancel, Save) come back around without leaving it.
 xdotool key --clearmodifiers Tab
 sleep 0.3
 shot 47a-quit-tab1
-[[ "$(region_differ 47-quit-confirm 47a-quit-tab1 600x220+520+150)" -gt 30 ]] \
+[[ "$(region_differ 47-quit-confirm 47a-quit-tab1 460x290+570+160)" -gt 30 ]] \
   || fail "Tab in the quit dialog did not move the focus ring"
 xdotool key --clearmodifiers Tab
 sleep 0.2
@@ -1301,7 +1308,7 @@ xdotool key --clearmodifiers Tab
 sleep 0.3
 shot 47b-quit-tab3
 # Dialog region only: the editor behind may repaint (caret).
-[[ "$(region_differ 47-quit-confirm 47b-quit-tab3 600x220+520+150)" -lt 30 ]] \
+[[ "$(region_differ 47-quit-confirm 47b-quit-tab3 460x290+570+160)" -lt 30 ]] \
   || fail "three Tabs did not cycle back to Save (focus left the dialog?)"
 pass "quit dialog: primary focused, Tab cycles inside the dialog"
 xdotool type --delay 30 'LEAK'
@@ -1427,7 +1434,9 @@ assert found > 20, f"Tokyo Moon background not found ({found})"
 # on line 7 after Ctrl+End, so its brighter number is not sampled).
 best = None
 for y in range(int(h * .17), int(h * .355)):
-    for x in range(int(w * .29), int(w * .33)):
+    # The gutter sits right of the sidebar (wider at the zoom left over from
+    # earlier steps), so look between it and the text column.
+    for x in range(int(w * .34), int(w * .37)):
         px = im.getpixel((x, y))
         if max(abs(a - b) for a, b in zip(px, bg)) > 3 and px[2] >= px[0]:
             r = ratio(px, bg)

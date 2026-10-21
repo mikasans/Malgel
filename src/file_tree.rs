@@ -655,6 +655,13 @@ impl FileTree {
         cx.notify();
     }
 
+    /// Whether the keyboard is in an open inline rename box.
+    pub fn is_typing_a_rename(&self, window: &Window, cx: &gpui_kit::App) -> bool {
+        self.rename_input
+            .as_ref()
+            .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window))
+    }
+
     pub fn cancel_inline_rename(&mut self, cx: &mut Context<Self>) {
         self.renaming = None;
         self.rename_input = None;
@@ -667,6 +674,9 @@ impl FileTree {
             return;
         };
         self.cancel_inline_rename(cx);
+        // The input that had the keyboard is gone; hand it back to the tree
+        // (as VS Code does) so the window's shortcuts keep working.
+        self.focus_handle.focus(window, cx);
         let name = name.trim();
         if name.is_empty() {
             return;
@@ -1288,9 +1298,14 @@ impl FileTree {
                 let at_root = self.root.as_deref() == Some(entry.path.as_path());
                 let can_paste = self.has_clipboard();
                 let menu_focus = self.focus_handle.clone();
+                // Rows are as wide as their name; the rename input has no
+                // intrinsic width, so its row must take the whole width or
+                // the input collapses to nothing (no text, no caret, no keys).
+                let is_renaming = renaming_path.as_ref() == Some(&entry.path);
                 Some(
                     h_flex()
                         .id(ix)
+                        .when(is_renaming, |this| this.w_full())
                         .h(px(26.))
                         .pl(px(8. + 14. * row.depth as f32))
                         .pr_2()
@@ -1347,13 +1362,14 @@ impl FileTree {
                                 }),
                         )
                         .child(type_icon.small().flex_none())
-                        .child(if renaming_path.as_ref() == Some(&entry.path) {
+                        .child(if is_renaming {
                             if let Some(input) = rename_input.clone() {
                                 div()
                                     .flex_1()
-                                    .min_w_0()
-                                    .on_action(cx.listener(|this, _: &Escape, _, cx| {
+                                    .min_w(px(80.))
+                                    .on_action(cx.listener(|this, _: &Escape, window, cx| {
                                         this.cancel_inline_rename(cx);
+                                        this.focus_handle.focus(window, cx);
                                     }))
                                     .child(Input::new(&input).appearance(false))
                                     .into_any_element()
