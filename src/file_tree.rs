@@ -2128,9 +2128,6 @@ mod tests {
         );
         // Win32 extended-length paths must not leak onto the clipboard.
         let win = vec![PathBuf::from(r"\\?\D:\work\leo\glint.svg")];
-        assert_eq!(
-            absolute_paths_for_clipboard(&win),
-            r"D:\work\leo\glint.svg"
-        );
+        assert_eq!(absolute_paths_for_clipboard(&win), r"D:\work\leo\glint.svg");
     }
 }

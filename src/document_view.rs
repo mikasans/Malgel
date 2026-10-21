@@ -1138,12 +1138,13 @@ impl DocumentView {
             return;
         }
         let source = self.editor.read(cx).value();
-        if self.live.is_some() {
+        if let Some(live) = &mut self.live {
+            self.revision += 1;
+            live.sync.edited(self.revision);
             self.source = source;
             self.dirty = true;
-            self.revision += 1;
             self.focus_block = None;
-            self.send_live_text(debounce, cx);
+            self.send_live_text(debounce, false, cx);
             self.schedule_analysis(debounce, cx);
             cx.notify();
             return;
@@ -1452,14 +1453,27 @@ impl DocumentView {
             },
         );
         let listen = cx.spawn_in(window, async move |this, cx| {
+            use crate::typst_live::Response;
             use futures::StreamExt as _;
             while let Some(answer) = answers.next().await {
-                if this
-                    .update_in(cx, |this, window, cx| {
-                        this.on_live_answer(answer, window, cx)
-                    })
-                    .is_err()
-                {
+                // Pages, diagnostics and caret reveals only need the
+                // document, never the window: an update that needs the
+                // window fails whenever the window is busy (a nested event
+                // loop, a modal), and that used to end this loop for good —
+                // every later compile was then dropped on the floor and the
+                // preview stopped following the editor.
+                let applied = match answer {
+                    Response::SourceAt(offset) => this.update_in(cx, |this, window, cx| {
+                        this.reveal_typst_source(offset, "Preview click", window, cx)
+                    }),
+                    Response::DefinitionAt(offset) => this.update_in(cx, |this, window, cx| {
+                        this.reveal_typst_source(offset, "Go to Definition", window, cx)
+                    }),
+                    answer => this.update(cx, |this, cx| this.on_live_answer(answer, cx)),
+                };
+                // Only a document that is gone ends the loop; a jump that
+                // could not reach the window is simply skipped.
+                if applied.is_err() && this.upgrade().is_none() {
                     break;
                 }
             }
@@ -1477,57 +1491,110 @@ impl DocumentView {
             revealed_cursor: None,
             typed: None,
             latency: None,
+            sync: crate::typst_live::LiveSync::default(),
             _listen: listen,
             _clicks: clicks,
         });
     }
 
     /// Hand the text to the compiler once typing pauses briefly.
-    fn send_live_text(&mut self, debounce: bool, cx: &mut Context<Self>) {
+    ///
+    /// `force` is Force Recompile: no pause, no render-budget gate, and the
+    /// compiler drops every cache before compiling.
+    fn send_live_text(&mut self, debounce: bool, force: bool, cx: &mut Context<Self>) {
         let revision = self.revision;
         let Some(live) = &mut self.live else {
             return;
         };
-        live.typed = Some((revision, std::time::Instant::now()));
+        if !force {
+            live.typed = Some((revision, std::time::Instant::now()));
+        }
         live.send_task = Some(cx.spawn(async move |this, cx| {
-            if debounce {
+            if debounce && !force {
                 cx.background_executor().timer(LIVE_DEBOUNCE).await;
             }
             _ = this.update(cx, |this, cx| {
-                // Prefer the already-held SharedString; avoid value()+to_string.
-                let text = if !this.source.is_empty() {
-                    this.source.to_string()
-                } else {
-                    this.editor.read(cx).value().to_string()
+                // Always the editor's text as it is now: the revision may
+                // have moved on while this send waited.
+                let revision = this.revision;
+                let text = this.editor.read(cx).value().to_string();
+                if !force && !this.typst_render_allowed(&text) {
+                    if let Some(live) = &mut this.live {
+                        live.send_task = None;
+                    }
+                    cx.notify();
+                    return;
+                }
+                let Some(live) = &mut this.live else {
+                    return;
                 };
-                let image_bytes = estimate_typst_image_bytes(this.path.as_deref(), &text);
-                let estimate = crate::render_budget::estimate_typst(&text, image_bytes);
-                if estimate.exceeds_budget() {
-                    if !this.render_confirmed
-                        && this.render_gate != crate::render_budget::RenderConsent::Skipped
-                    {
-                        this.render_gate = crate::render_budget::RenderConsent::Pending;
-                    }
-                    this.render_estimate = Some(estimate);
-                    if matches!(
-                        this.render_gate,
-                        crate::render_budget::RenderConsent::Pending
-                            | crate::render_budget::RenderConsent::Skipped
-                    ) {
-                        cx.notify();
-                        return;
-                    }
+                live.send_task = None;
+                if live.worker.send(crate::typst_live::Request::Compile {
+                    text,
+                    revision,
+                    force,
+                }) {
+                    live.sync.sent(revision, force);
+                    crate::perf::mark(&format!("typst_compile_sent rev={revision} force={force}"));
                 } else {
-                    this.render_gate = crate::render_budget::RenderConsent::Allowed;
-                    this.render_confirmed = false;
-                    this.render_estimate = None;
+                    log::error!("typst live: compiler thread is gone (rev {revision})");
+                    live.sync.cancel_force();
                 }
-                if let Some(live) = &this.live {
-                    live.worker
-                        .send(crate::typst_live::Request::Compile { text, revision });
-                }
+                cx.notify();
             });
         }));
+    }
+
+    /// The render-budget gate for a Typst compile: whether `text` may be
+    /// compiled now, updating the banner state as a side effect.
+    fn typst_render_allowed(&mut self, text: &str) -> bool {
+        let image_bytes = estimate_typst_image_bytes(self.path.as_deref(), text);
+        let estimate = crate::render_budget::estimate_typst(text, image_bytes);
+        if estimate.exceeds_budget() {
+            if !self.render_confirmed
+                && self.render_gate != crate::render_budget::RenderConsent::Skipped
+            {
+                self.render_gate = crate::render_budget::RenderConsent::Pending;
+            }
+            self.render_estimate = Some(estimate);
+            !matches!(
+                self.render_gate,
+                crate::render_budget::RenderConsent::Pending
+                    | crate::render_budget::RenderConsent::Skipped
+            )
+        } else {
+            self.render_gate = crate::render_budget::RenderConsent::Allowed;
+            self.render_confirmed = false;
+            self.render_estimate = None;
+            true
+        }
+    }
+
+    /// Force Recompile: compile the editor's text now, bypassing the typing
+    /// pause, the budget gate and every cache, and draw every page again.
+    /// Returns `false` when this document has no live Typst preview.
+    pub fn force_recompile(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.live.is_none() {
+            return false;
+        }
+        log::info!("typst live: force recompile (rev {})", self.revision);
+        if let Some(live) = &mut self.live {
+            // Shown as busy from the click on, not from when the send runs.
+            live.sync.sent(self.revision, true);
+        }
+        self.send_live_text(false, true, cx);
+        cx.notify();
+        true
+    }
+
+    /// Whether this document has a live Typst preview.
+    pub fn has_typst_live(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Whether a Force Recompile is still running.
+    pub fn is_force_recompiling(&self) -> bool {
+        self.live.as_ref().is_some_and(|live| live.sync.forcing())
     }
 
     /// Show where the caret's text is on the pages, once the caret rests.
@@ -1551,12 +1618,7 @@ impl DocumentView {
         }));
     }
 
-    fn on_live_answer(
-        &mut self,
-        answer: crate::typst_live::Response,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_live_answer(&mut self, answer: crate::typst_live::Response, cx: &mut Context<Self>) {
         use crate::typst_live::Response;
         let current = self.revision;
         let Some(live) = &mut self.live else {
@@ -1564,6 +1626,8 @@ impl DocumentView {
         };
         match answer {
             Response::Compiled(compiled) => {
+                let follow_up = live.sync.compiled(compiled.revision, compiled.partial)
+                    && live.send_task.is_none();
                 if let Some((typed, since)) = live.typed
                     && typed == compiled.revision
                 {
@@ -1643,20 +1707,24 @@ impl DocumentView {
                     }
                 }
                 self.show_misspellings(cx);
+                if follow_up {
+                    // The editor moved on and no newer compile is coming:
+                    // send the newest text so the preview catches up.
+                    log::debug!(
+                        "typst live: rev {} compiled but editor is at {current}; follow-up compile",
+                        compiled.revision
+                    );
+                    self.send_live_text(false, false, cx);
+                }
                 cx.notify();
-            }
-            Response::SourceAt(offset) => {
-                log::debug!("typst live: preview click -> source offset {offset}");
-                self.reveal_typst_source(offset, "Preview click", window, cx);
             }
             Response::PageAt(page, _x, y) => {
                 log::debug!("typst live: caret reveal -> page {page}");
                 live.view.update(cx, |view, cx| view.reveal(page, y, cx));
             }
-            Response::DefinitionAt(offset) => {
-                log::debug!("typst live: go-to-definition -> offset {offset}");
-                self.reveal_typst_source(offset, "Go to Definition", window, cx);
-            }
+            // Jumps need the window; the listener routes them to
+            // `reveal_typst_source` itself.
+            Response::SourceAt(_) | Response::DefinitionAt(_) => {}
         }
     }
 
@@ -1766,6 +1834,8 @@ impl DocumentView {
         let pinned = self.preview_pinned;
         let name = self.name();
         let can_pin = self.has_preview() || self.live.is_some();
+        let typst = self.live.is_some();
+        let forcing = self.is_force_recompiling();
         // Pinned vs live-follow: different glyph (Pin vs PinOff), label, and
         // chrome — not a tint-only toggle.
         let bar = h_flex()
@@ -1809,6 +1879,32 @@ impl DocumentView {
                         format!("Following active — {name}")
                     }),
             )
+            .when(typst, |this| {
+                // Force Recompile: compile and draw every page again now,
+                // past the typing pause and every cache. Spins while the
+                // forced compile runs.
+                let label = if forcing {
+                    "Recompiling…"
+                } else {
+                    "Recompile"
+                };
+                let button = Button::new("force-recompile")
+                    .ghost()
+                    .small()
+                    .compact()
+                    .icon(gpui_kit::component::Icon::new(
+                        gpui_kit::assets::IconName::RefreshCw,
+                    ))
+                    .label(label)
+                    .tooltip(force_recompile_tooltip())
+                    // Spinner in place of the icon, and no second click,
+                    // while the forced compile runs.
+                    .loading(forcing)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.force_recompile(cx);
+                    }));
+                this.child(button)
+            })
             .when(can_pin, |this| {
                 this.child(
                     Button::new("pin-preview")
@@ -3483,7 +3579,10 @@ impl Render for DocumentView {
                     div()
                         .text_color(cx.theme().danger)
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                        .child(format!("Couldn\u{2019}t open \u{201c}{}\u{201d}", self.name())),
+                        .child(format!(
+                            "Couldn\u{2019}t open \u{201c}{}\u{201d}",
+                            self.name()
+                        )),
                 )
                 .child(
                     div()
@@ -3588,6 +3687,15 @@ impl Render for DocumentView {
     }
 }
 
+/// The Force Recompile button's tooltip, naming its shortcut.
+fn force_recompile_tooltip() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Force Recompile — rebuild the pages from scratch (⌥⇧⌘B)"
+    } else {
+        "Force Recompile — rebuild the pages from scratch (Ctrl+Alt+Shift+B)"
+    }
+}
+
 /// How long typing pauses before a Typst source is compiled again. Short:
 /// a compile of a long document takes a few milliseconds once warm.
 const LIVE_DEBOUNCE: Duration = Duration::from_millis(40);
@@ -3625,6 +3733,9 @@ struct TypstLive {
     /// measure the time from a keystroke to its pages.
     typed: Option<(usize, std::time::Instant)>,
     latency: Option<Duration>,
+    /// Which revision the editor is at, which went to the compiler and
+    /// which came back, so an edit is never left uncompiled.
+    sync: crate::typst_live::LiveSync,
     _listen: Task<()>,
     _clicks: Subscription,
 }

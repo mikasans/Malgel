@@ -71,6 +71,7 @@ actions!(
         ToggleFocusMode,
         TogglePreviewLayout,
         TogglePinPreview,
+        ForceRecompile,
         SplitEditorRight,
         SplitEditorDown,
         CloseEditorSplit,
@@ -341,6 +342,12 @@ pub fn bind_keys(cx: &mut App) {
         // Toggle editor|preview <-> editor-only (default open is already split,
         // so a one-shot "open preview" feels like a no-op without this).
         KeyBinding::new("secondary-shift-v", TogglePreviewLayout, None),
+        // Typst Force Recompile. VS Code leaves Ctrl+Alt+Shift+B (Cmd+Alt+Shift+B)
+        // unbound; Ctrl+Shift+B is its Run Build Task and Ctrl+Alt+R / Shift+Alt+R
+        // reveal the file in the OS, so the "build" letter with every modifier
+        // stays clear of both. No key-context: it must work with the preview
+        // focused too.
+        KeyBinding::new("secondary-alt-shift-b", ForceRecompile, None),
         // VS Code Split Editor Right (Ctrl+\).
         KeyBinding::new("secondary-\\", SplitEditorRight, None),
         #[cfg(not(target_os = "macos"))]
@@ -618,6 +625,27 @@ mod tests {
                 next.keystrokes()[0].modifiers().shift
             ),
         );
+    }
+
+    /// Force Recompile is Ctrl+Alt+Shift+B (Cmd+Alt+Shift+B): one key, every
+    /// modifier, so it never shadows VS Code's Ctrl+Shift+B (Run Build Task)
+    /// or Ctrl+B (Toggle Side Bar).
+    #[test]
+    fn force_recompile_has_its_own_chord() {
+        let force = KeyBinding::new("secondary-alt-shift-b", ForceRecompile, None);
+        assert_eq!(force.keystrokes().len(), 1);
+        let ks = &force.keystrokes()[0];
+        assert_eq!(ks.key(), "b");
+        let m = ks.modifiers();
+        assert!(m.alt && m.shift && (m.control || m.platform));
+        for other in ["secondary-b", "secondary-shift-b", "secondary-alt-b"] {
+            let taken = KeyBinding::new(other, Bold, None);
+            assert_ne!(
+                taken.keystrokes()[0].modifiers(),
+                m,
+                "{other} must not collide with Force Recompile"
+            );
+        }
     }
 
     /// Go to Line stays Ctrl+G on macOS so Cmd+G remains Find Next.

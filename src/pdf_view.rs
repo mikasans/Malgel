@@ -310,6 +310,18 @@ impl PdfDocument {
         self.rendered.get(&index).cloned()
     }
 
+    /// The sheets this document shows that `other` does not (compared by
+    /// image id, which is the hash of the image's bytes).
+    fn sheets_not_in(&self, other: &Self) -> Vec<Arc<Image>> {
+        let kept: HashSet<u64> = other.rendered.values().map(|image| image.id()).collect();
+        let mut seen = HashSet::new();
+        self.rendered
+            .values()
+            .filter(|image| !kept.contains(&image.id()) && seen.insert(image.id()))
+            .cloned()
+            .collect()
+    }
+
     /// Whether `other` shows the same page sheets (shared `Arc`s) and sizes.
     fn same_sheets_as(&self, other: &Self) -> bool {
         if self.pages.len() != other.pages.len() || self.rendered.len() != other.rendered.len() {
@@ -437,6 +449,12 @@ pub struct PdfView {
     list_cache: Option<ListLayoutCache>,
     /// Last click-to-source emit, so a bounced mouse-up does not jump twice.
     last_click: Option<(Instant, usize, i32, i32)>,
+    /// Ids of the sheets handed out for painting, so only images GPUI has
+    /// actually decoded and uploaded are released when they are replaced.
+    painted: HashSet<u64>,
+    /// Sheets a reload replaced, released on the next render (which has the
+    /// window their GPU tiles live in).
+    released: Vec<Arc<Image>>,
 }
 
 /// What a page viewer reports to the document showing it.
@@ -476,6 +494,8 @@ impl PdfView {
             press: None,
             list_cache: None,
             last_click: None,
+            painted: HashSet::new(),
+            released: Vec::new(),
         }
     }
 
@@ -501,6 +521,16 @@ impl PdfView {
             .as_ref()
             .map(|doc| doc.generation.wrapping_add(1))
             .unwrap_or(1);
+        // GPUI keeps every decoded image (and its atlas tile) until told to
+        // drop it. A live preview replaces a sheet on every keystroke, so
+        // without this each edit left a full decoded page behind (several
+        // MiB apiece). Sheets the new document still shows — the same bytes
+        // have the same id — stay. The release itself happens in `render`,
+        // which has the window.
+        if let Some(old) = &self.doc {
+            let gone = old.sheets_not_in(&doc);
+            self.released.extend(gone);
+        }
         self.doc = Some(doc);
         if let Some(doc) = &mut self.doc {
             doc.generation = generation;
@@ -512,12 +542,38 @@ impl PdfView {
         cx.notify();
     }
 
+    /// Drop the decoded images and atlas tiles of sheets a reload replaced.
+    /// Only sheets that were painted are in GPUI's caches; asking for any
+    /// other would start decoding it just to throw it away.
+    fn release_replaced_sheets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.released.is_empty() {
+            return;
+        }
+        let shown: HashSet<u64> = self
+            .doc
+            .as_ref()
+            .map(|doc| doc.rendered.values().map(|image| image.id()).collect())
+            .unwrap_or_default();
+        for image in std::mem::take(&mut self.released) {
+            let id = image.id();
+            // A sheet the current document shows again (same bytes) stays.
+            if shown.contains(&id) || !self.painted.remove(&id) {
+                continue;
+            }
+            if let Some(render) = image.clone().get_render_image(window, cx) {
+                _ = window.drop_image(render);
+            }
+            image.remove_asset(cx);
+        }
+    }
+
     /// The sheet for page `index`, scheduling a background conversion when
     /// it is not yet ready. Returns `None` while conversion is in flight so
     /// the caller can paint a placeholder without blocking the UI thread.
     fn page_image(&mut self, index: usize, cx: &mut Context<Self>) -> Option<Arc<Image>> {
         let doc = self.doc.as_mut()?;
         if let Some(image) = doc.rendered.get(&index) {
+            self.painted.insert(image.id());
             return Some(image.clone());
         }
         // Pre-rendered Typst sheets land in `rendered` already; no bytes to convert.
@@ -1468,7 +1524,8 @@ impl Focusable for PdfView {
 }
 
 impl Render for PdfView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.release_replaced_sheets(window, cx);
         // Resolve fit modes against the live viewport before drawing the
         // toolbar, so the percentage shown matches the pages below it.
         let viewport = self.scroll.bounds().size;

@@ -399,6 +399,11 @@ pub fn groups() -> Vec<CommandGroupSpec> {
             cmd("Pin Tab", IconName::Pin, PinTab),
             cmd("Pin Preview", IconName::Pin, TogglePinPreview),
             cmd(
+                "Typst: Force Recompile",
+                IconName::RefreshCw,
+                ForceRecompile,
+            ),
+            cmd(
                 "PDF page thumbnails",
                 IconName::PanelLeft,
                 TogglePdfThumbnails,

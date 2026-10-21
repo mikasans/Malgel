@@ -168,6 +168,10 @@ pub struct LiveCompiler {
     revision: usize,
     document: Option<PagedDocument>,
     sheets: HashMap<u128, Arc<Image>>,
+    /// The sheet key of every page of the last good document, in page order,
+    /// so a progressive paint can stand the previous sheet in for a page that
+    /// is still being drawn instead of dropping the page.
+    page_keys: Vec<u128>,
     /// Diagnostics from the last compile, reused when the source is unchanged.
     diagnostics: Vec<LiveDiagnostic>,
 }
@@ -182,8 +186,20 @@ impl LiveCompiler {
             revision: 0,
             document: None,
             sheets: HashMap::new(),
+            page_keys: Vec::new(),
             diagnostics: Vec::new(),
         }
+    }
+
+    /// Forget everything a compile could be reused from: the last text, the
+    /// drawn sheets, the bytes of named files and the compiler's memoized
+    /// work. The next compile starts from scratch and draws every page again
+    /// — what Force Recompile asks for when the preview looks wrong.
+    pub fn invalidate(&mut self) {
+        self.text.clear();
+        self.sheets.clear();
+        self.world.clear_caches();
+        comemo::evict(0);
     }
 
     /// Compile `text`, drawing only pages that changed.
@@ -270,6 +286,7 @@ impl LiveCompiler {
                     })
                     .collect();
                 // Only the sheets of the current pages are kept.
+                self.page_keys = document.pages().iter().map(hash128).collect();
                 self.sheets = sheets;
                 self.document = Some(document);
                 Some(pages)
@@ -313,14 +330,28 @@ impl LiveCompiler {
     /// Compile with progressive sheet paint: first dirty page is rasterized and
     /// reported via `on_partial` before the remaining dirty pages, so first
     /// paint does not wait on the whole stack.
+    ///
+    /// `force` throws away every cache first (see [`Self::invalidate`]), so
+    /// the pages are compiled and drawn anew even when the text is the same.
     pub fn compile_progressive(
         &mut self,
         text: &str,
         revision: usize,
+        force: bool,
         mut on_partial: impl FnMut(Compiled),
     ) -> Compiled {
         let started = Instant::now();
-        crate::perf::mark(&format!("typst_compile_begin rev={revision}"));
+        crate::perf::mark(&format!("typst_compile_begin rev={revision} force={force}"));
+        // The sheets on screen now, by page: a progressive paint shows these
+        // for pages not drawn yet, so the page count never dips mid-compile.
+        let previous: Vec<Option<Arc<Image>>> = self
+            .page_keys
+            .iter()
+            .map(|key| self.sheets.get(key).cloned())
+            .collect();
+        if force {
+            self.invalidate();
+        }
         if text == self.text && self.document.is_some() && !self.sheets.is_empty() {
             return self.compile(text, revision);
         }
@@ -363,12 +394,16 @@ impl LiveCompiler {
                 let build_pages = |sheets: &HashMap<u128, Arc<Image>>| -> Vec<LivePage> {
                     keys.iter()
                         .zip(meta.iter())
-                        .filter_map(|(key, (w, h))| {
-                            sheets.get(key).map(|image| LivePage {
-                                width: *w,
-                                height: *h,
-                                image: image.clone(),
-                            })
+                        .enumerate()
+                        .filter_map(|(ix, (key, (w, h)))| {
+                            sheets
+                                .get(key)
+                                .or_else(|| previous.get(ix).and_then(Option::as_ref))
+                                .map(|image| LivePage {
+                                    width: *w,
+                                    height: *h,
+                                    image: image.clone(),
+                                })
                         })
                         .collect()
                 };
@@ -398,8 +433,19 @@ impl LiveCompiler {
                         });
                     }
                 }
-                let pages = build_pages(&sheets);
+                let pages: Vec<LivePage> = keys
+                    .iter()
+                    .zip(meta.iter())
+                    .filter_map(|(key, (w, h))| {
+                        sheets.get(key).map(|image| LivePage {
+                            width: *w,
+                            height: *h,
+                            image: image.clone(),
+                        })
+                    })
+                    .collect();
                 debug_assert_eq!(pages.len(), document.pages().len());
+                self.page_keys = keys;
                 self.sheets = sheets;
                 self.document = Some(document);
                 Some(pages)
@@ -545,10 +591,24 @@ impl LiveCompiler {
 
 /// What the editor asks the compiler thread.
 pub enum Request {
-    Compile { text: String, revision: usize },
-    SourceAt { page: usize, x: f32, y: f32 },
-    PageAt { offset: usize },
-    DefinitionAt { offset: usize },
+    /// Compile `text`, the editor's text at `revision`. `force` drops every
+    /// cache first so the pages are compiled and drawn from scratch.
+    Compile {
+        text: String,
+        revision: usize,
+        force: bool,
+    },
+    SourceAt {
+        page: usize,
+        x: f32,
+        y: f32,
+    },
+    PageAt {
+        offset: usize,
+    },
+    DefinitionAt {
+        offset: usize,
+    },
 }
 
 /// What the compiler thread answers.
@@ -560,6 +620,94 @@ pub enum Response {
     DefinitionAt(usize),
 }
 
+/// The requests of one batch worth answering, in the order they arrived:
+/// only the newest of each kind, since anything older is already stale.
+/// A forced compile anywhere in the batch makes the newest compile forced,
+/// so an edit typed right after Force Recompile does not cancel the force.
+fn fold_batch(batch: Vec<Request>) -> Vec<Request> {
+    let newest = |kind: fn(&Request) -> bool| batch.iter().rposition(kind);
+    let newest_compile = newest(|r| matches!(r, Request::Compile { .. }));
+    let newest_source = newest(|r| matches!(r, Request::SourceAt { .. }));
+    let newest_page = newest(|r| matches!(r, Request::PageAt { .. }));
+    let newest_def = newest(|r| matches!(r, Request::DefinitionAt { .. }));
+    let forced = batch
+        .iter()
+        .any(|r| matches!(r, Request::Compile { force: true, .. }));
+    batch
+        .into_iter()
+        .enumerate()
+        .filter_map(|(ix, request)| {
+            let keep = Some(ix)
+                == match request {
+                    Request::Compile { .. } => newest_compile,
+                    Request::SourceAt { .. } => newest_source,
+                    Request::PageAt { .. } => newest_page,
+                    Request::DefinitionAt { .. } => newest_def,
+                };
+            keep.then_some(match request {
+                Request::Compile {
+                    text,
+                    revision,
+                    force,
+                } => Request::Compile {
+                    text,
+                    revision,
+                    force: force || forced,
+                },
+                other => other,
+            })
+        })
+        .collect()
+}
+
+/// The answer to a compile that panicked: no pages (the last good ones stay
+/// on screen) and a message saying so.
+fn panicked(revision: usize) -> Compiled {
+    Compiled {
+        revision,
+        pages: None,
+        diagnostics: vec![LiveDiagnostic {
+            message: "Typst compile panicked — preview stopped. Fix the source and try again."
+                .into(),
+            range: None,
+            error: true,
+        }],
+        elapsed: Duration::ZERO,
+        redrawn: 0,
+        highlights: Vec::new(),
+        partial: false,
+    }
+}
+
+/// Answer one request. `None` when there is nothing to say (a click that
+/// lands on no source, for one).
+fn answer(
+    compiler: &mut LiveCompiler,
+    request: Request,
+    answers: &futures::channel::mpsc::UnboundedSender<Response>,
+) -> Option<Response> {
+    match request {
+        Request::Compile {
+            text,
+            revision,
+            force,
+        } => {
+            let partial_tx = answers.clone();
+            let compiled = compiler.compile_progressive(&text, revision, force, move |partial| {
+                let _ = partial_tx.unbounded_send(Response::Compiled(partial));
+            });
+            Some(Response::Compiled(compiled))
+        }
+        Request::SourceAt { page, x, y } => compiler.source_at(page, x, y).map(Response::SourceAt),
+        Request::PageAt { offset } => compiler
+            .page_at(offset)
+            .map(|(page, x, y)| Response::PageAt(page, x, y)),
+        Request::DefinitionAt { offset } => {
+            compiler.definition_at(offset).map(Response::DefinitionAt)
+        }
+    }
+}
+
 /// The compiler thread for one document. Dropping it ends the thread.
 pub struct LiveWorker {
     requests: mpsc::Sender<Request>,
@@ -568,6 +716,13 @@ pub struct LiveWorker {
 impl LiveWorker {
     /// Start compiling `path`'s text on a thread of its own; answers arrive
     /// on the returned receiver.
+    ///
+    /// The thread outlives anything a request does to it: every call into
+    /// Typst — a compile, the poll that recompiles when an import changed,
+    /// a click or caret lookup — runs under `catch_unwind`, and a panic
+    /// rebuilds the compiler instead of ending the thread. A dead thread
+    /// would swallow every later edit without a word, leaving the preview
+    /// frozen on whatever it showed last.
     pub fn spawn(path: PathBuf) -> (Self, futures::channel::mpsc::UnboundedReceiver<Response>) {
         let (requests, inbox) = mpsc::channel::<Request>();
         let (answers, outbox) = futures::channel::mpsc::unbounded();
@@ -581,7 +736,19 @@ impl LiveWorker {
                     let first = match inbox.recv_timeout(IMPORT_POLL) {
                         Ok(request) => request,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if let Some(compiled) = compiler.recompile_if_imports_changed()
+                            let polled = panic::catch_unwind(AssertUnwindSafe(|| {
+                                compiler.recompile_if_imports_changed()
+                            }));
+                            let compiled = match polled {
+                                Ok(compiled) => compiled,
+                                Err(_) => {
+                                    log::error!("typst live: import recompile panicked");
+                                    let revision = compiler.revision;
+                                    compiler = LiveCompiler::new(&path);
+                                    Some(panicked(revision))
+                                }
+                            };
+                            if let Some(compiled) = compiled
                                 && answers
                                     .unbounded_send(Response::Compiled(compiled))
                                     .is_err()
@@ -592,93 +759,35 @@ impl LiveWorker {
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     };
-                    // Fold a queue of edits into the newest one.
+                    // Fold a queue of edits into the newest one: requests
+                    // that arrived while the last compile ran are all here,
+                    // so the newest text is always the one compiled next.
                     let mut batch = vec![first];
                     batch.extend(inbox.try_iter());
-                    // One gesture → one answer: keep only the newest of each kind.
-                    let newest_compile = batch
-                        .iter()
-                        .rposition(|r| matches!(r, Request::Compile { .. }));
-                    let newest_source = batch
-                        .iter()
-                        .rposition(|r| matches!(r, Request::SourceAt { .. }));
-                    let newest_page = batch
-                        .iter()
-                        .rposition(|r| matches!(r, Request::PageAt { .. }));
-                    let newest_def = batch
-                        .iter()
-                        .rposition(|r| matches!(r, Request::DefinitionAt { .. }));
-                    for (ix, request) in batch.into_iter().enumerate() {
-                        let answer = match request {
-                            Request::Compile { text, revision } => {
-                                if Some(ix) != newest_compile {
-                                    continue;
-                                }
-                                let partial_tx = answers.clone();
-                                let compiled = match panic::catch_unwind(AssertUnwindSafe(|| {
-                                    compiler.compile_progressive(
-                                        &text,
-                                        revision,
-                                        move |partial| {
-                                            let _ = partial_tx
-                                                .unbounded_send(Response::Compiled(partial));
-                                        },
-                                    )
-                                })) {
-                                    Ok(compiled) => compiled,
-                                    Err(_) => {
-                                        log::error!(
-                                            "typst live: compile panicked (rev {revision})"
-                                        );
-                                        // Rebuild the world — a panicking compile may
-                                        // leave memoization / sheets inconsistent.
-                                        compiler = LiveCompiler::new(&path);
-                                        Compiled {
-                                            revision,
-                                            pages: None,
-                                            diagnostics: vec![LiveDiagnostic {
-                                                message: "Typst compile panicked — preview stopped. Fix the source and try again.".into(),
-                                                range: None,
-                                                error: true,
-                                            }],
-                                            elapsed: Duration::ZERO,
-                                            redrawn: 0,
-                                            highlights: Vec::new(),
-                                            partial: false,
-                                        }
-                                    }
-                                };
-                                Response::Compiled(compiled)
-                            }
-                            Request::SourceAt { page, x, y } => {
-                                if Some(ix) != newest_source {
-                                    continue;
-                                }
-                                match compiler.source_at(page, x, y) {
-                                    Some(offset) => Response::SourceAt(offset),
-                                    None => continue,
-                                }
-                            }
-                            Request::PageAt { offset } => {
-                                if Some(ix) != newest_page {
-                                    continue;
-                                }
-                                match compiler.page_at(offset) {
-                                    Some((page, x, y)) => Response::PageAt(page, x, y),
-                                    None => continue,
-                                }
-                            }
-                            Request::DefinitionAt { offset } => {
-                                if Some(ix) != newest_def {
-                                    continue;
-                                }
-                                match compiler.definition_at(offset) {
-                                    Some(at) => Response::DefinitionAt(at),
-                                    None => continue,
-                                }
+                    for request in fold_batch(batch) {
+                        let compile_revision = match &request {
+                            Request::Compile { revision, .. } => Some(*revision),
+                            _ => None,
+                        };
+                        let answered =
+                            panic::catch_unwind(AssertUnwindSafe(|| {
+                                answer(&mut compiler, request, &answers)
+                            }));
+                        let response = match answered {
+                            Ok(response) => response,
+                            Err(_) => {
+                                log::error!(
+                                    "typst live: request panicked (compile rev {compile_revision:?})"
+                                );
+                                // Rebuild the world — a panicking compile may
+                                // leave memoization / sheets inconsistent.
+                                compiler = LiveCompiler::new(&path);
+                                compile_revision.map(|revision| Response::Compiled(panicked(revision)))
                             }
                         };
-                        if answers.unbounded_send(answer).is_err() {
+                        if let Some(response) = response
+                            && answers.unbounded_send(response).is_err()
+                        {
                             return;
                         }
                     }
@@ -688,8 +797,75 @@ impl LiveWorker {
         (Self { requests }, outbox)
     }
 
-    pub fn send(&self, request: Request) {
-        _ = self.requests.send(request);
+    /// Hand the thread a request. `false` when the thread is gone.
+    pub fn send(&self, request: Request) -> bool {
+        self.requests.send(request).is_ok()
+    }
+}
+
+/// Bookkeeping that keeps the preview on the editor's newest text.
+///
+/// Every edit bumps the editor's revision. A compile is sent for it after a
+/// short pause; a compile answers with the revision it compiled. When the
+/// answer is older than the editor and nothing newer is on its way — an edit
+/// whose send was lost, cancelled by the budget gate flipping, or swallowed
+/// any other way — the editor sends its text again, so the preview always
+/// ends on the text in the editor rather than on a stale page.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct LiveSync {
+    /// The editor's newest revision: what the preview should show.
+    wanted: usize,
+    /// The newest revision handed to the compiler thread.
+    sent: Option<usize>,
+    /// The newest revision a finished (non-partial) compile answered for.
+    done: Option<usize>,
+    /// A Force Recompile waiting for its answer.
+    forcing: Option<usize>,
+}
+
+impl LiveSync {
+    /// The editor's text changed and is now at `revision`.
+    pub fn edited(&mut self, revision: usize) {
+        self.wanted = self.wanted.max(revision);
+    }
+
+    /// The text at `revision` went to the compiler thread.
+    pub fn sent(&mut self, revision: usize, force: bool) {
+        self.wanted = self.wanted.max(revision);
+        self.sent = Some(self.sent.map_or(revision, |sent| sent.max(revision)));
+        if force {
+            self.forcing = Some(revision);
+        }
+    }
+
+    /// A compile answered for `revision`. Returns whether the editor has to
+    /// send its text again: it moved on since, and no newer compile is
+    /// queued that would catch it up.
+    pub fn compiled(&mut self, revision: usize, partial: bool) -> bool {
+        if partial {
+            return false;
+        }
+        self.done = Some(self.done.map_or(revision, |done| done.max(revision)));
+        if self.forcing.is_some_and(|forcing| revision >= forcing) {
+            self.forcing = None;
+        }
+        self.wanted > revision && self.sent.is_none_or(|sent| sent <= revision)
+    }
+
+    /// Whether a Force Recompile is still running.
+    pub fn forcing(&self) -> bool {
+        self.forcing.is_some()
+    }
+
+    /// A Force Recompile will not be answered (its send failed).
+    pub fn cancel_force(&mut self) {
+        self.forcing = None;
+    }
+
+    /// Whether the pages on screen are older than the editor's text.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn behind(&self) -> bool {
+        self.done.is_none_or(|done| done < self.wanted)
     }
 }
 
@@ -868,5 +1044,264 @@ mod tests {
                 || (b.len() >= 4 && b[0] == 0x89 && &b[1..4] == b"PNG"),
             "expected WebP, JPEG, or PNG sheet cache encoding"
         );
+    }
+
+    fn ids(compiled: &Compiled) -> Vec<u64> {
+        compiled
+            .pages
+            .as_ref()
+            .expect("compiled")
+            .iter()
+            .map(|page| page.image.id())
+            .collect()
+    }
+
+    /// One character, a deleted character and an undo each reach the pages:
+    /// the edited page gets a new sheet, the others keep theirs.
+    #[test]
+    fn single_character_edits_redraw_the_page() {
+        let mut live = compiler("tiny-edits");
+        let text = pages(3);
+        let first = live.compile_progressive(&text, 1, false, |_| {});
+        let before = ids(&first);
+        let typed = text.replacen("Section 2", "Section 2x", 1);
+        let second = live.compile_progressive(&typed, 2, false, |_| {});
+        let after = ids(&second);
+        assert_eq!(second.redrawn, 1, "only the edited page is drawn");
+        assert_eq!(before[0], after[0]);
+        assert_ne!(
+            before[1], after[1],
+            "a one-character edit must change page 2"
+        );
+        // Undo: the old text, and the old page, come back.
+        let undone = live.compile_progressive(&text, 3, false, |_| {});
+        assert_eq!(ids(&undone), before);
+        // A single deleted character.
+        let deleted = text.replacen("Section 3", "Section ", 1);
+        let shown = live.compile_progressive(&deleted, 4, false, |_| {});
+        assert_ne!(ids(&shown)[2], before[2]);
+    }
+
+    /// Force Recompile skips the "same text, same pages" shortcut and the
+    /// sheet cache: every page is compiled and drawn again.
+    #[test]
+    fn force_recompile_bypasses_every_cache() {
+        let mut live = compiler("force");
+        let text = pages(3);
+        let first = live.compile_progressive(&text, 1, false, |_| {});
+        let count = first.pages.as_ref().map_or(0, Vec::len);
+        assert!(count >= 3);
+        let again = live.compile_progressive(&text, 2, false, |_| {});
+        assert_eq!(again.redrawn, 0, "unchanged text reuses every sheet");
+        let forced = live.compile_progressive(&text, 3, true, |_| {});
+        assert_eq!(forced.redrawn, count, "a forced compile draws every page");
+        assert_eq!(forced.revision, 3);
+        let old = first.pages.unwrap();
+        let new = forced.pages.unwrap();
+        assert!(
+            old.iter()
+                .zip(&new)
+                .all(|(a, b)| !Arc::ptr_eq(&a.image, &b.image)),
+            "forced sheets are new images, so the viewer reloads them"
+        );
+    }
+
+    /// A progressive paint never shows fewer pages than the document has:
+    /// pages still being drawn keep their previous sheet meanwhile, so the
+    /// viewer does not shrink (and lose its scroll position) mid-compile.
+    #[test]
+    fn progressive_paint_keeps_the_page_count() {
+        let mut live = compiler("progressive-count");
+        let text = pages(5);
+        let first = live.compile_progressive(&text, 1, false, |_| {});
+        let count = first.pages.as_ref().map_or(0, Vec::len);
+        // A page-wide change dirties every page.
+        let restyled = format!("#set text(fill: blue)\n{text}");
+        let mut partials = Vec::new();
+        let done = live.compile_progressive(&restyled, 2, false, |partial| {
+            partials.push(partial.pages.as_ref().map_or(0, Vec::len));
+        });
+        assert!(
+            !partials.is_empty(),
+            "several dirty pages paint progressively"
+        );
+        assert!(
+            partials.iter().all(|&n| n == count),
+            "partial page counts {partials:?} != {count}"
+        );
+        assert_eq!(done.pages.as_ref().map_or(0, Vec::len), count);
+    }
+
+    /// Edits queued behind a running compile fold into the newest, and that
+    /// newest text is compiled next — nothing typed during a compile is lost.
+    #[test]
+    fn edits_during_a_compile_are_compiled_next() {
+        use futures::StreamExt as _;
+        let dir = std::env::temp_dir().join(format!("malgel-live-inflight-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (worker, mut answers) = LiveWorker::spawn(dir.join("main.typ"));
+        let text = pages(8);
+        // The first compile is slow; the edits land while it runs.
+        assert!(worker.send(Request::Compile {
+            text: text.clone(),
+            revision: 1,
+            force: false,
+        }));
+        let mut last = text.clone();
+        for revision in 2..=4 {
+            last = last.replacen("Section 1\n", "Section 1!\n", 1);
+            assert!(worker.send(Request::Compile {
+                text: last.clone(),
+                revision,
+                force: false,
+            }));
+        }
+        let mut finals = Vec::new();
+        let newest = futures::executor::block_on(async {
+            loop {
+                let Some(Response::Compiled(compiled)) = answers.next().await else {
+                    continue;
+                };
+                if compiled.partial {
+                    continue;
+                }
+                finals.push(compiled.revision);
+                if compiled.revision == 4 {
+                    break compiled;
+                }
+            }
+        });
+        assert!(
+            finals.len() <= 2,
+            "queued edits fold into one compile: {finals:?}"
+        );
+        assert_eq!(*finals.last().unwrap(), 4);
+        // The pages shown are the newest text's.
+        let mut check = compiler("inflight-check");
+        let expected = check.compile(&last, 9);
+        let shown: Vec<u64> = newest.pages.unwrap().iter().map(|p| p.image.id()).collect();
+        assert_eq!(shown, ids(&expected));
+    }
+
+    /// A Force Recompile followed at once by an edit is still forced.
+    #[test]
+    fn a_force_folded_into_a_newer_edit_stays_forced() {
+        let batch = vec![
+            Request::Compile {
+                text: "a".into(),
+                revision: 1,
+                force: true,
+            },
+            Request::PageAt { offset: 0 },
+            Request::Compile {
+                text: "ab".into(),
+                revision: 2,
+                force: false,
+            },
+        ];
+        let folded = fold_batch(batch);
+        assert_eq!(folded.len(), 2);
+        assert!(matches!(
+            folded[1],
+            Request::Compile {
+                revision: 2,
+                force: true,
+                ..
+            }
+        ));
+    }
+
+    /// Requests with nothing to answer do not stop the thread: the next
+    /// edit is still compiled.
+    #[test]
+    fn the_worker_keeps_serving_after_an_unanswered_request() {
+        use futures::StreamExt as _;
+        let dir = std::env::temp_dir().join(format!("malgel-live-alive-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (worker, mut answers) = LiveWorker::spawn(dir.join("main.typ"));
+        // Nothing compiled yet: these have no answer.
+        assert!(worker.send(Request::SourceAt {
+            page: 99,
+            x: -1.,
+            y: -1.
+        }));
+        assert!(worker.send(Request::DefinitionAt { offset: 10_000 }));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(worker.send(Request::Compile {
+            text: "= Still here\n".into(),
+            revision: 7,
+            force: false,
+        }));
+        let compiled = futures::executor::block_on(async {
+            loop {
+                if let Some(Response::Compiled(compiled)) = answers.next().await
+                    && !compiled.partial
+                {
+                    break compiled;
+                }
+            }
+        });
+        assert_eq!(compiled.revision, 7);
+        assert!(compiled.pages.is_some());
+    }
+
+    /// A small edit is sent and, once answered, leaves nothing behind.
+    #[test]
+    fn sync_a_small_edit_is_compiled_once() {
+        let mut sync = LiveSync::default();
+        sync.edited(1);
+        assert!(sync.behind());
+        sync.sent(1, false);
+        assert!(!sync.compiled(1, false), "nothing newer: no follow-up");
+        assert!(!sync.behind());
+    }
+
+    /// An edit made while a compile runs is compiled after it: either its
+    /// own send is already queued, or the answer triggers a follow-up.
+    #[test]
+    fn sync_an_edit_during_a_compile_gets_a_follow_up() {
+        let mut sync = LiveSync::default();
+        sync.edited(1);
+        sync.sent(1, false);
+        // Typed while revision 1 compiles; its send is queued.
+        sync.edited(2);
+        sync.sent(2, false);
+        assert!(!sync.compiled(1, false), "revision 2 is already on its way");
+        assert!(!sync.compiled(2, false));
+        // Typed while revision 2 compiles, but its send never happened (the
+        // budget gate flipped, a debounce was dropped, …).
+        sync.edited(3);
+        assert!(sync.compiled(2, false), "editor is ahead: send again");
+        assert!(sync.behind());
+        sync.sent(3, false);
+        assert!(!sync.compiled(3, false));
+        assert!(!sync.behind());
+    }
+
+    /// Partial (progressive) answers never decide anything.
+    #[test]
+    fn sync_partial_answers_do_not_count() {
+        let mut sync = LiveSync::default();
+        sync.edited(2);
+        sync.sent(1, false);
+        assert!(!sync.compiled(1, true));
+        assert!(sync.behind());
+    }
+
+    /// Force Recompile stays "busy" until its own revision is answered.
+    #[test]
+    fn sync_force_is_busy_until_answered() {
+        let mut sync = LiveSync::default();
+        sync.edited(4);
+        sync.sent(4, false);
+        sync.sent(4, true);
+        assert!(sync.forcing());
+        assert!(!sync.compiled(3, false));
+        assert!(sync.forcing(), "an older answer does not end the force");
+        assert!(!sync.compiled(4, false));
+        assert!(!sync.forcing());
+        sync.sent(5, true);
+        sync.cancel_force();
+        assert!(!sync.forcing());
     }
 }

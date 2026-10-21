@@ -1112,6 +1112,9 @@ impl Workspace {
         if self.active > ix || self.active >= self.documents.len() {
             self.active = self.active.saturating_sub(1);
         }
+        // The active tab may have changed: a stale EditorOnly / PreviewOnly
+        // role would hide its editor or its preview.
+        self.sync_preview_pin_roles(cx);
         // Collapse if both panes would show the same tab.
         if let Some(split) = self.editor_split {
             let other = split.other.min(self.documents.len().saturating_sub(1));
@@ -1708,13 +1711,7 @@ impl Workspace {
                                 settings.recent_files.retain(|recent| recent != &path)
                             });
                         }
-                        this.fail_loading(
-                            placeholder,
-                            &path,
-                            err,
-                            window,
-                            cx,
-                        );
+                        this.fail_loading(placeholder, &path, err, window, cx);
                     }
                 });
             })
@@ -3107,6 +3104,39 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.toggle_pin_preview(window, cx);
+    }
+
+    /// Force Recompile the Typst preview on screen: the pinned one when a
+    /// pinned preview sits beside another tab, the active document's
+    /// otherwise.
+    fn force_recompile_action(
+        &mut self,
+        _: &crate::actions::ForceRecompile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.force_recompile_target(cx);
+        let forced = target.is_some_and(|doc| doc.update(cx, |doc, cx| doc.force_recompile(cx)));
+        if !forced {
+            window.push_notification(
+                Notification::info("Force Recompile works on Typst documents with a preview."),
+                cx,
+            );
+        }
+    }
+
+    /// The document whose preview Force Recompile rebuilds: the pinned
+    /// preview when it is shown beside another tab and is Typst, else the
+    /// active document.
+    fn force_recompile_target(&self, cx: &App) -> Option<Entity<DocumentView>> {
+        let active = self.active_document().clone();
+        let pinned = self
+            .pinned_preview
+            .filter(|&id| id != active.entity_id())
+            .and_then(|id| self.document_index(id))
+            .map(|ix| self.documents[ix].clone())
+            .filter(|doc| doc.read(cx).has_typst_live());
+        pinned.or(Some(active))
     }
 
     /// Assign EditorOnly / PreviewOnly / Full roles so a pinned preview can
@@ -5558,6 +5588,7 @@ impl Workspace {
         }
         self.documents.insert(gap, doc);
         self.active = gap;
+        self.sync_preview_pin_roles(cx);
         self.save_session(window, cx);
         cx.notify();
     }
@@ -6284,6 +6315,7 @@ impl Workspace {
             other: dragged,
             vertical,
         });
+        self.sync_preview_pin_roles(cx);
         AppSettings::update(cx, |settings| {
             settings.focus_mode = false;
             settings.layout = Layout::Editor;
@@ -7744,6 +7776,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::reopen_closed_editor))
             .on_action(cx.listener(Self::pin_tab))
             .on_action(cx.listener(Self::toggle_pin_preview_action))
+            .on_action(cx.listener(Self::force_recompile_action))
             .on_action(cx.listener(Self::show_tab_context_menu))
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
@@ -8214,6 +8247,7 @@ impl Workspace {
                     other,
                     vertical: split.vertical,
                 });
+                this.sync_preview_pin_roles(cx);
                 this.tab_insertion = None;
                 this.tab_drag_index.set(None);
                 this.tab_drag_last_pos.set(None);

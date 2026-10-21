@@ -11,9 +11,7 @@ use std::path::{Path, PathBuf};
 
 /// Absolute path text for the clipboard / toasts: no Win32 `\\?\` prefix.
 pub fn path_for_clipboard(path: &Path) -> String {
-    strip_verbatim_prefix(path)
-        .to_string_lossy()
-        .into_owned()
+    strip_verbatim_prefix(path).to_string_lossy().into_owned()
 }
 
 /// The same path without a Win32 extended-length / verbatim prefix, so

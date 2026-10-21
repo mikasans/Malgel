@@ -234,6 +234,15 @@ impl DocumentWorld {
         self.read.get_mut().expect("not poisoned").clear();
     }
 
+    /// Forget the bytes of every named file and where each package was
+    /// found, so the next compile reads them all from disk again — what a
+    /// forced recompile wants when a file changed without its size or
+    /// modification time moving.
+    pub(crate) fn clear_caches(&mut self) {
+        self.file_cache.get_mut().expect("not poisoned").clear();
+        self.package_roots.get_mut().expect("not poisoned").clear();
+    }
+
     /// The document's source as the compiler sees it.
     pub(crate) fn main_source(&self) -> &Source {
         &self.source
