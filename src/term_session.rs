@@ -50,8 +50,10 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 /// × 5000 ≈ 12 MB worst case per session.
 pub const SCROLLBACK_LINES: usize = 5_000;
 /// Bytes per PTY read. Also bounds how long the reader holds the terminal
-/// lock for one parse (well under a millisecond for 64 KiB).
-const READ_CHUNK: usize = 64 * 1024;
+/// lock for one parse, which the UI thread may wait out for a frame: 16 KiB
+/// of `yes` is 8k line feeds, ~3ms (64 KiB held it ~13ms, longer on a
+/// loaded box).
+const READ_CHUNK: usize = 16 * 1024;
 /// Bytes per write(2) on the writer thread, so [`PtySession::interrupt`] can
 /// cut into a long paste between chunks.
 const WRITE_CHUNK: usize = 1024;

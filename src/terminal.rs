@@ -79,6 +79,8 @@ const SUSTAINED_FLOOD_AFTER: Duration = Duration::from_millis(500);
 const SUSTAINED_FLOOD_FRAME: Duration = Duration::from_millis(333);
 /// How long after Ctrl+C/Z/\\ output is painted unthrottled.
 const INTERRUPT_FAST_PAINT: Duration = Duration::from_millis(1000);
+/// Output quiet this long after an interrupt counts as settled.
+const SETTLE_QUIET: Duration = Duration::from_millis(500);
 /// Bytes per tick below which output counts as interactive (echo, prompt)
 /// and is painted at once.
 const ECHO_BYTES: u64 = 4096;
@@ -136,6 +138,8 @@ fn is_app_chord(keys: &Keystroke) -> bool {
 
 /// One integrated terminal session in the bottom panel.
 pub struct TerminalPanel {
+    /// The panel is maximized (set by the workspace; picks the header icon).
+    pub maximized: bool,
     focus_handle: FocusHandle,
     cwd: Option<PathBuf>,
     input: Entity<InputState>,
@@ -156,6 +160,11 @@ pub struct TerminalPanel {
     flood_since: Option<Instant>,
     /// After an interrupt, paint every tick until then.
     fast_paint_until: Option<Instant>,
+    /// Last interrupt and the last paint after it that showed new output:
+    /// MALGEL_PERF logs `term_interrupt_settle` (interrupt to the final
+    /// changed frame) once output has been quiet for SETTLE_QUIET.
+    interrupt_at: Option<Instant>,
+    settle_paint: Option<Instant>,
     _pump: Option<gpui_kit::Task<()>>,
     /// Stick output viewport to the end while the user has not scrolled up.
     follow_tail: bool,
@@ -224,6 +233,9 @@ impl TerminalPanel {
             bytes_at_paint: 0,
             flood_since: None,
             fast_paint_until: None,
+            maximized: false,
+            interrupt_at: None,
+            settle_paint: None,
             _pump: None,
             follow_tail: true,
         }
@@ -448,6 +460,8 @@ impl TerminalPanel {
             // painting every tick until the prompt is up.
             self.flood_since = None;
             self.fast_paint_until = Some(Instant::now() + INTERRUPT_FAST_PAINT);
+            self.interrupt_at = Some(Instant::now());
+            self.settle_paint = None;
             if pending {
                 self.input
                     .update(cx, |input, cx| input.set_value("", window, cx));
@@ -596,7 +610,20 @@ impl TerminalPanel {
                 if self.last_paint.elapsed() > FLOOD_FRAME {
                     self.flood_since = None;
                 }
+                if let Some(at) = self.interrupt_at {
+                    let last = self.settle_paint.unwrap_or(at);
+                    if last.elapsed() >= SETTLE_QUIET {
+                        self.interrupt_at = None;
+                        crate::perf::mark(&format!(
+                            "term_interrupt_settle {:.0}ms",
+                            last.duration_since(at).as_secs_f64() * 1000.0
+                        ));
+                    }
+                }
                 return true;
+            }
+            if self.interrupt_at.is_some() {
+                self.settle_paint = Some(Instant::now());
             }
             if streaming && !fast {
                 self.flood_since.get_or_insert_with(Instant::now);
@@ -968,8 +995,16 @@ impl Render for TerminalPanel {
                         Button::new(ElementId::NamedInteger("terminal-maximize".into(), eid))
                             .ghost()
                             .small()
-                            .icon(Icon::new(IconName::ChevronUp))
-                            .tooltip("Maximize Panel Size")
+                            .icon(Icon::new(if self.maximized {
+                                IconName::Minimize2
+                            } else {
+                                IconName::Maximize2
+                            }))
+                            .tooltip(if self.maximized {
+                                "Restore Panel Size"
+                            } else {
+                                "Maximize Panel Size"
+                            })
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(
                                     Box::new(crate::actions::ToggleMaximizedPanel),
@@ -982,7 +1017,7 @@ impl Render for TerminalPanel {
                             .ghost()
                             .small()
                             .icon(Icon::new(IconName::X))
-                            .tooltip("Hide Panel (Ctrl+`)")
+                            .tooltip("Close Panel (Ctrl+`)")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(TerminalEvent::HidePanel))),
                     ),
             )

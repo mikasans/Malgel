@@ -8787,6 +8787,16 @@ impl Workspace {
     }
 
     fn render_terminal_area(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        // The header's Maximize / Restore button mirrors the panel state.
+        for term in &self.terminals {
+            if term.read(cx).maximized != self.terminal_maximized {
+                let maximized = self.terminal_maximized;
+                term.update(cx, |term, cx| {
+                    term.maximized = maximized;
+                    cx.notify();
+                });
+            }
+        }
         let active = self
             .terminal_active
             .min(self.terminals.len().saturating_sub(1));

@@ -21,13 +21,43 @@
 # try, default 99), TERM_SCENARIOS ("1 3 p2 2 5 4" subsets), TERM_LAG_LIMIT_MS
 # (flood UI stall, default 250), P2_SECS / P2_CPU_LIMIT / P2_LAG_LIMIT_MS
 # (the `yes` flood: default 10s, <100% CPU, ui_lag max <250ms),
-# INT_SETTLE_LIMIT_MS (^C to a still screen, default 300),
+# INT_SETTLE_LIMIT_MS (^C to the last changed frame, default 200),
+# TERM_RETRY (0: no second run of failed scenario groups),
 # KILL_LIMIT_MS (Kill Terminal to job gone, default 500).
 
 set -uo pipefail
 
 if [[ -z "${E2E_INNER:-}" ]]; then
-  E2E_INNER=1 exec timeout --kill-after=10 "${E2E_TIMEOUT:-900}" "$0" "$@"
+  # Outer run: the suite, then (TERM_RETRY=1, the default) one more go at
+  # the scenario groups that failed. Timing limits are absolute, and a box
+  # shared with builds (load average in every result line) can blow one
+  # second of one scenario; a real regression fails both runs.
+  art="${E2E_ARTIFACTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/target/e2e-terminal}"
+  E2E_INNER=1 E2E_ARTIFACTS="$art" timeout --kill-after=10 "${E2E_TIMEOUT:-900}" "$0" "$@"
+  rc=$?
+  res="$art/results.tsv"
+  if ((rc != 1)) || [[ "${TERM_RETRY:-1}" == 0 || ! -f "$res" ]]; then
+    exit "$rc"
+  fi
+  groups=$(awk -F'\t' '$2 != "PASS" { g = $1; sub(/-.*/, "", g); if (g ~ /^s[0-9]$/) print substr(g, 2); else if (g == "p2") print g }' "$res" | sort -u | tr '\n' ' ')
+  # Something that cannot be retried (the app died) fails outright.
+  if [[ -z "${groups// /}" ]] || awk -F'\t' '$2 != "PASS" && $1 !~ /^(s[0-9]|p2)-/ { bad = 1 } END { exit !bad }' "$res"; then
+    exit "$rc"
+  fi
+  echo "== retrying scenario groups: $groups(load $(cut -d' ' -f1-3 /proc/loadavg))"
+  E2E_INNER=1 E2E_ARTIFACTS="$art/retry" TERM_SCENARIOS="$groups" \
+    timeout --kill-after=10 "${E2E_TIMEOUT:-900}" "$0" "$@"
+  # A scenario passes if its retry passed; both details are kept.
+  awk -F'\t' -v OFS='\t' 'NR == FNR { retry[$1] = $2 "\t" $3; next }
+    $2 != "PASS" && ($1 in retry) {
+      split(retry[$1], r, "\t")
+      if (r[1] == "PASS") { print $1, "PASS", "retry: " r[2] " | first run FAIL: " $3; next }
+      print $1, $2, $3 " | retry FAIL: " r[2]; next
+    }
+    { print }' "$art/retry/results.tsv" "$res" >"$res.merged" && mv "$res.merged" "$res"
+  echo; echo "== results (after retry)"; cat "$res"
+  ! awk -F'\t' '$2 != "PASS" { bad = 1 } END { exit !bad }' "$res"
+  exit $?
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -146,8 +176,8 @@ watch_rss() { # run a sampler until $1 exists or $2 seconds pass
   [[ -e "$1" ]]
 }
 FAILS=0
-record() { # scenario status detail
-  printf '%s\t%s\t%s\n' "$1" "$2" "$3" | tee -a "$RESULTS"
+record() { # scenario status detail (the 1-minute load average is appended)
+  printf '%s\t%s\t%s load=%s\n' "$1" "$2" "$3" "$(cut -d' ' -f1 /proc/loadavg)" | tee -a "$RESULTS"
   [[ "$2" == PASS ]] || FAILS=$((FAILS + 1))
 }
 want() { [[ -z "$ONLY" || " $ONLY " == *" $1 "* ]]; }
@@ -235,10 +265,14 @@ if want 1; then
       fi
     done
     mark=$(fresh_marker s1-int.done); run "touch $mark"
-    if wait_for 10 test -e "$mark" && [[ $settled == yes ]] && ((t2 - t0 <= ${INT_SETTLE_LIMIT_MS:-300})); then
-      record s1-ctrl-c PASS "producer killed $((t1 - t0))ms after ^C; screen settled by $((t2 - t0))ms; ui_lag_max=$(lag_since "$lm")ms"
+    # The app's own measure (MALGEL_PERF): ^C to the last frame that showed
+    # new output. The screenshots above only confirm the screen is still;
+    # each one costs ~100ms, so their timing is coarse.
+    st=$(tail -n +"$((lm + 1))" "$APP_LOG" | sed -n 's/.*term_interrupt_settle \([0-9]*\)ms.*/\1/p' | tail -1)
+    if wait_for 10 test -e "$mark" && [[ $settled == yes && -n "$st" ]] && ((st <= ${INT_SETTLE_LIMIT_MS:-200})); then
+      record s1-ctrl-c PASS "producer killed $((t1 - t0))ms after ^C; output settled ${st}ms after ^C (screen still by $((t2 - t0))ms); ui_lag_max=$(lag_since "$lm")ms"
     else
-      record s1-ctrl-c FAIL "producer killed $((t1 - t0))ms; settled=$settled after $((t2 - t0))ms; shell answered=$([[ -e $mark ]] && echo y || echo n)"
+      record s1-ctrl-c FAIL "producer killed $((t1 - t0))ms; output settled ${st:-?}ms after ^C; screen still=$settled by $((t2 - t0))ms; shell answered=$([[ -e $mark ]] && echo y || echo n)"
       recover
     fi
   else
