@@ -442,6 +442,15 @@ impl PtySession {
         self.input.push(&paste_payload(text, bracketed));
     }
 
+    /// The terminal lock, as the UI thread takes it: the wait is reported to
+    /// MALGEL_PERF (`term_lock_wait` in the ui_lag line).
+    fn ui_lock(&self) -> impl std::ops::DerefMut<Target = Term<Listener>> + '_ {
+        let started = std::time::Instant::now();
+        let guard = self.shared.term.lock();
+        crate::perf::note_term_lock_wait(started.elapsed());
+        guard
+    }
+
     /// Send a signal character (^C, ^Z, ^\) ahead of any queued input.
     pub fn interrupt(&self, byte: u8) {
         self.shared.interrupted.store(true, Ordering::Release);
@@ -467,7 +476,7 @@ impl PtySession {
         if let Some(master) = &self.master {
             let _ = master.resize(pty_size(size));
         }
-        self.shared.term.lock().resize(size);
+        self.ui_lock().resize(size);
         self.shared.dirty.store(true, Ordering::Release);
     }
 
@@ -514,21 +523,21 @@ impl PtySession {
     }
 
     pub fn mode(&self) -> TermMode {
-        *self.shared.term.lock().mode()
+        *self.ui_lock().mode()
     }
 
     /// Visible rows: the alternate screen as-is, or for the normal screen the
     /// newest `max_lines` of scrollback + screen with trailing blank rows below
     /// the cursor dropped.
     pub fn snapshot(&self, max_lines: usize) -> Snapshot {
-        let term = self.shared.term.lock();
+        let term = self.ui_lock();
         snapshot_term(&term, max_lines)
     }
 
     /// Row count, cursor and modes for the view; pair with [`Self::rows`],
     /// which the UI calls only for the rows actually on screen.
     pub fn view_info(&self) -> ViewInfo {
-        let term = self.shared.term.lock();
+        let term = self.ui_lock();
         view_info_term(&term)
     }
 
@@ -536,13 +545,13 @@ impl PtySession {
     /// clamped to what exists now.
     #[cfg(all(test, unix))]
     pub fn rows(&self, range: std::ops::Range<usize>) -> Vec<String> {
-        let term = self.shared.term.lock();
+        let term = self.ui_lock();
         rows_term(&term, range)
     }
 
     /// [`Self::rows`] with colors and attributes.
     pub fn styled_rows(&self, range: std::ops::Range<usize>) -> Vec<StyledRow> {
-        let term = self.shared.term.lock();
+        let term = self.ui_lock();
         let (top, bottom) = view_bounds(&term);
         let count = (bottom - top + 1).max(0) as usize;
         let end = range.end.min(count);
@@ -554,7 +563,7 @@ impl PtySession {
 
     /// Everything in scrollback and on screen, soft-wrapped rows rejoined.
     pub fn transcript(&self) -> String {
-        let term = self.shared.term.lock();
+        let term = self.ui_lock();
         let grid = term.grid();
         let top = grid.topmost_line().0;
         let bottom = last_content_line(&term);
@@ -572,7 +581,7 @@ impl PtySession {
     /// Clear scrollback and screen, keeping the cursor's line at the top (VS
     /// Code's Clear keeps the prompt).
     pub fn clear(&self) {
-        let mut term = self.shared.term.lock();
+        let mut term = self.ui_lock();
         let cursor = term.grid().cursor.point;
         let line = cursor.line.0.max(0) as usize;
         if line > 0 {
@@ -589,7 +598,7 @@ impl PtySession {
     pub fn inject(&self, text: &str) {
         let mut processor: ansi::Processor = ansi::Processor::new();
         let normalized = text.replace('\n', "\r\n");
-        let mut term = self.shared.term.lock();
+        let mut term = self.ui_lock();
         processor.advance(&mut *term, normalized.as_bytes());
         drop(term);
         self.shared.dirty.store(true, Ordering::Release);

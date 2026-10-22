@@ -107,6 +107,16 @@ impl Drop for Span {
     }
 }
 
+/// Longest wait of the UI thread for a terminal's lock since the last
+/// ui_lag line, in microseconds.
+static TERM_LOCK_WAIT_MAX_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_term_lock_wait(wait: Duration) {
+    if ENABLED.load(Ordering::Relaxed) {
+        TERM_LOCK_WAIT_MAX_US.fetch_max(wait.as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 /// `MALGEL_PERF=1` only: a foreground heartbeat that measures how late the
 /// main thread wakes for a 10ms timer, logged once a second as
 /// `malgel-perf: ui_lag max=..ms over50=N ticks=N`. A stalled UI thread (a
@@ -131,11 +141,22 @@ pub fn start_ui_lag_probe(cx: &mut gpui_kit::App) {
             max_lag = max_lag.max(lag);
             if lag > Duration::from_millis(50) {
                 over_50 += 1;
+                if lag > Duration::from_millis(200) {
+                    eprintln!(
+                        "malgel-perf: stall {:.0}ms ending at +{:.1}ms",
+                        lag.as_secs_f64() * 1000.0,
+                        since_ms()
+                    );
+                }
             }
             if window_start.elapsed() >= Duration::from_secs(1) {
+                let lock_us = TERM_LOCK_WAIT_MAX_US.swap(0, Ordering::Relaxed);
                 eprintln!(
-                    "malgel-perf: ui_lag max={:.1}ms over50={over_50} ticks={ticks} (at +{:.1}ms) rss={}",
+                    "malgel-perf: ui_lag max={:.1}ms over50={over_50} ticks={ticks} frames={} \
+                     term_lock_wait={:.1}ms (at +{:.1}ms) rss={}",
                     max_lag.as_secs_f64() * 1000.0,
+                    FRAMES.swap(0, Ordering::Relaxed),
+                    lock_us as f64 / 1000.0,
                     since_ms(),
                     rss_label()
                 );
@@ -170,10 +191,17 @@ pub fn release_free_memory() {
     }
 }
 
+// Workspace renders since the last ui_lag line.
+static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// `MALGEL_PERF_INJECT_SLEEP_MS=N` (only with `MALGEL_PERF=1`): stall every
 /// workspace frame by N ms. A deliberate regression, so the perf gate
 /// (scripts/e2e/perf_scenes.sh) can be shown to trip; never set otherwise.
+/// Also counts frames for the ui_lag line.
 pub fn injected_frame_delay() {
+    if ENABLED.load(Ordering::Relaxed) {
+        FRAMES.fetch_add(1, Ordering::Relaxed);
+    }
     static DELAY: OnceLock<Option<Duration>> = OnceLock::new();
     let delay = DELAY.get_or_init(|| {
         if !enabled() {
