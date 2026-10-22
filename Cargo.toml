@@ -101,6 +101,9 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 ignore = "0.4.33"
 # Integrated terminal (Ctrl+`): a real shell in a bottom panel via a PTY.
 portable-pty = "0.9"
+# The terminal's screen: a VT emulator (grid, scrollback, alternate screen) so
+# vim / less / top draw correctly. Parsing runs on the PTY reader thread.
+alacritty_terminal = { version = "0.26", default-features = false }
 # Math rendering, all pure Rust: LaTeX is translated to Typst math, laid out
 # by the Typst compiler with its bundled math fonts, and drawn as SVG (or PNG
 # for Word). PDF export compiles whole documents with the same compiler.
@@ -118,6 +121,11 @@ serde_json = "1"
 hayro = "0.7.1"
 hayro-svg = "0.7.0"
 typst-ide = "0.15.1"
+
+# Terminal: poll the PTY so its reader can stop, and hang up the foreground
+# job on Kill. Already in the lockfile via portable-pty.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # "Default app for Markdown" in Settings.
 [target.'cfg(target_os = "macos")'.dependencies]

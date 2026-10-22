@@ -1,0 +1,1159 @@
+//! PTY session behind the integrated terminal, free of any UI types so it can
+//! be driven headless in tests.
+//!
+//! Threading model (the point of this module — every piece here exists because
+//! the old panel froze or ballooned under load):
+//!
+//! - **Reader thread** reads the PTY master and feeds the bytes straight into a
+//!   VT emulator (`alacritty_terminal::Term`) under a fair mutex. There is no
+//!   channel between the PTY and the UI, so a flooding process (`yes`,
+//!   `seq 1 5000000`, `cat big.log`) cannot queue gigabytes in memory: once the
+//!   parser is busy the reader stops reading, the kernel PTY buffer fills and
+//!   the producer blocks — backpressure is the PTY itself. The emulator keeps
+//!   a fixed scrollback, so memory is bounded no matter how much is printed.
+//! - **The UI thread never parses.** It polls [`PtySession::take_dirty`] at
+//!   frame rate and, when something changed, copies the visible rows out under
+//!   the lock (`snapshot`) — cost proportional to rows shown, not to bytes
+//!   received.
+//! - **Writer thread** owns the PTY writer. The UI only appends to an input
+//!   queue, so a child that stops reading stdin (a full tty input queue) can
+//!   never block the UI on `write(2)`. [`PtySession::interrupt`] drops queued
+//!   but unwritten input before sending ^C / ^Z / ^\ so a stuck paste cannot
+//!   hold the signal hostage.
+//! - **Shutdown never blocks the UI.** Killing (SIGHUP, grace period, SIGKILL)
+//!   and reaping happen on a short-lived thread; the reader polls with a
+//!   timeout so it exits even when an orphaned job keeps the PTY open.
+
+use std::{
+    collections::VecDeque,
+    io::{Read, Write},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+};
+
+use alacritty_terminal::{
+    Term,
+    event::{Event, EventListener},
+    grid::Dimensions,
+    index::{Column, Line, Point},
+    sync::FairMutex,
+    term::{Config, TermMode, cell::Flags},
+    vte::ansi::{self, Handler as _},
+};
+use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+
+/// Lines of scrollback the emulator keeps (VS Code's default is 1000; we keep
+/// more because Copy reads the whole buffer). Bounded: ~100 cols × 24 B/cell
+/// × 5000 ≈ 12 MB worst case per session.
+pub const SCROLLBACK_LINES: usize = 5_000;
+/// Bytes per PTY read. Also bounds how long the reader holds the terminal
+/// lock for one parse (well under a millisecond for 64 KiB).
+const READ_CHUNK: usize = 64 * 1024;
+/// Bytes per write(2) on the writer thread, so [`PtySession::interrupt`] can
+/// cut into a long paste between chunks.
+const WRITE_CHUNK: usize = 1024;
+/// Most bytes per second the reader parses. A runaway producer (`yes`) is
+/// held to this by PTY backpressure instead of pinning a core in the parser:
+/// nobody reads 500 MB/s of output, and `cat` of a 40 MB log still takes
+/// about a second.
+const MAX_PARSE_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
+/// Throttle accounting window.
+const THROTTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+/// After the shell process exits, how long to wait for EOF on the PTY before
+/// declaring the session over anyway (a background job can hold it open).
+const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+/// How often a blocked reader wakes to check for shutdown.
+const READER_POLL_MS: i32 = 100;
+
+/// Terminal grid size in character cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl GridSize {
+    pub const DEFAULT: GridSize = GridSize {
+        cols: 100,
+        rows: 24,
+    };
+
+    pub fn clamped(cols: usize, rows: usize) -> GridSize {
+        GridSize {
+            cols: cols.clamp(20, 1000) as u16,
+            rows: rows.clamp(4, 500) as u16,
+        }
+    }
+}
+
+impl Dimensions for GridSize {
+    fn total_lines(&self) -> usize {
+        self.rows as usize
+    }
+    fn screen_lines(&self) -> usize {
+        self.rows as usize
+    }
+    fn columns(&self) -> usize {
+        self.cols as usize
+    }
+}
+
+/// Bytes waiting for the writer thread.
+#[derive(Default)]
+struct InputQueueState {
+    pending: VecDeque<u8>,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct InputQueue {
+    state: Mutex<InputQueueState>,
+    ready: Condvar,
+}
+
+impl InputQueue {
+    fn push(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            if state.closed {
+                return;
+            }
+            state.pending.extend(bytes);
+            self.ready.notify_one();
+        }
+    }
+
+    /// Drop anything not yet written, then queue `bytes` (a control char).
+    fn interrupt(&self, bytes: &[u8]) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.closed {
+                return;
+            }
+            state.pending.clear();
+            state.pending.extend(bytes);
+            self.ready.notify_one();
+        }
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            state.pending.clear();
+            self.ready.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.state.lock().map(|s| s.pending.len()).unwrap_or(0)
+    }
+
+    /// Block until bytes are queued; `None` once closed.
+    fn next_chunk(&self) -> Option<Vec<u8>> {
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if state.closed {
+                return None;
+            }
+            if !state.pending.is_empty() {
+                let n = state.pending.len().min(WRITE_CHUNK);
+                return Some(state.pending.drain(..n).collect());
+            }
+            state = self.ready.wait(state).ok()?;
+        }
+    }
+}
+
+/// Emulator events: replies the terminal must send back to the program
+/// (device attributes, cursor position reports) go through the input queue.
+#[derive(Clone)]
+struct Listener {
+    input: Arc<InputQueue>,
+}
+
+impl EventListener for Listener {
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(text) = event {
+            self.input.push(text.as_bytes());
+        }
+    }
+}
+
+struct Shared {
+    term: FairMutex<Term<Listener>>,
+    /// Set by the reader after every parse; cleared by the UI on snapshot.
+    dirty: AtomicBool,
+    /// Reader saw EOF / EIO (every slave handle closed).
+    eof: AtomicBool,
+    /// Asks the reader to exit at its next poll.
+    stop: AtomicBool,
+    bytes_read: AtomicU64,
+}
+
+/// What the panel paints: plain rows (no colors yet) plus cursor and modes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Snapshot {
+    pub lines: Vec<String>,
+    /// `(row in lines, column in chars)` when the program shows a cursor in
+    /// the alternate screen. The normal screen uses the line composer instead.
+    pub cursor: Option<(usize, usize)>,
+    pub alt_screen: bool,
+    pub app_cursor: bool,
+    pub bracketed_paste: bool,
+}
+
+/// Shape of the view without copying any text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewInfo {
+    pub line_count: usize,
+    /// `(view row, column in chars)` when the program shows a cursor.
+    pub cursor: Option<(usize, usize)>,
+    pub alt_screen: bool,
+    pub app_cursor: bool,
+}
+
+/// A live shell (or any command) on a PTY.
+pub struct PtySession {
+    shared: Arc<Shared>,
+    input: Arc<InputQueue>,
+    master: Option<Box<dyn MasterPty + Send>>,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    child_pid: Option<u32>,
+    child_exited_at: Option<std::time::Instant>,
+    size: GridSize,
+}
+
+impl PtySession {
+    /// Spawn `cmd` on a new PTY of `size`.
+    pub fn spawn(cmd: CommandBuilder, size: GridSize) -> Result<PtySession, String> {
+        let pty_system = NativePtySystem::default();
+        let pair = pty_system
+            .openpty(pty_size(size))
+            .map_err(|err| format!("PTY error: {err}"))?;
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|err| format!("Couldn’t start shell: {err}"))?;
+        drop(pair.slave);
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|err| format!("Couldn’t read shell output: {err}"))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|err| format!("Couldn’t write to shell: {err}"))?;
+
+        let input = Arc::new(InputQueue::default());
+        let config = Config {
+            scrolling_history: SCROLLBACK_LINES,
+            ..Config::default()
+        };
+        let term = Term::new(
+            config,
+            &size,
+            Listener {
+                input: input.clone(),
+            },
+        );
+        let shared = Arc::new(Shared {
+            term: FairMutex::new(term),
+            dirty: AtomicBool::new(true),
+            eof: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            bytes_read: AtomicU64::new(0),
+        });
+
+        #[cfg(unix)]
+        let poll_fd = pair.master.as_raw_fd();
+        #[cfg(not(unix))]
+        let poll_fd: Option<i32> = None;
+        {
+            let shared = shared.clone();
+            thread::Builder::new()
+                .name("malgel-pty-reader".into())
+                .spawn(move || reader_loop(reader, poll_fd, shared))
+                .map_err(|err| format!("Couldn’t start reader: {err}"))?;
+        }
+        {
+            let input = input.clone();
+            thread::Builder::new()
+                .name("malgel-pty-writer".into())
+                .spawn(move || writer_loop(writer, input))
+                .map_err(|err| format!("Couldn’t start writer: {err}"))?;
+        }
+
+        let child_pid = child.process_id();
+        Ok(PtySession {
+            shared,
+            input,
+            master: Some(pair.master),
+            child: Some(child),
+            child_pid,
+            child_exited_at: None,
+            size,
+        })
+    }
+
+    /// Queue bytes for the program. Never blocks on the PTY.
+    pub fn write(&self, bytes: &[u8]) {
+        self.input.push(bytes);
+    }
+
+    /// Paste text the way a terminal does: CR line endings, wrapped in
+    /// bracketed-paste markers when the program asked for them.
+    pub fn paste(&self, text: &str) {
+        let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
+        self.input.push(&paste_payload(text, bracketed));
+    }
+
+    /// Send a signal character (^C, ^Z, ^\) ahead of any queued input.
+    pub fn interrupt(&self, byte: u8) {
+        self.input.interrupt(&[byte]);
+    }
+
+    /// Bytes queued for the program but not yet written.
+    #[cfg(test)]
+    pub fn pending_input(&self) -> usize {
+        self.input.pending_len()
+    }
+
+    pub fn bytes_read(&self) -> u64 {
+        self.shared.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Resize the PTY (the program gets SIGWINCH) and the emulator grid.
+    pub fn resize(&mut self, size: GridSize) {
+        if size == self.size {
+            return;
+        }
+        self.size = size;
+        if let Some(master) = &self.master {
+            let _ = master.resize(pty_size(size));
+        }
+        self.shared.term.lock().resize(size);
+        self.shared.dirty.store(true, Ordering::Release);
+    }
+
+    /// True (once) when output arrived since the last call.
+    pub fn take_dirty(&self) -> bool {
+        self.shared.dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether the shell is gone: the PTY hit EOF or the shell process exited
+    /// (a background job can keep the PTY open after `exit`).
+    pub fn poll_exited(&mut self) -> bool {
+        if self.shared.eof.load(Ordering::Acquire) {
+            return true;
+        }
+        if self.child_exited_at.is_none()
+            && let Some(child) = &mut self.child
+            && let Ok(Some(_)) = child.try_wait()
+        {
+            self.child_exited_at = Some(std::time::Instant::now());
+        }
+        // The shell is gone but its last output may still be in flight to
+        // the reader; give it a moment before calling the session over
+        // (otherwise `echo hi; exit` loses "hi"). EOF wins when it comes.
+        self.child_exited_at
+            .is_some_and(|at| at.elapsed() >= EXIT_GRACE)
+    }
+
+    /// True when the shell has no foreground job (safe to restart).
+    pub fn is_idle(&self) -> bool {
+        #[cfg(unix)]
+        {
+            match (
+                self.master.as_ref().and_then(|m| m.process_group_leader()),
+                self.child_pid,
+            ) {
+                (Some(leader), Some(pid)) => leader as u32 == pid,
+                _ => true,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
+    pub fn mode(&self) -> TermMode {
+        *self.shared.term.lock().mode()
+    }
+
+    /// Visible rows: the alternate screen as-is, or for the normal screen the
+    /// newest `max_lines` of scrollback + screen with trailing blank rows below
+    /// the cursor dropped.
+    pub fn snapshot(&self, max_lines: usize) -> Snapshot {
+        let term = self.shared.term.lock();
+        snapshot_term(&term, max_lines)
+    }
+
+    /// Row count, cursor and modes for the view; pair with [`Self::rows`],
+    /// which the UI calls only for the rows actually on screen.
+    pub fn view_info(&self) -> ViewInfo {
+        let term = self.shared.term.lock();
+        view_info_term(&term)
+    }
+
+    /// Text of view rows `range` (indices as in [`ViewInfo::line_count`]),
+    /// clamped to what exists now.
+    pub fn rows(&self, range: std::ops::Range<usize>) -> Vec<String> {
+        let term = self.shared.term.lock();
+        rows_term(&term, range)
+    }
+
+    /// Everything in scrollback and on screen, soft-wrapped rows rejoined.
+    pub fn transcript(&self) -> String {
+        let term = self.shared.term.lock();
+        let grid = term.grid();
+        let top = grid.topmost_line().0;
+        let bottom = last_content_line(&term);
+        let mut out = String::new();
+        for line in top..=bottom {
+            let (text, wrapped) = row_text(&term, Line(line));
+            out.push_str(text.trim_end_matches(' '));
+            if !wrapped && line != bottom {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Clear scrollback and screen, keeping the cursor's line at the top (VS
+    /// Code's Clear keeps the prompt).
+    pub fn clear(&self) {
+        let mut term = self.shared.term.lock();
+        let cursor = term.grid().cursor.point;
+        let line = cursor.line.0.max(0) as usize;
+        if line > 0 {
+            term.scroll_up(line);
+        }
+        term.goto(0, cursor.column.0);
+        term.clear_screen(ansi::ClearMode::Below);
+        term.clear_screen(ansi::ClearMode::Saved);
+        drop(term);
+        self.shared.dirty.store(true, Ordering::Release);
+    }
+
+    /// Print local status text (banners) into the emulator as if output.
+    pub fn inject(&self, text: &str) {
+        let mut processor: ansi::Processor = ansi::Processor::new();
+        let normalized = text.replace('\n', "\r\n");
+        let mut term = self.shared.term.lock();
+        processor.advance(&mut *term, normalized.as_bytes());
+        drop(term);
+        self.shared.dirty.store(true, Ordering::Release);
+    }
+
+    /// Stop the session without blocking: close input, ask the reader to quit,
+    /// and kill + reap the process tree on a helper thread.
+    pub fn shutdown(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        self.input.close();
+        let child = self.child.take();
+        #[cfg(unix)]
+        let foreground = self.master.as_ref().and_then(|m| m.process_group_leader());
+        let master = self.master.take();
+        if child.is_none() && master.is_none() {
+            return;
+        }
+        let _ = thread::Builder::new()
+            .name("malgel-pty-reaper".into())
+            .spawn(move || {
+                #[cfg(unix)]
+                if let Some(pgid) = foreground
+                    && pgid > 0
+                {
+                    // The foreground job (e.g. `yes`) gets the hangup a real
+                    // terminal sends when its window closes.
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGHUP);
+                    }
+                }
+                if let Some(mut child) = child {
+                    // SIGHUP, ~200ms grace, then SIGKILL (portable-pty).
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                // Last handle on the master: closing it hangs up the slave
+                // for anything still attached.
+                drop(master);
+            });
+    }
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// The user's shell: `$SHELL`, else the login shell from the password
+/// database (a desktop launcher or service may not export `SHELL`), else bash,
+/// else `/bin/sh`. Falling straight to `/bin/sh` meant dash on Debian: no
+/// line editing, so Tab, Up/Down history, Ctrl+R and Ctrl+L did nothing.
+#[cfg(unix)]
+pub fn user_shell() -> String {
+    if let Ok(shell) = std::env::var("SHELL")
+        && !shell.trim().is_empty()
+    {
+        return shell;
+    }
+    // SAFETY: getpwuid returns a pointer into static storage (or null); the
+    // string is copied out before any other passwd call.
+    let from_passwd = unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_shell.is_null() {
+            None
+        } else {
+            std::ffi::CStr::from_ptr((*pw).pw_shell)
+                .to_str()
+                .ok()
+                .map(str::to_owned)
+        }
+    };
+    let usable = |p: &str| {
+        !p.is_empty()
+            && !p.ends_with("/nologin")
+            && !p.ends_with("/false")
+            && std::path::Path::new(p).exists()
+    };
+    if let Some(shell) = from_passwd.filter(|p| usable(p)) {
+        return shell;
+    }
+    for candidate in ["/bin/bash", "/usr/bin/bash", "/bin/zsh", "/usr/bin/zsh"] {
+        if usable(candidate) {
+            return candidate.to_string();
+        }
+    }
+    "/bin/sh".to_string()
+}
+
+/// Bytes a paste sends: CR line endings (what Enter sends), wrapped in
+/// bracketed-paste markers when the program enabled them.
+pub fn paste_payload(text: &str, bracketed: bool) -> Vec<u8> {
+    let normalized = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\r");
+    if !bracketed {
+        return normalized.into_bytes();
+    }
+    // A pasted end marker would let the paste escape the bracket.
+    let clean = normalized.replace("\x1b[201~", "");
+    let mut payload = b"\x1b[200~".to_vec();
+    payload.extend_from_slice(clean.as_bytes());
+    payload.extend_from_slice(b"\x1b[201~");
+    payload
+}
+
+fn pty_size(size: GridSize) -> PtySize {
+    PtySize {
+        rows: size.rows,
+        cols: size.cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+fn reader_loop(mut reader: Box<dyn Read + Send>, poll_fd: Option<i32>, shared: Arc<Shared>) {
+    let mut processor: ansi::Processor = ansi::Processor::new();
+    let mut buf = vec![0u8; READ_CHUNK];
+    let window_budget = MAX_PARSE_BYTES_PER_SEC * THROTTLE_WINDOW.as_millis() as u64 / 1000;
+    let mut window_start = std::time::Instant::now();
+    let mut window_bytes = 0u64;
+    loop {
+        if shared.stop.load(Ordering::Acquire) {
+            break;
+        }
+        if window_bytes >= window_budget {
+            let elapsed = window_start.elapsed();
+            if elapsed < THROTTLE_WINDOW {
+                thread::sleep(THROTTLE_WINDOW - elapsed);
+            }
+            window_start = std::time::Instant::now();
+            window_bytes = 0;
+        } else if window_start.elapsed() >= THROTTLE_WINDOW {
+            window_start = std::time::Instant::now();
+            window_bytes = 0;
+        }
+        if !wait_readable(poll_fd) {
+            continue;
+        }
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                {
+                    let mut term = shared.term.lock();
+                    processor.advance(&mut *term, &buf[..n]);
+                }
+                window_bytes += n as u64;
+                shared.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+                shared.dirty.store(true, Ordering::Release);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    shared.eof.store(true, Ordering::Release);
+    shared.dirty.store(true, Ordering::Release);
+}
+
+/// Wait up to [`READER_POLL_MS`] for the PTY to become readable so the reader
+/// can notice shutdown. Returns true when a read will not block forever.
+fn wait_readable(fd: Option<i32>) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(fd) = fd else {
+            return true;
+        };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, READER_POLL_MS) };
+        // Error / hangup: let read() report it.
+        rc != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fd, READER_POLL_MS);
+        true
+    }
+}
+
+fn writer_loop(mut writer: Box<dyn Write + Send>, input: Arc<InputQueue>) {
+    while let Some(chunk) = input.next_chunk() {
+        if writer.write_all(&chunk).is_err() {
+            break;
+        }
+        let _ = writer.flush();
+    }
+    input.close();
+}
+
+/// Text of one grid row and whether it soft-wraps into the next.
+fn row_text<T>(term: &Term<T>, line: Line) -> (String, bool) {
+    let grid = term.grid();
+    let row = &grid[line];
+    let cols = grid.columns();
+    let mut text = String::with_capacity(cols);
+    for col in 0..cols {
+        let cell = &row[Column(col)];
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        text.push(cell.c);
+        if let Some(extra) = cell.zerowidth() {
+            text.extend(extra.iter());
+        }
+    }
+    let wrapped = row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+    (text, wrapped)
+}
+
+fn row_is_blank<T>(term: &Term<T>, line: Line) -> bool {
+    let grid = term.grid();
+    let row = &grid[line];
+    (0..grid.columns()).all(|c| row[Column(c)].c == ' ')
+}
+
+/// Lowest line worth showing on the normal screen: the cursor line or the
+/// last non-blank line below it.
+fn last_content_line<T>(term: &Term<T>) -> i32 {
+    let grid = term.grid();
+    let cursor_line = grid.cursor.point.line.0;
+    let mut bottom = grid.bottommost_line().0;
+    while bottom > cursor_line && row_is_blank(term, Line(bottom)) {
+        bottom -= 1;
+    }
+    bottom
+}
+
+/// First and last grid line of the view: the alternate screen as-is, or the
+/// whole scrollback down to the cursor / last non-blank line.
+fn view_bounds<T>(term: &Term<T>) -> (i32, i32) {
+    let grid = term.grid();
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        (0, grid.bottommost_line().0)
+    } else {
+        (grid.topmost_line().0, last_content_line(term))
+    }
+}
+
+fn view_info_term<T>(term: &Term<T>) -> ViewInfo {
+    let mode = *term.mode();
+    let grid = term.grid();
+    let (top, bottom) = view_bounds(term);
+    let cursor = mode.contains(TermMode::SHOW_CURSOR).then(|| {
+        let Point { line, column } = grid.cursor.point;
+        let row = (line.0 - top).max(0) as usize;
+        // Column in chars: wide-char spacers are skipped in the row text.
+        let gr = &grid[line];
+        let col = (0..column.0.min(grid.columns()))
+            .filter(|&c| {
+                !gr[Column(c)]
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            })
+            .count();
+        (row, col)
+    });
+    ViewInfo {
+        line_count: (bottom - top + 1).max(0) as usize,
+        cursor,
+        alt_screen: mode.contains(TermMode::ALT_SCREEN),
+        app_cursor: mode.contains(TermMode::APP_CURSOR),
+    }
+}
+
+fn rows_term<T>(term: &Term<T>, range: std::ops::Range<usize>) -> Vec<String> {
+    let (top, bottom) = view_bounds(term);
+    let count = (bottom - top + 1).max(0) as usize;
+    let end = range.end.min(count);
+    let start = range.start.min(end);
+    (start..end)
+        .map(|ix| {
+            let (mut text, _) = row_text(term, Line(top + ix as i32));
+            let trimmed = text.trim_end_matches(' ').len();
+            text.truncate(trimmed);
+            text
+        })
+        .collect()
+}
+
+fn snapshot_term<T>(term: &Term<T>, max_lines: usize) -> Snapshot {
+    let info = view_info_term(term);
+    let start = if info.alt_screen {
+        0
+    } else {
+        info.line_count.saturating_sub(max_lines.max(1))
+    };
+    let lines = rows_term(term, start..info.line_count);
+    Snapshot {
+        lines,
+        cursor: info
+            .cursor
+            .filter(|_| info.alt_screen)
+            .and_then(|(r, c)| r.checked_sub(start).map(|r| (r, c))),
+        alt_screen: info.alt_screen,
+        app_cursor: info.app_cursor,
+        bracketed_paste: term.mode().contains(TermMode::BRACKETED_PASTE),
+    }
+}
+
+/// Bytes a key press sends to a program in raw (alternate-screen) mode, as
+/// xterm encodes them. `key` is GPUI's key name, `key_char` the typed text.
+pub fn encode_key(
+    key: &str,
+    key_char: Option<&str>,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
+    let csi_or_ss3 = |final_byte: u8| -> Vec<u8> {
+        if app_cursor && !ctrl && !alt && !shift {
+            vec![0x1b, b'O', final_byte]
+        } else {
+            let m = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+            if m == 1 {
+                vec![0x1b, b'[', final_byte]
+            } else {
+                format!("\x1b[1;{m}{}", final_byte as char).into_bytes()
+            }
+        }
+    };
+    let tilde = |n: u8| -> Vec<u8> { format!("\x1b[{n}~").into_bytes() };
+    let mut bytes = match key {
+        "enter" => vec![b'\r'],
+        "backspace" => vec![0x7f],
+        "tab" if shift => b"\x1b[Z".to_vec(),
+        "tab" => vec![b'\t'],
+        "escape" => vec![0x1b],
+        "space" if ctrl => vec![0],
+        "space" => vec![b' '],
+        "up" => csi_or_ss3(b'A'),
+        "down" => csi_or_ss3(b'B'),
+        "right" => csi_or_ss3(b'C'),
+        "left" => csi_or_ss3(b'D'),
+        "home" => csi_or_ss3(b'H'),
+        "end" => csi_or_ss3(b'F'),
+        "insert" => tilde(2),
+        "delete" => tilde(3),
+        "pageup" => tilde(5),
+        "pagedown" => tilde(6),
+        "f1" => b"\x1bOP".to_vec(),
+        "f2" => b"\x1bOQ".to_vec(),
+        "f3" => b"\x1bOR".to_vec(),
+        "f4" => b"\x1bOS".to_vec(),
+        "f5" => tilde(15),
+        "f6" => tilde(17),
+        "f7" => tilde(18),
+        "f8" => tilde(19),
+        "f9" => tilde(20),
+        "f10" => tilde(21),
+        "f11" => tilde(23),
+        "f12" => tilde(24),
+        _ => {
+            if ctrl {
+                let mut chars = key.chars();
+                let (Some(c), None) = (chars.next(), chars.next()) else {
+                    return None;
+                };
+                let byte = match c.to_ascii_lowercase() {
+                    c @ 'a'..='z' => c as u8 - b'a' + 1,
+                    '@' | '2' => 0,
+                    '[' | '3' => 0x1b,
+                    '\\' | '4' => 0x1c,
+                    ']' | '5' => 0x1d,
+                    '^' | '6' => 0x1e,
+                    '_' | '-' | '7' => 0x1f,
+                    '/' => 0x1f,
+                    '8' | '?' => 0x7f,
+                    _ => return None,
+                };
+                vec![byte]
+            } else if let Some(text) = key_char.filter(|t| !t.is_empty()) {
+                text.as_bytes().to_vec()
+            } else if key.chars().count() == 1 {
+                if shift {
+                    key.to_uppercase().into_bytes()
+                } else {
+                    key.as_bytes().to_vec()
+                }
+            } else {
+                return None;
+            }
+        }
+    };
+    if alt && !bytes.starts_with(b"\x1b[") && !bytes.starts_with(b"\x1bO") {
+        bytes.insert(0, 0x1b);
+    }
+    Some(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn sh(script: &str) -> CommandBuilder {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-c");
+        cmd.arg(script);
+        cmd.env("TERM", "xterm-256color");
+        cmd
+    }
+
+    fn interactive_sh() -> CommandBuilder {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-i");
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("PS1", "$ ");
+        cmd.env("ENV", "/dev/null");
+        cmd
+    }
+
+    fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if f() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        f()
+    }
+
+    fn screen_text(session: &PtySession) -> String {
+        session.snapshot(10_000).lines.join("\n")
+    }
+
+    fn rss_kib() -> u64 {
+        crate::perf::rss_kib().unwrap_or(0)
+    }
+
+    #[test]
+    fn exit_is_detected_and_output_kept() {
+        let mut s = PtySession::spawn(sh("echo hello-pty; exit 3"), GridSize::DEFAULT).unwrap();
+        assert!(wait_until(Duration::from_secs(10), || s.poll_exited()));
+        assert!(screen_text(&s).contains("hello-pty"));
+    }
+
+    #[test]
+    fn utf8_split_across_reads_is_not_mangled() {
+        // printf in pieces: the 3-byte char straddles two writes.
+        let mut s = PtySession::spawn(
+            sh(r"printf '\344'; sleep 0.1; printf '\270\255-ok\n'"),
+            GridSize::DEFAULT,
+        )
+        .unwrap();
+        assert!(wait_until(Duration::from_secs(10), || s.poll_exited()));
+        assert!(screen_text(&s).contains("中-ok"), "{}", screen_text(&s));
+    }
+
+    #[test]
+    fn flood_is_parsed_off_the_ui_thread_with_bounded_memory() {
+        // ~39 MB of output; memory must not track the byte count.
+        let lines = 5_000_000u64;
+        let before = rss_kib();
+        let started = Instant::now();
+        let mut s = PtySession::spawn(sh(&format!("seq 1 {lines}")), GridSize::DEFAULT).unwrap();
+        let mut peak = before;
+        // Simulated UI: snapshot at ~60 fps, never more than one snapshot of
+        // work per frame regardless of how much arrived.
+        let mut worst_snapshot = Duration::ZERO;
+        while !s.poll_exited() {
+            if s.take_dirty() {
+                // What a frame costs the UI: shape + the rows on screen.
+                let t = Instant::now();
+                let info = s.view_info();
+                let rows = s.rows(info.line_count.saturating_sub(60)..info.line_count);
+                worst_snapshot = worst_snapshot.max(t.elapsed());
+                assert!(rows.len() <= 60);
+                assert!(info.line_count <= SCROLLBACK_LINES + GridSize::DEFAULT.rows as usize);
+            }
+            peak = peak.max(rss_kib());
+            assert!(started.elapsed() < Duration::from_secs(120), "flood hung");
+            thread::sleep(Duration::from_millis(16));
+        }
+        let secs = started.elapsed().as_secs_f64();
+        let bytes = s.bytes_read();
+        let mb_s = bytes as f64 / 1e6 / secs;
+        let text = screen_text(&s);
+        assert!(text.contains(&lines.to_string()), "tail missing");
+        let grown_mb = peak.saturating_sub(before) as f64 / 1024.0;
+        eprintln!(
+            "flood: {:.1} MB in {secs:.2}s = {mb_s:.1} MB/s, rss +{grown_mb:.1} MiB, worst frame fetch {:.2}ms",
+            bytes as f64 / 1e6,
+            worst_snapshot.as_secs_f64() * 1000.0
+        );
+        assert!(bytes > 38_000_000);
+        // Scrollback is capped: tens of MB of output, a few MB of grid.
+        // (Process-wide RSS, shared with tests running in parallel: loose.)
+        assert!(grown_mb < 256.0, "rss grew {grown_mb:.1} MiB");
+        // Debug builds are slow; release does far better (see report).
+        assert!(mb_s > 2.0, "throughput {mb_s:.1} MB/s");
+        assert!(worst_snapshot < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn ctrl_c_stops_a_flood_promptly() {
+        let mut s = PtySession::spawn(interactive_sh(), GridSize::DEFAULT).unwrap();
+        s.write(b"yes\r");
+        assert!(wait_until(Duration::from_secs(10), || s.bytes_read() > 1_000_000));
+        let t = Instant::now();
+        s.interrupt(0x03);
+        // Output must go quiet: bytes stop growing.
+        let mut last = s.bytes_read();
+        let mut quiet_since = Instant::now();
+        while quiet_since.elapsed() < Duration::from_millis(300) {
+            thread::sleep(Duration::from_millis(20));
+            let now = s.bytes_read();
+            if now != last {
+                last = now;
+                quiet_since = Instant::now();
+            }
+            assert!(t.elapsed() < Duration::from_secs(5), "^C did not stop yes");
+        }
+        let stop_ms = (quiet_since - t).as_secs_f64() * 1000.0;
+        eprintln!("ctrl-c: flood stopped {stop_ms:.0}ms after ^C");
+        // Shell is alive and answers.
+        s.write(b"echo after-int\r");
+        assert!(wait_until(Duration::from_secs(5), || screen_text(&s)
+            .contains("after-int\n")
+            || screen_text(&s).lines().any(|l| l == "after-int")));
+        assert!(!s.poll_exited());
+    }
+
+    #[test]
+    fn writes_never_block_when_child_ignores_stdin() {
+        // The child never reads: the tty input queue fills. A blocking write
+        // on the UI thread used to hang the app here.
+        let mut s = PtySession::spawn(sh("sleep 30"), GridSize::DEFAULT).unwrap();
+        let big = vec![b'x'; 1 << 20];
+        let t = Instant::now();
+        for _ in 0..4 {
+            s.write(&big);
+        }
+        assert!(t.elapsed() < Duration::from_millis(200), "write blocked");
+        assert!(s.pending_input() > 0);
+        // ^C jumps the queue and clears it.
+        s.interrupt(0x03);
+        assert!(s.pending_input() <= 1);
+        assert!(wait_until(Duration::from_secs(10), || s.poll_exited()));
+        let t = Instant::now();
+        drop(s);
+        assert!(t.elapsed() < Duration::from_millis(100), "drop blocked");
+    }
+
+    #[test]
+    fn shutdown_is_non_blocking_and_kills_foreground_job() {
+        let mut s = PtySession::spawn(interactive_sh(), GridSize::DEFAULT).unwrap();
+        s.write(b"trap '' HUP; sleep 1000\r");
+        assert!(wait_until(Duration::from_secs(5), || !s.is_idle()));
+        let pid = s.child_pid.unwrap();
+        let t = Instant::now();
+        s.shutdown();
+        assert!(t.elapsed() < Duration::from_millis(50), "shutdown blocked");
+        // The shell is gone within the SIGHUP grace period + SIGKILL.
+        assert!(wait_until(Duration::from_secs(5), || unsafe {
+            libc::kill(pid as i32, 0) != 0
+        }));
+    }
+
+    #[test]
+    fn alt_screen_enter_exit_restores_main_screen() {
+        let mut s = PtySession::spawn(
+            sh(r"echo main-line; printf '\033[?1049h\033[2J\033[Halt-content'; sleep 0.3; printf '\033[?1049l'; echo back; sleep 0.3"),
+            GridSize::DEFAULT,
+        )
+        .unwrap();
+        assert!(wait_until(Duration::from_secs(5), || s
+            .snapshot(100)
+            .alt_screen));
+        let alt = s.snapshot(100);
+        assert!(alt.lines.iter().any(|l| l.contains("alt-content")));
+        assert!(!alt.lines.iter().any(|l| l.contains("main-line")));
+        assert!(alt.cursor.is_some());
+        assert!(wait_until(Duration::from_secs(5), || s.poll_exited()));
+        let main = s.snapshot(100);
+        assert!(!main.alt_screen);
+        assert!(main.lines.iter().any(|l| l.contains("main-line")));
+        assert!(!main.lines.iter().any(|l| l.contains("alt-content")));
+    }
+
+    #[test]
+    fn resize_reaches_the_program() {
+        let mut s = PtySession::spawn(interactive_sh(), GridSize::DEFAULT).unwrap();
+        s.resize(GridSize { cols: 77, rows: 19 });
+        s.write(b"stty size\r");
+        let ok = wait_until(Duration::from_secs(20), || {
+            screen_text(&s).lines().any(|l| l.trim().ends_with("19 77"))
+        });
+        assert!(ok, "screen:\n{}", screen_text(&s));
+    }
+
+    #[test]
+    fn long_line_without_newline_is_bounded() {
+        // 4 MB with no newline: wraps in the grid instead of growing one
+        // string forever.
+        let mut s = PtySession::spawn(
+            sh("head -c 4000000 /dev/zero | tr '\\0' a"),
+            GridSize::DEFAULT,
+        )
+        .unwrap();
+        assert!(wait_until(Duration::from_secs(60), || s.poll_exited()));
+        let snap = s.snapshot(2_000);
+        assert!(snap.lines.len() <= 2_000);
+        assert!(snap.lines.iter().all(|l| l.chars().count() <= 100));
+    }
+
+    #[test]
+    fn clear_keeps_cursor_line_and_drops_history() {
+        let mut s = PtySession::spawn(
+            sh("seq 1 300; printf 'prompt$ '; sleep 2"),
+            GridSize::DEFAULT,
+        )
+        .unwrap();
+        assert!(wait_until(Duration::from_secs(5), || screen_text(&s)
+            .contains("prompt$")));
+        s.clear();
+        let snap = s.snapshot(2_000);
+        assert_eq!(snap.lines, vec!["prompt$".to_string()]);
+        s.shutdown();
+        let _ = s.poll_exited();
+    }
+
+    #[test]
+    fn paste_uses_cr_and_brackets_when_asked() {
+        assert_eq!(paste_payload("a\nb\r\nc", false), b"a\rb\rc".to_vec());
+        assert_eq!(
+            paste_payload("x\x1b[201~y", true),
+            b"\x1b[200~xy\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn rows_are_fetched_on_demand_and_clamped() {
+        let mut s = PtySession::spawn(sh("seq 1 50; sleep 2"), GridSize::DEFAULT).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || s
+            .view_info()
+            .line_count
+            >= 50));
+        let info = s.view_info();
+        let rows = s.rows(0..3);
+        assert_eq!(rows, vec!["1", "2", "3"]);
+        assert!(s.rows(info.line_count..info.line_count + 10).is_empty());
+        assert_eq!(s.rows(49..50), vec!["50"]);
+        s.shutdown();
+        let _ = s.poll_exited();
+    }
+
+    #[test]
+    fn encode_key_matches_xterm() {
+        assert_eq!(
+            encode_key("escape", None, false, false, false, false),
+            Some(vec![0x1b])
+        );
+        assert_eq!(
+            encode_key("enter", None, false, false, false, false),
+            Some(vec![b'\r'])
+        );
+        assert_eq!(
+            encode_key("up", None, false, false, false, false),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            encode_key("up", None, false, false, false, true),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            encode_key("c", None, true, false, false, false),
+            Some(vec![3])
+        );
+        assert_eq!(
+            encode_key("d", None, true, false, false, false),
+            Some(vec![4])
+        );
+        assert_eq!(
+            encode_key("z", None, true, false, false, false),
+            Some(vec![0x1a])
+        );
+        assert_eq!(
+            encode_key("\\", None, true, false, false, false),
+            Some(vec![0x1c])
+        );
+        assert_eq!(
+            encode_key("q", Some("q"), false, false, false, false),
+            Some(b"q".to_vec())
+        );
+        assert_eq!(
+            encode_key(":", Some(":"), false, false, true, false),
+            Some(b":".to_vec())
+        );
+        assert_eq!(
+            encode_key("x", Some("x"), false, true, false, false),
+            Some(b"\x1bx".to_vec())
+        );
+        assert_eq!(
+            encode_key("pagedown", None, false, false, false, false),
+            Some(b"\x1b[6~".to_vec())
+        );
+        assert_eq!(
+            encode_key("right", None, true, false, false, false),
+            Some(b"\x1b[1;5C".to_vec())
+        );
+    }
+}

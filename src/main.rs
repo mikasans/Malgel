@@ -40,6 +40,7 @@ mod shortcuts;
 mod single_instance;
 mod smart_edit;
 mod spell;
+mod term_session;
 mod terminal;
 mod themes;
 mod title_menu_bar;
@@ -243,6 +244,8 @@ fn main() {
         themes::init(Settings::load(), cx);
         // Bind keys before building menus so the menus show the shortcuts.
         actions::bind_keys(cx);
+        terminal::init(cx);
+        crate::perf::start_ui_lag_probe(cx);
         diagram_viewer::bind_keys(cx);
         let app_menu_bar = menus::init(cx);
 

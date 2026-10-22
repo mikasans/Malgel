@@ -1,42 +1,48 @@
 //! Integrated terminal: a bottom panel with a real shell (Ctrl+`).
 //!
-//! Open/focus/refresh follow VS Code / Pebrel-style panel habits: summoning
-//! shows the panel and focuses the composer when focus is elsewhere, and only
-//! hides when the terminal already owns focus. Output auto-scrolls to the end
-//! while the user is following the tail; scrolling up pauses follow. New
-//! Terminal is Ctrl+Shift+` (never the same chord as toggle).
+//! Open/focus/refresh follow VS Code habits: summoning shows the panel and
+//! focuses it when focus is elsewhere, and only hides when the terminal
+//! already owns focus. Output follows the tail; scrolling up pauses follow.
+//! New Terminal is Ctrl+Shift+` (never the same chord as toggle).
 //!
-//! Output is a line buffer (not one wrapping string) so glyph columns stay
-//! aligned with the shell cursor: `\r` rewrites the current line, tabs expand
-//! to spaces, and each row is `whitespace_nowrap` at a fixed line height.
-//! Copy / paste use Ctrl+Shift+C / Ctrl+Shift+V (VS Code), leaving Ctrl+C as
-//! interrupt. A single line composer always owns typed input (IME-safe) — the
-//! panel key sink only handles copy/paste/interrupt chords so Escape/`^[`
-//! cannot bleed into the PTY. While the PTY is alive its `$` prefix is omitted
-//! so the shell prompt in the transcript is the only dollar — no double
-//! composers. Element ids are unique per session so split panes do not share
-//! hit-testing. Kill closes the session tab when more than one exists; the
-//! last session shows a Restart affordance instead of a zombie empty tab.
+//! The screen is a real VT emulator ([`crate::term_session`]): vim, less, top
+//! and git's pager draw correctly, the alternate screen restores the shell
+//! transcript on exit, and the PTY is sized to the visible cells. Parsing
+//! happens on the session's reader thread; the panel only paints the rows in
+//! view (a virtual list), so a flood costs the UI a few dozen rows a frame.
+//!
+//! Input is direct, like xterm / VS Code: every key goes to the program as it
+//! is pressed, so Ctrl+C / D / Z / \, Tab completion, Up/Down history, Ctrl+R,
+//! Ctrl+L, Ctrl+U / W and full-screen apps all behave as in a terminal. A
+//! keystroke interceptor routes non-text keys before the text input's own
+//! bindings (Copy on Ctrl+C, Undo on Ctrl+Z) can claim them. Typed text still
+//! lands in a one-line input first — the IME's composition shows there — and
+//! is forwarded the moment it is committed. Before a shell runs, that input is
+//! a plain command line ("Run a command…").
+//!
+//! App chords keep working from the terminal: Ctrl+Shift+anything (palette,
+//! Ctrl+Shift+C / V copy and paste), Ctrl+P, Ctrl+`, Ctrl+Tab, Ctrl+PageUp /
+//! PageDown, Ctrl+Q. Element ids are unique per session so split panes do not
+//! share hit-testing, and keys only ever reach the focused pane. Kill closes
+//! the session tab when more than one exists; the last session shows a
+//! Restart affordance instead of a zombie empty tab.
 
 use std::{
-    collections::VecDeque,
-    io::{Read, Write},
+    cell::Cell,
+    ops::Range,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver, TryRecvError},
-    },
-    thread,
-    time::Duration,
+    rc::Rc,
+    time::{Duration, Instant},
 };
 
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement as _,
-    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window,
+    App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EntityInputHandler as _,
+    EventEmitter, FocusHandle, Focusable, Global, InteractiveElement as _, IntoElement, Keystroke,
+    MouseButton, ParentElement as _, Pixels, Render, ScrollDelta, ScrollStrategy, ScrollWheelEvent,
+    SharedString, Size, Styled as _, UniformListScrollHandle, WeakEntity, Window,
     assets::IconName,
     base::Disableable as _,
+    canvas,
     component::{
         ActiveTheme as _, Icon, Sizable as _,
         button::{Button, ButtonVariants as _},
@@ -44,40 +50,98 @@ use gpui_kit::{
         input::{Input, InputEvent, InputState},
         v_flex,
     },
-    div, point,
+    div,
     prelude::FluentBuilder as _,
-    px, rems,
+    px, rems, uniform_list,
 };
-use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use portable_pty::CommandBuilder;
 
-const MAX_OUTPUT_CHARS: usize = 200_000;
-/// Cap painted rows so a flooded PTY cannot rebuild tens of thousands of
-/// elements every frame. Copy / trim still see the full ring buffer.
-const MAX_RENDER_LINES: usize = 2_000;
-const TAB_WIDTH: usize = 8;
+use crate::term_session::{GridSize, PtySession, ViewInfo, encode_key};
+
+/// Transcript kept from a stopped / exited shell above the next one.
+const MAX_PRELUDE_LINES: usize = 500;
 const LINE_HEIGHT_REMS: f32 = 1.35;
+/// `text_sm` in rems: the output font size.
+const FONT_REMS: f32 = 0.875;
+/// UI poll for new PTY output. Parsing happens on the reader thread; a tick
+/// only reads the view's shape when something changed.
+const PUMP_INTERVAL: Duration = Duration::from_millis(16);
+/// While output streams (a flood, not an echo), repaint at most this often:
+/// nobody reads 60 frames of `yes`, and every frame repaints the window.
+const FLOOD_FRAME: Duration = Duration::from_millis(80);
+/// Bytes per tick below which output counts as interactive (echo, prompt)
+/// and is painted at once.
+const ECHO_BYTES: u64 = 4096;
 
-enum PtyMessage {
-    Output(Vec<u8>),
-    Exited,
+/// Every live panel, for the keystroke interceptor.
+#[derive(Default)]
+struct TerminalRegistry(Vec<WeakEntity<TerminalPanel>>);
+
+impl Global for TerminalRegistry {}
+
+/// Install the keystroke interceptor that gives the focused terminal first
+/// claim on keys. Call once at startup, after the key bindings.
+pub fn init(cx: &mut App) {
+    cx.set_global(TerminalRegistry::default());
+    cx.intercept_keystrokes(|event, window, cx| {
+        let panels: Vec<Entity<TerminalPanel>> = cx
+            .global::<TerminalRegistry>()
+            .0
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+            .collect();
+        for panel in panels {
+            if !panel.read(cx).contains_focus(window, cx) {
+                continue;
+            }
+            let handled = panel.update(cx, |panel, cx| {
+                panel.intercept_key(&event.keystroke, window, cx)
+            });
+            if handled {
+                cx.stop_propagation();
+            }
+            break;
+        }
+    })
+    .detach();
+}
+
+/// App shortcuts that must keep working while the terminal has focus.
+fn is_app_chord(keys: &Keystroke) -> bool {
+    let m = &keys.modifiers;
+    if m.platform || m.function {
+        return true;
+    }
+    if m.control && m.shift {
+        // Ctrl+Shift+C / V are the terminal's own copy / paste.
+        return !matches!(keys.key.as_str(), "c" | "v");
+    }
+    m.control
+        && !m.alt
+        && matches!(
+            keys.key.as_str(),
+            "`" | "p" | "q" | "tab" | "pageup" | "pagedown" | ","
+        )
 }
 
 /// One integrated terminal session in the bottom panel.
 pub struct TerminalPanel {
     focus_handle: FocusHandle,
     cwd: Option<PathBuf>,
-    /// Completed lines (no trailing newline) plus the live line under edit.
-    lines: VecDeque<String>,
-    /// Characters of the unfinished last line (after the last `\n`).
-    current: String,
     input: Entity<InputState>,
-    scroll: ScrollHandle,
-    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
-    /// Kept alive so the PTY master FD is not closed while reader/writer clones run.
-    _master: Option<Box<dyn MasterPty + Send>>,
-    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    rx: Option<Receiver<PtyMessage>>,
-    _reader: Option<thread::JoinHandle<()>>,
+    scroll: UniformListScrollHandle,
+    session: Option<PtySession>,
+    /// Transcript of earlier (stopped) shells plus status notices.
+    prelude: Vec<SharedString>,
+    /// Shape of the session's view as of the last tick.
+    view: ViewInfo,
+    /// Output viewport size from the last paint, for PTY resize.
+    viewport: Rc<Cell<Option<Size<Pixels>>>>,
+    /// Character cell (width, height) from the last render.
+    cell: (Pixels, Pixels),
+    rem: Pixels,
+    last_paint: Instant,
+    bytes_at_paint: u64,
     _pump: Option<gpui_kit::Task<()>>,
     /// Stick output viewport to the end while the user has not scrolled up.
     follow_tail: bool,
@@ -97,48 +161,70 @@ impl Focusable for TerminalPanel {
         self.focus_handle.clone()
     }
 }
-
 impl TerminalPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(""));
         cx.subscribe_in(
             &input,
             window,
-            |this, input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
+            |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => {
                     let line = input.read(cx).value().to_string();
                     input.update(cx, |input, cx| input.set_value("", window, cx));
-                    // Line composer: start shell if needed, then send CR-terminated line.
-                    this.send_line(&line, cx);
+                    // No shell yet (or an IME line pending): start one and run it.
+                    this.send_line(&line, window, cx);
                 }
+                InputEvent::Change => this.forward_typed(window, cx),
+                _ => {}
             },
         )
         .detach();
+        let focus_handle = cx.focus_handle();
+        // A click anywhere in the panel focuses its root (track_focus) after
+        // our own mouse handlers ran; hand that focus straight to the input so
+        // typed text (which needs the input's text handler) is never dropped.
+        cx.on_focus(&focus_handle, window, |this, window, cx| {
+            this.focus_input(window, cx);
+        })
+        .detach();
+        if cx.has_global::<TerminalRegistry>() {
+            let weak = cx.weak_entity();
+            let registry = cx.global_mut::<TerminalRegistry>();
+            registry.0.retain(|w| w.upgrade().is_some());
+            registry.0.push(weak);
+        }
         Self {
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             cwd: None,
-            lines: VecDeque::new(),
-            current: String::new(),
             input,
-            scroll: ScrollHandle::new(),
-            writer: None,
-            _master: None,
-            child: None,
-            rx: None,
-            _reader: None,
+            scroll: UniformListScrollHandle::new(),
+            session: None,
+            prelude: Vec::new(),
+            view: ViewInfo::default(),
+            viewport: Rc::new(Cell::new(None)),
+            cell: (px(8.), px(18.)),
+            rem: px(16.),
+            last_paint: Instant::now(),
+            bytes_at_paint: 0,
             _pump: None,
             follow_tail: true,
         }
     }
 
-    pub fn set_cwd(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
+    fn shell_running(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Change the folder new shells start in. A running shell is restarted
+    /// only when it is idle at its prompt: summoning the panel from a file in
+    /// another folder must never kill a build or server the user started.
+    pub fn set_cwd(&mut self, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         if self.cwd == cwd {
             return;
         }
         self.cwd = cwd;
-        if self.writer.is_some() {
-            self.stop_shell();
-            self.start_shell(cx);
+        if self.session.as_ref().is_some_and(|s| s.is_idle()) {
+            self.start_shell(window, cx);
         }
         cx.notify();
     }
@@ -147,7 +233,7 @@ impl TerminalPanel {
         // Focus the Input key-sink so the window has an input_handler.
         // X11 IME commits (and `xdotool type`) are dropped without one; raw
         // KeyDown alone is not enough for typed characters under Xvfb.
-        let running = self.writer.is_some();
+        let running = self.shell_running();
         self.input.update(cx, |input, cx| {
             input.set_placeholder(if running { "" } else { "Run a command…" }, window, cx);
         });
@@ -162,22 +248,37 @@ impl TerminalPanel {
 
     /// Restart a killed shell and focus the composer (last-session affordance).
     pub fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_shell(cx);
+        self.start_shell(window, cx);
         self.follow_tail = true;
         self.scroll_to_end();
         self.focus_input(window, cx);
         cx.notify();
     }
 
-    /// Keep the viewport on the newest output (Pebrel/VS Code follow-tail).
+    fn total_rows(&self) -> usize {
+        if self.view.alt_screen {
+            self.view.line_count
+        } else {
+            self.prelude.len() + self.view.line_count
+        }
+    }
+
+    /// Keep the viewport on the newest output (VS Code follow-tail).
     fn scroll_to_end(&self) {
-        // Large negative Y; GPUI clamps to the content bottom.
-        self.scroll.set_offset(point(px(0.), px(-1_000_000.)));
+        let rows = self.total_rows();
+        if rows > 0 {
+            self.scroll.scroll_to_item(rows - 1, ScrollStrategy::Bottom);
+        }
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
-        self.lines.clear();
-        self.current.clear();
+        self.prelude.clear();
+        if let Some(session) = &self.session {
+            session.clear();
+            self.view = session.view_info();
+        } else {
+            self.view = ViewInfo::default();
+        }
         self.follow_tail = true;
         self.scroll_to_end();
         cx.notify();
@@ -186,17 +287,19 @@ impl TerminalPanel {
     /// Full transcript for clipboard copy.
     fn transcript(&self) -> String {
         let mut out = String::new();
-        for line in &self.lines {
+        for line in &self.prelude {
             out.push_str(line);
             out.push('\n');
         }
-        out.push_str(&self.current);
+        if let Some(session) = &self.session {
+            out.push_str(&session.transcript());
+        }
         out
     }
 
     fn copy_all(&self, cx: &mut Context<Self>) {
         let text = self.transcript();
-        if text.is_empty() {
+        if text.trim().is_empty() {
             return;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -209,17 +312,15 @@ impl TerminalPanel {
         let Some(text) = item.text() else {
             return;
         };
-        // Normalize to CR — what a keyboard Enter sends into a tty.
-        let payload = text
-            .replace("\r\n", "\n")
-            .replace('\r', "\n")
-            .replace('\n', "\r");
-        self.write_bytes(payload.as_bytes());
+        if let Some(session) = &self.session {
+            session.paste(&text);
+            self.follow_tail = true;
+        }
     }
 
     pub fn ensure_running(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.writer.is_none() {
-            self.start_shell(cx);
+        if self.session.is_none() {
+            self.start_shell(window, cx);
         }
         // Re-arm follow-tail so opening via shortcut always shows latest output.
         self.follow_tail = true;
@@ -228,226 +329,177 @@ impl TerminalPanel {
         cx.notify();
     }
 
+    /// Stop the shell. Never blocks: the kill and reap run off the UI thread.
     pub fn stop_shell(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+        if let Some(mut session) = self.session.take() {
+            session.shutdown();
+            // Keep what was on screen (normal screen only — a TUI's frame is
+            // noise once it is gone).
+            let snap = session.snapshot(MAX_PRELUDE_LINES);
+            if !snap.alt_screen {
+                self.prelude
+                    .extend(snap.lines.into_iter().map(SharedString::from));
+            }
         }
-        self.writer = None;
-        self._master = None;
-        self.rx = None;
-        self._reader = None;
         self._pump = None;
+        self.view = ViewInfo::default();
+        cap_prelude(&mut self.prelude);
     }
 
-    fn send_line(&mut self, line: &str, cx: &mut Context<Self>) {
-        if self.writer.is_none() {
-            self.start_shell(cx);
+    fn send_line(&mut self, line: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.is_none() {
+            self.start_shell(window, cx);
         }
-        let Some(writer) = &self.writer else {
+        let Some(session) = &self.session else {
             self.append("Couldn’t start a shell.\n", cx);
             return;
         };
         // PTY line discipline expects CR (same as a real keyboard Enter).
         let mut payload = line.as_bytes().to_vec();
         payload.push(b'\r');
-        if let Ok(mut w) = writer.lock() {
-            let _ = w.write_all(&payload);
-            let _ = w.flush();
-        }
+        session.write(&payload);
+        self.follow_tail = true;
+        self.scroll_to_end();
     }
 
-    fn write_bytes(&mut self, bytes: &[u8]) {
-        let Some(writer) = &self.writer else {
+    /// Committed text in the input goes straight to the program (direct
+    /// input). An IME composition stays in the input until committed.
+    fn forward_typed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
             return;
         };
-        if let Ok(mut w) = writer.lock() {
-            let _ = w.write_all(bytes);
-            let _ = w.flush();
-        }
-    }
-
-    /// Chord-only key sink. Printable input and Escape stay on the line
-    /// composer so split-pane focus cannot inject `^[` into the wrong PTY.
-    fn forward_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        if self.writer.is_none() {
+        let (text, composing) = self.input.update(cx, |input, cx| {
+            (
+                input.value().to_string(),
+                input.marked_text_range(window, cx).is_some(),
+            )
+        });
+        if text.is_empty() || composing {
             return;
         }
-        let keys = &event.keystroke;
-        // Ctrl+Shift+C / Ctrl+Shift+V — copy / paste (VS Code terminal).
-        if keys.modifiers.control && keys.modifiers.shift && !keys.modifiers.alt {
-            if keys.key.eq_ignore_ascii_case("c") {
-                self.copy_all(cx);
-                cx.stop_propagation();
-                return;
-            }
-            if keys.key.eq_ignore_ascii_case("v") {
-                self.paste_clipboard(cx);
-                cx.stop_propagation();
-                return;
-            }
-        }
-        // Ctrl+C → ETX so interrupt-from-keyboard still reaches the shell.
-        if keys.modifiers.control
-            && !keys.modifiers.alt
-            && !keys.modifiers.platform
-            && !keys.modifiers.shift
-            && keys.key.eq_ignore_ascii_case("c")
-        {
-            self.write_bytes(&[0x03]);
-            cx.stop_propagation();
-        }
-        #[cfg(target_os = "macos")]
-        {
-            if keys.modifiers.platform && !keys.modifiers.alt && !keys.modifiers.control {
-                if keys.key.eq_ignore_ascii_case("c") {
-                    self.copy_all(cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                if keys.key.eq_ignore_ascii_case("v") {
-                    self.paste_clipboard(cx);
-                    cx.stop_propagation();
-                }
-            }
-        }
+        session.write(text.as_bytes());
+        self.input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.follow_tail = true;
     }
 
+    /// First claim on a keystroke while this panel has focus (runs before
+    /// any binding). Returns true when the key went to the program.
+    fn intercept_key(
+        &mut self,
+        keys: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.session.is_none() || is_app_chord(keys) {
+            return false;
+        }
+        let m = &keys.modifiers;
+        if m.control && m.shift {
+            match keys.key.as_str() {
+                "c" => self.copy_all(cx),
+                _ => self.paste_clipboard(cx),
+            }
+            return true;
+        }
+        let (pending, has_selection) = {
+            let input = self.input.read(cx);
+            (
+                !input.value().is_empty(),
+                !input.selected_value().is_empty(),
+            )
+        };
+        let ctrl_only = m.control && !m.alt && !m.shift;
+        if ctrl_only && keys.key == "c" && has_selection {
+            return false; // copy the input's selection
+        }
+        if ctrl_only && keys.key == "v" {
+            self.paste_clipboard(cx);
+            return true;
+        }
+        let session = self.session.as_ref().expect("checked above");
+        if ctrl_only && matches!(keys.key.as_str(), "c" | "z" | "\\") {
+            let byte = match keys.key.as_str() {
+                "c" => 0x03,
+                "z" => 0x1a,
+                _ => 0x1c,
+            };
+            // Signals jump any queued input; a half-typed IME line is dropped.
+            session.interrupt(byte);
+            if pending {
+                self.input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+            }
+            self.follow_tail = true;
+            self.scroll_to_end();
+            cx.notify();
+            return true;
+        }
+        // An IME composition (or text typed before the shell started) owns
+        // editing keys until it is committed.
+        if pending && !m.control && !m.alt {
+            return false;
+        }
+        // Plain text goes through the input so the IME and X11 commits work;
+        // it is forwarded on change.
+        let printable =
+            !m.control && !m.alt && (keys.key == "space" || keys.key.chars().count() == 1);
+        if printable {
+            return false;
+        }
+        let Some(bytes) = encode_key(
+            &keys.key,
+            keys.key_char.as_deref(),
+            m.control,
+            m.alt,
+            m.shift,
+            self.view.app_cursor,
+        ) else {
+            return false;
+        };
+        session.write(&bytes);
+        self.follow_tail = true;
+        self.scroll_to_end();
+        true
+    }
+
+    /// Show a status line (banner, "shell stopped") under the transcript.
     pub fn append(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.ingest(text);
-        self.trim_output();
+        if let Some(session) = &self.session {
+            session.inject(text);
+            self.view = session.view_info();
+        } else {
+            for line in text.trim_end_matches('\n').split('\n') {
+                self.prelude.push(SharedString::from(line.to_string()));
+            }
+            cap_prelude(&mut self.prelude);
+        }
         if self.follow_tail {
             self.scroll_to_end();
         }
         cx.notify();
     }
 
-    /// Feed PTY / status text into the line buffer with `\r` / tab handling.
-    fn ingest(&mut self, text: &str) {
-        let mut chars = text.chars().peekable();
-        while let Some(ch) = chars.next() {
-            match ch {
-                '\n' => {
-                    self.lines.push_back(std::mem::take(&mut self.current));
-                }
-                '\r' => {
-                    // CRLF from a tty: the CR is just the line-ending prefix —
-                    // do not clear, or the echoed command vanishes before `\n`.
-                    if chars.peek() == Some(&'\n') {
-                        continue;
-                    }
-                    // Bare CR (progress / spinner): rewrite from column 0.
-                    self.current.clear();
-                }
-                '\t' => {
-                    let col = self.current.chars().count();
-                    let spaces = TAB_WIDTH - (col % TAB_WIDTH);
-                    for _ in 0..spaces {
-                        self.current.push(' ');
-                    }
-                }
-                c if c == '\u{08}' || c == '\u{7f}' => {
-                    self.current.pop();
-                }
-                // Drop other C0 controls (BEL, etc.) so they cannot shift glyphs.
-                c if c.is_control() => {}
-                c => self.current.push(c),
-            }
-        }
-    }
-
-    fn trim_output(&mut self) {
-        let mut total: usize = self.lines.iter().map(|l| l.len() + 1).sum();
-        total += self.current.len();
-        if total <= MAX_OUTPUT_CHARS {
-            return;
-        }
-        while total > MAX_OUTPUT_CHARS / 2 {
-            let Some(removed) = self.lines.pop_front() else {
-                break;
-            };
-            total = total.saturating_sub(removed.len() + 1);
-        }
-    }
-
-    fn start_shell(&mut self, cx: &mut Context<Self>) {
+    fn start_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_shell();
-        let pty_system = NativePtySystem::default();
-        let pair = match pty_system.openpty(PtySize {
-            rows: 24,
-            cols: 100,
-            pixel_width: 0,
-            pixel_height: 0,
-        }) {
-            Ok(pair) => pair,
-            Err(err) => {
-                self.append(&format!("PTY error: {err}\n"), cx);
-                return;
-            }
-        };
-
+        let size = self.wanted_grid_size().unwrap_or(GridSize::DEFAULT);
         let mut cmd = default_shell();
         if let Some(cwd) = &self.cwd {
             cmd.cwd(cwd);
         }
-        let child = match pair.slave.spawn_command(cmd) {
-            Ok(child) => child,
+        match PtySession::spawn(cmd, size) {
+            Ok(session) => self.session = Some(session),
             Err(err) => {
-                self.append(&format!("Couldn’t start shell: {err}\n"), cx);
+                self.append(&format!("{err}\n"), cx);
                 return;
             }
-        };
-        drop(pair.slave);
-
-        let mut reader = match pair.master.try_clone_reader() {
-            Ok(r) => r,
-            Err(err) => {
-                self.append(&format!("Couldn’t read shell output: {err}\n"), cx);
-                return;
-            }
-        };
-        let writer = match pair.master.take_writer() {
-            Ok(w) => Arc::new(Mutex::new(w)),
-            Err(err) => {
-                self.append(&format!("Couldn’t write to shell: {err}\n"), cx);
-                return;
-            }
-        };
-
-        let (tx, rx) = mpsc::channel();
-        let reader_tx = tx;
-        let reader = thread::spawn(move || {
-            let mut buf = [0u8; 4096];
+        }
+        self.bytes_at_paint = 0;
+        self._pump = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if reader_tx
-                            .send(PtyMessage::Output(buf[..n].to_vec()))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            let _ = reader_tx.send(PtyMessage::Exited);
-        });
-
-        self.writer = Some(writer);
-        self._master = Some(pair.master);
-        self.child = Some(child);
-        self.rx = Some(rx);
-        self._reader = Some(reader);
-
-        let entity = cx.weak_entity();
-        self._pump = Some(cx.spawn(async move |_, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(33))
-                    .await;
-                let cont = entity
-                    .update(cx, |this, cx| this.drain_pty(cx))
+                cx.background_executor().timer(PUMP_INTERVAL).await;
+                let cont = this
+                    .update_in(cx, |this, window, cx| this.tick(window, cx))
                     .unwrap_or(false);
                 if !cont {
                     break;
@@ -463,56 +515,117 @@ impl TerminalPanel {
         self.append(&format!("— shell in {cwd_label}\n"), cx);
     }
 
-    /// Returns whether to keep pumping (channel still open).
-    fn drain_pty(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(rx) = self.rx.take() else {
+    /// Grid that fits the output viewport painted last frame.
+    fn wanted_grid_size(&self) -> Option<GridSize> {
+        let size = self.viewport.get()?;
+        Some(grid_size_for(
+            size.width,
+            size.height,
+            self.cell.0,
+            self.cell.1,
+            self.rem,
+        ))
+    }
+
+    /// One UI frame of terminal work. Returns whether to keep pumping.
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let wanted = self.wanted_grid_size();
+        let Some(session) = &mut self.session else {
             return false;
         };
-        let mut changed = false;
-        let mut exited = false;
-        let mut chunks = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(PtyMessage::Output(bytes)) => chunks.push(bytes),
-                Ok(PtyMessage::Exited) => {
-                    exited = true;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    exited = true;
-                    break;
-                }
+        if let Some(size) = wanted {
+            session.resize(size);
+        }
+        let exited = session.poll_exited();
+        if !exited {
+            let bytes = session.bytes_read();
+            let streaming = bytes.saturating_sub(self.bytes_at_paint) > ECHO_BYTES;
+            if streaming && self.last_paint.elapsed() < FLOOD_FRAME {
+                // Leave the dirty flag set; paint on a later tick.
+                return true;
             }
+            if !session.take_dirty() {
+                return true;
+            }
+            self.bytes_at_paint = bytes;
         }
-        for bytes in chunks {
-            let text = String::from_utf8_lossy(&bytes);
-            self.ingest(&strip_ansi(&text));
-            changed = true;
-        }
+        self.last_paint = Instant::now();
+        self.view = session.view_info();
         if exited {
-            self.ingest(
-                "
-— shell exited
-",
+            self.stop_shell();
+            self.append("— shell exited\n", cx);
+            let _ = window;
+        }
+        if self.follow_tail {
+            self.scroll_to_end();
+        }
+        cx.notify();
+        !exited
+    }
+
+    /// Text of view rows `range` (prelude, then the live session).
+    fn row_texts(&self, range: Range<usize>) -> Vec<SharedString> {
+        if self.view.alt_screen {
+            let Some(session) = &self.session else {
+                return Vec::new();
+            };
+            return session
+                .rows(range)
+                .into_iter()
+                .map(SharedString::from)
+                .collect();
+        }
+        let split = self.prelude.len();
+        let mut out = Vec::with_capacity(range.len());
+        if range.start < split {
+            out.extend(
+                self.prelude[range.start..range.end.min(split)]
+                    .iter()
+                    .cloned(),
             );
-            changed = true;
-            self.writer = None;
-            self._master = None;
-            self.child = None;
-            self._pump = None;
-            self._reader = None;
+        }
+        if range.end > split
+            && let Some(session) = &self.session
+        {
+            let from = range.start.saturating_sub(split);
+            let to = range.end - split;
+            out.extend(session.rows(from..to).into_iter().map(SharedString::from));
+        }
+        out
+    }
+
+    /// Cursor row in view coordinates.
+    fn cursor_row(&self) -> Option<(usize, usize)> {
+        let (row, col) = self.view.cursor?;
+        let offset = if self.view.alt_screen {
+            0
         } else {
-            self.rx = Some(rx);
-        }
-        if changed {
-            self.trim_output();
-            if self.follow_tail {
-                self.scroll_to_end();
-            }
-            cx.notify();
-        }
-        self.rx.is_some()
+            self.prelude.len()
+        };
+        Some((row + offset, col))
+    }
+}
+
+/// Columns × rows of `cell_w` × `line_h` cells that fit a viewport with the
+/// output area's 0.5rem padding on each side.
+fn grid_size_for(
+    width: Pixels,
+    height: Pixels,
+    cell_w: Pixels,
+    line_h: Pixels,
+    rem: Pixels,
+) -> GridSize {
+    let w = f32::from(width) - f32::from(rem);
+    let h = f32::from(height) - f32::from(rem);
+    let cols = (w / f32::from(cell_w).max(1.)).floor().max(0.) as usize;
+    let rows = (h / f32::from(line_h).max(1.)).floor().max(0.) as usize;
+    GridSize::clamped(cols, rows)
+}
+
+fn cap_prelude(prelude: &mut Vec<SharedString>) {
+    let excess = prelude.len().saturating_sub(MAX_PRELUDE_LINES);
+    if excess > 0 {
+        prelude.drain(..excess);
     }
 }
 
@@ -521,21 +634,29 @@ impl Drop for TerminalPanel {
         self.stop_shell();
     }
 }
-
 impl Render for TerminalPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let shell_running = self.writer.is_some();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let shell_running = self.shell_running();
         // Unique ids per session so split panes do not share hit-testing / focus.
         let eid = cx.entity_id().as_u64();
-        let skip = self.lines.len().saturating_sub(MAX_RENDER_LINES);
-        let mut rows: Vec<SharedString> = self
-            .lines
-            .iter()
-            .skip(skip)
-            .map(|l| SharedString::from(l.clone()))
-            .collect();
-        // Always show the live line (may be empty) so the cursor row stays put.
-        rows.push(SharedString::from(self.current.clone()));
+        // Cell metrics for PTY sizing (mono font advance × line height).
+        let rem = window.rem_size();
+        let font_size = rem * FONT_REMS;
+        let line_h = rem * LINE_HEIGHT_REMS;
+        let font_id = window
+            .text_system()
+            .resolve_font(&gpui_kit::font(cx.theme().mono_font_family.clone()));
+        let cell_w = window
+            .text_system()
+            .advance(font_id, font_size, 'M')
+            .map(|s| s.width)
+            .unwrap_or(font_size * 0.6);
+        self.cell = (cell_w, line_h);
+        self.rem = rem;
+        let viewport = self.viewport.clone();
+        let cursor_fg = cx.theme().background;
+        let cursor_bg = cx.theme().foreground;
+        let row_count = self.total_rows().max(1);
 
         v_flex()
             .id(ElementId::NamedInteger("terminal-panel".into(), eid))
@@ -544,9 +665,6 @@ impl Render for TerminalPanel {
             .border_t_1()
             .border_color(cx.theme().border)
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                this.forward_key(event, cx);
-            }))
             .child(
                 h_flex()
                     .id(ElementId::NamedInteger("terminal-header".into(), eid))
@@ -628,17 +746,15 @@ impl Render for TerminalPanel {
             .child(
                 div()
                     .id(ElementId::NamedInteger("terminal-output".into(), eid))
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .p_2()
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_sm()
                     .line_height(rems(LINE_HEIGHT_REMS))
-                    .overflow_x_scroll()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    // Clicking the transcript focuses the composer so typing
-                    // resumes without hunting for it (Pebrel/VS Code).
+                    // Clicking the transcript focuses the input so typing
+                    // resumes without hunting for it.
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
@@ -648,44 +764,108 @@ impl Render for TerminalPanel {
                         }),
                     )
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                        // Scrolling up pauses follow; nudging down near the end resumes.
-                        // Bind to this surface so a focused terminal (not an image
-                        // tab above) owns the wheel when the pointer is here.
+                        // Scrolling up pauses follow; scrolling down to the
+                        // end resumes it.
                         let dy = match event.delta {
                             ScrollDelta::Pixels(p) => f32::from(p.y),
                             ScrollDelta::Lines(l) => l.y * 16.,
                         };
                         if dy > 0.5 {
                             this.follow_tail = false;
-                        } else if dy < -0.5 {
+                        } else if dy < -0.5 && this.scroll.is_scrolled_to_end() != Some(false) {
                             this.follow_tail = true;
-                            this.scroll_to_end();
                         }
                         cx.notify();
                     }))
-                    .child(v_flex().w_full().children(rows.into_iter().enumerate().map(
-                        move |(ix, line)| {
-                            // Non-breaking space keeps an empty line's height so
-                            // the cursor row does not collapse and drift.
-                            let shown = if line.is_empty() {
-                                SharedString::from("\u{00a0}")
-                            } else {
-                                line
-                            };
-                            div()
-                                .id(ElementId::NamedInteger(
-                                    SharedString::from(format!("term-line-{eid}")),
-                                    ix as u64,
-                                ))
-                                .w_full()
-                                .whitespace_nowrap()
-                                .child(shown)
-                        },
-                    ))),
+                    .child(
+                        // Virtual list: only the rows in view are fetched from
+                        // the emulator and laid out, whatever the scrollback.
+                        uniform_list(
+                            ElementId::NamedInteger("terminal-rows".into(), eid),
+                            row_count,
+                            cx.processor(move |this, range: Range<usize>, _window, _cx| {
+                                let start = range.start;
+                                let cursor = this.cursor_row();
+                                let mut texts = this.row_texts(range.clone());
+                                texts.resize(range.len(), SharedString::default());
+                                texts
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, line)| {
+                                        let ix = start + i;
+                                        let row = div()
+                                            .id(ElementId::NamedInteger(
+                                                SharedString::from(format!("term-line-{eid}")),
+                                                ix as u64,
+                                            ))
+                                            .h(line_h)
+                                            .w_full()
+                                            .whitespace_nowrap();
+                                        match cursor {
+                                            Some((cr, cc)) if cr == ix => {
+                                                let chars: Vec<char> = line.chars().collect();
+                                                let mut before: String =
+                                                    chars.iter().take(cc).collect();
+                                                // Pad so the cursor sits at its column.
+                                                while before.chars().count() < cc {
+                                                    before.push(' ');
+                                                }
+                                                let at = chars.get(cc).copied().unwrap_or(' ');
+                                                let after: String =
+                                                    chars.iter().skip(cc + 1).collect();
+                                                row.child(
+                                                    h_flex()
+                                                        .when(!before.is_empty(), |r| {
+                                                            r.child(before)
+                                                        })
+                                                        .child(
+                                                            div()
+                                                                .bg(cursor_bg)
+                                                                .text_color(cursor_fg)
+                                                                .child(if at == ' ' {
+                                                                    "\u{00a0}".to_string()
+                                                                } else {
+                                                                    at.to_string()
+                                                                }),
+                                                        )
+                                                        .when(!after.is_empty(), |r| {
+                                                            r.child(after)
+                                                        }),
+                                                )
+                                            }
+                                            _ => {
+                                                // Non-breaking space keeps an empty
+                                                // row's height.
+                                                let shown = if line.is_empty() {
+                                                    SharedString::from("\u{00a0}")
+                                                } else {
+                                                    line
+                                                };
+                                                row.child(shown)
+                                            }
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .track_scroll(&self.scroll)
+                        .size_full(),
+                    )
+                    // Records the viewport size for PTY resize (cols × rows).
+                    .child(
+                        canvas(
+                            move |bounds, _, _| viewport.set(Some(bounds.size)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    ),
             )
-            // Single line composer (always). While the PTY is alive we omit the
-            // `$` prefix so the shell prompt in the transcript is the only dollar
-            // (no double composers). The Input keeps the IME input_handler.
+            // Input row: the command line before a shell runs, the IME
+            // composition line while one does (typed text is forwarded as it
+            // is committed, so it never lingers here).
             .child(
                 h_flex()
                     .id(ElementId::NamedInteger("terminal-input-row".into(), eid))
@@ -727,7 +907,7 @@ fn default_shell() -> CommandBuilder {
     }
     #[cfg(not(windows))]
     {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let shell = crate::term_session::user_shell();
         let mut cmd = CommandBuilder::new(&shell);
         // Skip rc/profile so a broken ~/.bashrc cannot kill the session under
         // headless / Xvfb runs; still interactive for a prompt + job control.
@@ -741,45 +921,6 @@ fn default_shell() -> CommandBuilder {
         cmd.env("PS1", "$ ");
         cmd
     }
-}
-
-fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            match chars.peek().copied() {
-                Some('[') => {
-                    chars.next();
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    while let Some(c) = chars.next() {
-                        if c == '\u{7}' {
-                            break;
-                        }
-                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                Some(_) => {
-                    let _ = chars.next();
-                }
-                None => {}
-            }
-        } else {
-            // Keep `\r` / `\n` / tabs — `ingest` interprets them.
-            out.push(ch);
-        }
-    }
-    out
 }
 
 pub fn terminal_cwd(folder: Option<&Path>, doc_path: Option<&Path>) -> Option<PathBuf> {
@@ -797,16 +938,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_ansi_removes_colors_and_keeps_text() {
-        assert_eq!(strip_ansi("\u{1b}[32mhi\u{1b}[0m there"), "hi there");
-    }
-
-    #[test]
-    fn strip_ansi_keeps_carriage_return() {
-        assert!(strip_ansi("a\rb").contains('\r'));
-    }
-
-    #[test]
     fn terminal_cwd_prefers_folder() {
         let folder = Path::new("/tmp/proj");
         let doc = Path::new("/tmp/other/file.md");
@@ -817,81 +948,55 @@ mod tests {
     }
 
     #[test]
-    fn trim_output_pops_from_front_without_shifting() {
-        let mut lines: VecDeque<String> = (0..500)
-            .map(|i| format!("line-{i}-{}", "y".repeat(200)))
-            .collect();
-        let mut total: usize = lines.iter().map(|l| l.len() + 1).sum();
-        assert!(total > MAX_OUTPUT_CHARS / 4);
-        while total > MAX_OUTPUT_CHARS / 2 {
-            let Some(removed) = lines.pop_front() else {
-                break;
-            };
-            total = total.saturating_sub(removed.len() + 1);
+    fn grid_size_from_viewport() {
+        // 800x300 px, 8px cells, 20px rows, 16px rem → 1rem padding removed.
+        let size = grid_size_for(px(800.), px(300.), px(8.), px(20.), px(16.));
+        assert_eq!(size, GridSize { cols: 98, rows: 14 });
+        // Tiny panes clamp instead of producing a zero-sized PTY.
+        let tiny = grid_size_for(px(10.), px(10.), px(8.), px(20.), px(16.));
+        assert_eq!(tiny, GridSize { cols: 20, rows: 4 });
+    }
+
+    #[test]
+    fn prelude_is_capped() {
+        let mut prelude: Vec<SharedString> = (0..5_000).map(|i| i.to_string().into()).collect();
+        cap_prelude(&mut prelude);
+        assert_eq!(prelude.len(), MAX_PRELUDE_LINES);
+        assert_eq!(prelude.last().map(|s| s.as_ref()), Some("4999"));
+    }
+
+    fn ks(s: &str) -> Keystroke {
+        Keystroke::parse(s).unwrap()
+    }
+
+    #[test]
+    fn app_chords_skip_the_shell() {
+        for chord in [
+            "ctrl-`",
+            "ctrl-shift-p",
+            "ctrl-p",
+            "ctrl-tab",
+            "ctrl-shift-`",
+            "ctrl-q",
+        ] {
+            assert!(is_app_chord(&ks(chord)), "{chord}");
         }
-        assert!(total <= MAX_OUTPUT_CHARS / 2 + 400);
-        assert!(!lines.is_empty());
-    }
-
-    #[test]
-    fn ingest_cr_rewrites_current_line() {
-        let mut lines = Vec::new();
-        let mut current = String::new();
-        let ingest = |text: &str, lines: &mut Vec<String>, current: &mut String| {
-            let mut chars = text.chars().peekable();
-            while let Some(ch) = chars.next() {
-                match ch {
-                    '\n' => lines.push(std::mem::take(current)),
-                    '\r' => {
-                        if chars.peek() == Some(&'\n') {
-                            continue;
-                        }
-                        current.clear();
-                    }
-                    '\t' => {
-                        let col = current.chars().count();
-                        let spaces = TAB_WIDTH - (col % TAB_WIDTH);
-                        for _ in 0..spaces {
-                            current.push(' ');
-                        }
-                    }
-                    c => current.push(c),
-                }
-            }
-        };
-        ingest("hello\rworld", &mut lines, &mut current);
-        assert!(lines.is_empty());
-        assert_eq!(current, "world");
-        ingest("\nnext", &mut lines, &mut current);
-        assert_eq!(lines, vec!["world".to_string()]);
-        assert_eq!(current, "next");
-    }
-
-    #[test]
-    fn ingest_crlf_keeps_echoed_command() {
-        let mut lines: VecDeque<String> = VecDeque::new();
-        let mut current = String::new();
-        let ingest = |text: &str, lines: &mut VecDeque<String>, current: &mut String| {
-            let mut chars = text.chars().peekable();
-            while let Some(ch) = chars.next() {
-                match ch {
-                    '\n' => lines.push_back(std::mem::take(current)),
-                    '\r' => {
-                        if chars.peek() == Some(&'\n') {
-                            continue;
-                        }
-                        current.clear();
-                    }
-                    c => current.push(c),
-                }
-            }
-        };
-        // What a tty typically echoes after we write `echo hi\r`.
-        ingest("echo hi\r\nSPRINT\r\n$ ", &mut lines, &mut current);
-        assert_eq!(
-            lines.iter().cloned().collect::<Vec<_>>(),
-            vec!["echo hi".to_string(), "SPRINT".to_string()]
-        );
-        assert_eq!(current, "$ ");
+        for key in [
+            "ctrl-c",
+            "ctrl-d",
+            "ctrl-z",
+            "ctrl-r",
+            "ctrl-l",
+            "ctrl-u",
+            "ctrl-w",
+            "tab",
+            "up",
+            "escape",
+            "ctrl-shift-c",
+            "ctrl-shift-v",
+            "alt-b",
+        ] {
+            assert!(!is_app_chord(&ks(key)), "{key}");
+        }
     }
 }

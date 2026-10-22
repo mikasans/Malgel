@@ -763,7 +763,53 @@ impl Workspace {
         let seed = cx.new(|cx| TerminalPanel::new(window, cx));
         this.push_terminal(seed, window, cx);
         this.restore(paths, &settings, window, cx);
+        this.install_orphan_focus_guard(window, cx);
         this
+    }
+
+    /// Keys must never go dead. When the focused element disappears (the
+    /// preview pane a click focused is removed by Ctrl+1, a closed pane…)
+    /// GPUI dispatches from the window root, above every workspace action
+    /// handler, so Ctrl+`, Ctrl+P, Ctrl+Shift+P and typing all did nothing
+    /// until a mouse click. Before any binding runs, notice that focus is
+    /// outside the workspace with no dialog / sheet open, move it to the
+    /// active editor, and replay the keystroke there.
+    fn install_orphan_focus_guard(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = cx.weak_entity();
+        let window_id = window.window_handle().window_id();
+        // Set while a rescued keystroke is replayed, so a target that still
+        // cannot take focus does not loop.
+        let replaying = std::rc::Rc::new(std::cell::Cell::new(false));
+        cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle().window_id() != window_id || replaying.get() {
+                return;
+            }
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            if workspace.read(cx).focus_handle.contains_focused(window, cx)
+                || window.has_active_dialog(cx)
+                || window.has_active_sheet(cx)
+            {
+                return;
+            }
+            // Bare modifier presses carry no key worth replaying.
+            if event.keystroke.key.is_empty() {
+                return;
+            }
+            log::info!("ui: keyboard focus was orphaned; returning it to the editor");
+            let target = workspace.read(cx).active_focus_target(cx);
+            target.focus(window, cx);
+            cx.stop_propagation();
+            let keystroke = event.keystroke.clone();
+            let replaying = replaying.clone();
+            window.defer(cx, move |window, cx| {
+                replaying.set(true);
+                window.dispatch_keystroke(keystroke, cx);
+                replaying.set(false);
+            });
+        })
+        .detach();
     }
 
     /// Whether opening `paths` should restore the previous session's tabs: either
@@ -1380,19 +1426,24 @@ impl Workspace {
     }
 
     fn focus_active(&self, window: &mut Window, cx: &mut App) {
+        // Typst live preview is a PdfView, not the Markdown TextView —
+        // focusing an off-tree handle drops every workspace action.
+        let focus = self.active_focus_target(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+    }
+
+    /// The handle [`Self::focus_active`] would focus.
+    fn active_focus_target(&self, cx: &App) -> FocusHandle {
         let doc = self.active_document().read(cx);
         let shows_editor = AppSettings::get(cx).layout.shows_editor();
         let focus_mode = AppSettings::get(cx).focus_mode;
-        let focus = match keyboard_target(doc.is_media(), shows_editor, focus_mode) {
+        match keyboard_target(doc.is_media(), shows_editor, focus_mode) {
             KeyboardTarget::Media => doc
                 .media_focus_handle(cx)
                 .unwrap_or_else(|| doc.editor().focus_handle(cx)),
             KeyboardTarget::Editor => doc.editor().focus_handle(cx),
-            // Typst live preview is a PdfView, not the Markdown TextView —
-            // focusing an off-tree handle drops every workspace action.
             KeyboardTarget::Preview => doc.preview_pane_focus_handle(cx),
-        };
-        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        }
     }
 
     fn sync_file_tree(&self, cx: &mut App) {
@@ -2248,7 +2299,7 @@ impl Workspace {
         );
         let term = self.active_terminal().clone();
         term.update(cx, |term, cx| {
-            term.set_cwd(cwd, cx);
+            term.set_cwd(cwd, window, cx);
             term.ensure_running(window, cx);
         });
     }
@@ -2317,7 +2368,7 @@ impl Workspace {
         );
         for term in &self.terminals {
             term.update(cx, |term, cx| {
-                term.set_cwd(cwd.clone(), cx);
+                term.set_cwd(cwd.clone(), window, cx);
                 term.ensure_running(window, cx);
             });
         }
