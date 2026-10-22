@@ -17,10 +17,11 @@ use std::{
 
 use gpui_kit::{
     Anchor, App, AppContext as _, Bounds, ClipboardItem, Context, DismissEvent, DragMoveEvent,
-    Entity, EntityId, ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement as _,
-    IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, PathPromptOptions,
-    Pixels, Point, Render, ScrollHandle, SharedString, Size, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, UniformListScrollHandle, Window, WindowBounds, anchored,
+    Entity, EntityId, ExternalPaths, FocusHandle, Focusable, FontWeight, HighlightStyle,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent,
+    ParentElement as _, PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString, Size,
+    StatefulInteractiveElement as _, Styled as _, StyledText, Subscription, Task,
+    UniformListScrollHandle, Window, WindowBounds, anchored,
     assets::IconName,
     base::Disableable as _,
     component::{
@@ -505,6 +506,105 @@ fn command_item_with_path_icon(
                 .child(icon.clone().size_4())
                 .child(row_label.clone())
         })
+}
+
+/// How Quick Open draws a file: the name in the text colour and a little
+/// heavier, the folder after it dimmed and smaller, and the letters the
+/// query matched picked out, the way VS Code's Quick Open shows them.
+fn quick_open_item(row: &QuickOpenRow, query: &str) -> CommandItem {
+    let label: SharedString = row.label.clone().into();
+    let name = row
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| row.label.clone());
+    let mut keywords = vec![label.clone(), SharedString::from(name.clone())];
+    if let Some(keyword) = &row.keyword {
+        keywords.push(keyword.clone().into());
+    }
+    let (name_marks, dir, dir_marks) = quick_open_marks(&row.label, &name, query);
+    let icon = if row.is_dir {
+        folder_type_icon(&row.path, false)
+    } else {
+        file_type_icon(&row.path)
+    };
+    CommandItem::new()
+        .label(label)
+        .keywords(keywords)
+        .child(move |_window, cx| {
+            let theme = cx.theme();
+            let mark = HighlightStyle {
+                color: Some(theme.blue),
+                font_weight: Some(FontWeight::BOLD),
+                ..HighlightStyle::default()
+            };
+            let marked = |text: &str, ranges: &[std::ops::Range<usize>]| {
+                StyledText::new(SharedString::from(text.to_string()))
+                    .with_highlights(ranges.iter().map(|range| (range.clone(), mark)))
+            };
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_2()
+                .items_center()
+                .child(icon.clone().size_4())
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(marked(&name, &name_marks)),
+                )
+                .when(!dir.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(marked(&dir, &dir_marks)),
+                    )
+                })
+        })
+}
+
+/// Split a Quick Open label into its file name and folder, with the byte
+/// ranges of each that the query matched: in the name when the name holds
+/// the query, otherwise where the whole label does.
+fn quick_open_marks(
+    label: &str,
+    name: &str,
+    query: &str,
+) -> (
+    Vec<std::ops::Range<usize>>,
+    String,
+    Vec<std::ops::Range<usize>>,
+) {
+    let dir_end = label
+        .strip_suffix(name)
+        .map_or(0, |dir| dir.len())
+        .min(label.len());
+    let dir = label[..dir_end].trim_end_matches('/').to_string();
+    if query.is_empty() {
+        return (Vec::new(), dir, Vec::new());
+    }
+    if let Some(range) = search::match_bytes(name, query) {
+        return (vec![range], dir, Vec::new());
+    }
+    let Some(range) = search::match_bytes(label, query) else {
+        return (Vec::new(), dir, Vec::new());
+    };
+    let in_dir = range.start.min(dir.len())..range.end.min(dir.len());
+    let in_name = range.start.saturating_sub(dir_end)..range.end.saturating_sub(dir_end);
+    let keep = |range: std::ops::Range<usize>| {
+        if range.is_empty() {
+            Vec::new()
+        } else {
+            vec![range]
+        }
+    };
+    (keep(in_name), dir, keep(in_dir))
 }
 
 /// Which document indices the pinned-preview layout mounts in the editor
@@ -5868,20 +5968,7 @@ impl Workspace {
             // frame. Same test the palette filters with, so nothing it would
             // have shown is lost, up to QUICK_OPEN_SHOWN of them.
             let rows = matching_quick_open_rows(rows, &query, QUICK_OPEN_SHOWN);
-            let item = |row: &QuickOpenRow| {
-                let shown: SharedString = row.label.clone().into();
-                let name: SharedString = row
-                    .path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_default()
-                    .into();
-                let mut keywords = vec![shown.clone(), name];
-                if let Some(keyword) = &row.keyword {
-                    keywords.push(keyword.clone().into());
-                }
-                command_item_with_path_icon(shown, keywords, &row.path, row.is_dir)
-            };
+            let item = |row: &QuickOpenRow| quick_open_item(row, &query);
             let recent_items = first.iter().map(item).collect::<Vec<_>>();
             let items = rows.iter().map(item).collect::<Vec<_>>();
             // Section indices match the groups actually shown: omit an empty
@@ -10024,6 +10111,26 @@ mod tests {
             column: 1,
             text: format!("line {line}"),
         }
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn quick_open_marks_the_match_in_the_name_or_else_the_folder() {
+        let (name, dir, in_dir) = quick_open_marks("src/pkg000/m099.rs", "m099.rs", "M09");
+        assert_eq!(
+            (name, dir.as_str(), in_dir),
+            (vec![0..3], "src/pkg000", vec![])
+        );
+        let (name, dir, in_dir) = quick_open_marks("src/pkg000/m099.rs", "m099.rs", "pkg");
+        assert_eq!(
+            (name, dir.as_str(), in_dir),
+            (vec![], "src/pkg000", vec![4..7])
+        );
+        // A match across the slash marks both parts.
+        let (name, _, in_dir) = quick_open_marks("src/pkg000/m099.rs", "m099.rs", "000/m0");
+        assert_eq!((name, in_dir), (vec![0..2], vec![7..10]));
+        let (name, dir, in_dir) = quick_open_marks("README.md", "README.md", "");
+        assert_eq!((name, dir.as_str(), in_dir), (vec![], "", vec![]));
     }
 
     #[test]
