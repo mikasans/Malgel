@@ -253,8 +253,10 @@ fn format_rss_compact(kib: Option<u64>) -> Option<String> {
 
 fn format_cpu_compact(pct: Option<f32>) -> Option<String> {
     let pct = pct?;
-    // One-core percent; can exceed 100 on multi-threaded bursts.
-    let n = pct.round().clamp(0.0, 999.0) as u32;
+    // One-core percent; can exceed 100 on multi-threaded bursts. In steps
+    // of 5: the exact figure jitters every sample, and each new label is a
+    // repaint that itself costs CPU.
+    let n = ((pct / 5.0).round() * 5.0).clamp(0.0, 995.0) as u32;
     Some(format!("{n}%"))
 }
 
@@ -309,7 +311,9 @@ mod pulse_tests {
 
     #[test]
     fn formats_cpu_compactly() {
-        assert_eq!(format_cpu_compact(Some(12.4)), Some("12%".into()));
+        assert_eq!(format_cpu_compact(Some(12.4)), Some("10%".into()));
+        assert_eq!(format_cpu_compact(Some(13.0)), Some("15%".into()));
+        assert_eq!(format_cpu_compact(Some(1.9)), Some("0%".into()));
         assert_eq!(format_cpu_compact(Some(0.0)), Some("0%".into()));
     }
 

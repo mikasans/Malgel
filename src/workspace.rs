@@ -412,6 +412,12 @@ fn search_summary(found: &search::FolderSearch) -> String {
     text
 }
 
+/// Whether the status bar's memory/CPU pulse should repaint: only when its
+/// text changed, and only while the window is the active one.
+fn pulse_needs_repaint(generation: u64, shown: u64, window_active: bool) -> bool {
+    window_active && generation != shown
+}
+
 /// The next hit to show after `current`, `forward` or back, wrapping.
 fn step_hit(current: Option<usize>, len: usize, forward: bool) -> Option<usize> {
     if len == 0 {
@@ -799,6 +805,9 @@ impl Workspace {
 
         // Status-bar mem/CPU: sampler lives in perf (one process thread); this
         // only repaints when the shared pulse generation advances (~1.5s).
+        // A window in the background is not repainted for it at all (the
+        // label catches up on the next frame), so an idle Malgel behind
+        // another app costs nothing.
         crate::perf::ensure_pulse();
         let mut last_pulse_gen = 0u64;
         let pulse_task = cx.spawn_in(window, async move |this, cx| {
@@ -807,11 +816,13 @@ impl Workspace {
                     .timer(std::time::Duration::from_millis(1500))
                     .await;
                 let (_, generation) = crate::perf::pulse_snapshot();
-                if generation == last_pulse_gen {
-                    continue;
-                }
-                last_pulse_gen = generation;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                let alive = this.update_in(cx, |_, window, cx| {
+                    if pulse_needs_repaint(generation, last_pulse_gen, window.is_window_active()) {
+                        last_pulse_gen = generation;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
                     break;
                 }
             }
@@ -9934,6 +9945,13 @@ mod tests {
         assert_eq!(step_hit(None, 3, false), Some(2));
         assert_eq!(step_hit(Some(2), 3, true), Some(0));
         assert_eq!(step_hit(Some(0), 3, false), Some(2));
+    }
+
+    #[test]
+    fn the_pulse_repaints_only_a_changed_label_in_the_active_window() {
+        assert!(pulse_needs_repaint(2, 1, true));
+        assert!(!pulse_needs_repaint(2, 2, true));
+        assert!(!pulse_needs_repaint(3, 2, false));
     }
 
     #[test]
