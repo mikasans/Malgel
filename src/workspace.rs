@@ -372,7 +372,11 @@ enum SearchRow {
 
 /// The results tree's rows: hits grouped under their file, in the order the
 /// search found them, with the hits of a collapsed file left out.
-fn search_rows(hits: &[Hit], collapsed: &HashSet<PathBuf>) -> Vec<SearchRow> {
+fn search_rows(
+    hits: &[Hit],
+    counts: &HashMap<PathBuf, usize>,
+    collapsed: &HashSet<PathBuf>,
+) -> Vec<SearchRow> {
     let mut rows = Vec::new();
     let mut ix = 0;
     while ix < hits.len() {
@@ -383,7 +387,8 @@ fn search_rows(hits: &[Hit], collapsed: &HashSet<PathBuf>) -> Vec<SearchRow> {
             .map_or(hits.len(), |n| ix + n);
         rows.push(SearchRow::File {
             path: path.clone(),
-            count: end - ix,
+            // Every match in the file, also those past the per-file cap.
+            count: counts.get(path).copied().unwrap_or(end - ix).max(end - ix),
         });
         if !collapsed.contains(path) {
             rows.extend((ix..end).map(SearchRow::Hit));
@@ -393,20 +398,28 @@ fn search_rows(hits: &[Hit], collapsed: &HashSet<PathBuf>) -> Vec<SearchRow> {
     rows
 }
 
-/// The results header: `12 results in 3 files`, and how far a capped search
-/// got, the way VS Code says its results were limited.
+/// The results header: `12 results in 3 files`, and how many of them are
+/// listed when not all are, the way VS Code says its results were limited.
 fn search_summary(found: &search::FolderSearch) -> String {
     let plural =
         |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut text = format!(
         "{} in {}",
-        plural(found.hits.len(), "result", "results"),
+        plural(found.total_hits, "result", "results"),
         plural(found.files_matched, "file", "files")
     );
-    if found.limited || found.files_total >= quick_open::MAX_FILES {
+    if found.limited {
+        text.push_str(&format!(" \u{2014} showing {}", found.hits.len()));
+    }
+    if found.files_searched < found.files_total {
         text.push_str(&format!(
-            " \u{2014} results limited; searched {} of {} files",
+            " (searched {} of {} files)",
             found.files_searched, found.files_total
+        ));
+    } else if found.files_total >= quick_open::MAX_FILES {
+        text.push_str(&format!(
+            " (folder listing stops at {} files)",
+            quick_open::MAX_FILES
         ));
     }
     text
@@ -3783,7 +3796,9 @@ impl Workspace {
 
     fn rebuild_search_rows(&mut self) {
         self.sidebar_rows = match &self.sidebar_search {
-            SidebarSearch::Done { found, .. } => search_rows(&found.hits, &self.sidebar_collapsed),
+            SidebarSearch::Done { found, .. } => {
+                search_rows(&found.hits, &found.file_counts, &self.sidebar_collapsed)
+            }
             _ => Vec::new(),
         };
     }
@@ -8895,6 +8910,12 @@ impl Workspace {
                         this.focus_active(window, cx);
                         cx.stop_propagation();
                     }
+                    // Ctrl+Alt+Enter: Replace All, VS Code's key for it.
+                    let m = &keys.modifiers;
+                    if keys.key == "enter" && m.control && m.alt && !m.shift && !m.platform {
+                        this.sidebar_run_replace(true, window, cx);
+                        cx.stop_propagation();
+                    }
                 }),
             )
             .child(
@@ -8960,6 +8981,7 @@ impl Workspace {
                                 let ws = workspace.clone();
                                 Button::new("sidebar-replace-all")
                                     .label("Replace All")
+                                    .tooltip("Replace All (Ctrl+Alt+Enter)")
                                     .xsmall()
                                     .primary()
                                     .on_click(move |_, window, cx| {
@@ -9194,7 +9216,13 @@ impl Workspace {
             let _span = crate::perf::Span::new("folder_search");
             let files =
                 quick_open::files_under(&walk_root, show_hidden, &opened, quick_open::MAX_FILES);
-            let found = search::search_folder_files(&files, &wanted, search::MAX_HITS, &stop);
+            let found = search::search_folder_files(
+                &files,
+                &wanted,
+                search::MAX_HITS,
+                search::MAX_HITS_PER_FILE,
+                &stop,
+            );
             drop(files);
             crate::perf::release_free_memory();
             found
@@ -10020,7 +10048,8 @@ mod tests {
     #[test]
     fn search_results_group_hits_under_their_file() {
         let hits = [hit("/r/a.rs", 1), hit("/r/a.rs", 9), hit("/r/sub/b.rs", 3)];
-        let rows = search_rows(&hits, &HashSet::new());
+        let counts = HashMap::from([(PathBuf::from("/r/sub/b.rs"), 7)]);
+        let rows = search_rows(&hits, &counts, &HashSet::new());
         assert_eq!(
             rows,
             [
@@ -10032,20 +10061,20 @@ mod tests {
                 SearchRow::Hit(1),
                 SearchRow::File {
                     path: PathBuf::from("/r/sub/b.rs"),
-                    count: 1
+                    count: 7
                 },
                 SearchRow::Hit(2),
             ]
         );
         // A collapsed file keeps its row and count, without its hits.
         let collapsed = HashSet::from([PathBuf::from("/r/a.rs")]);
-        let rows = search_rows(&hits, &collapsed);
+        let rows = search_rows(&hits, &counts, &collapsed);
         assert_eq!(rows.len(), 3);
         assert_eq!(
             rows[1],
             SearchRow::File {
                 path: PathBuf::from("/r/sub/b.rs"),
-                count: 1
+                count: 7
             }
         );
     }
@@ -10054,21 +10083,35 @@ mod tests {
     fn the_search_summary_counts_results_and_files_and_says_when_it_was_limited() {
         let mut found = search::FolderSearch {
             hits: vec![hit("/r/a.rs", 1), hit("/r/b.rs", 2)],
+            total_hits: 2,
             files_matched: 2,
             files_searched: 20_000,
             files_total: 20_000,
-            limited: false,
+            ..Default::default()
         };
         assert_eq!(search_summary(&found), "2 results in 2 files");
         found.hits.truncate(1);
+        found.total_hits = 1;
         found.files_matched = 1;
         assert_eq!(search_summary(&found), "1 result in 1 file");
+        found.total_hits = 60_000;
         found.limited = true;
+        assert_eq!(
+            search_summary(&found),
+            "60000 results in 1 file \u{2014} showing 1"
+        );
         found.files_searched = 700;
         assert_eq!(
             search_summary(&found),
-            "1 result in 1 file \u{2014} results limited; searched 700 of 20000 files"
+            "60000 results in 1 file \u{2014} showing 1 (searched 700 of 20000 files)"
         );
+    }
+
+    #[test]
+    fn a_reopened_tab_goes_back_where_it_was() {
+        assert_eq!(reopen_position(2, 5), 2);
+        assert_eq!(reopen_position(0, 1), 0);
+        assert_eq!(reopen_position(9, 4), 3);
     }
 
     #[test]

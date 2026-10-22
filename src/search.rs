@@ -52,6 +52,28 @@ fn find_ignoring_case(line: &str, query: &str) -> Option<usize> {
     })
 }
 
+/// The bytes of `text` the first case-insensitive match of `query` covers.
+pub fn match_bytes(text: &str, query: &str) -> Option<std::ops::Range<usize>> {
+    let start = find_ignoring_case(text, query)?;
+    let (from, _) = text.char_indices().nth(start)?;
+    let len: usize = text[from..]
+        .chars()
+        .take(query.chars().count())
+        .map(char::len_utf8)
+        .sum();
+    Some(from..from + len)
+}
+
+/// Where `query` starts in `line` (in characters), under the smart-case rule.
+fn line_match(line: &str, query: &str, sensitive: bool) -> Option<usize> {
+    if sensitive {
+        // `str::find` counts bytes; the column counts characters.
+        line.find(query).map(|bytes| line[..bytes].chars().count())
+    } else {
+        find_ignoring_case(line, query)
+    }
+}
+
 /// Every line of `text` that holds `query`, as `(line, column, text)`, at most
 /// `limit` of them.
 pub fn search_text(text: &str, query: &str, limit: usize) -> Vec<(usize, usize, String)> {
@@ -64,17 +86,30 @@ pub fn search_text(text: &str, query: &str, limit: usize) -> Vec<(usize, usize, 
         if hits.len() >= limit {
             break;
         }
-        let found = if sensitive {
-            // `str::find` counts bytes; the column counts characters.
-            line.find(query).map(|bytes| line[..bytes].chars().count())
-        } else {
-            find_ignoring_case(line, query)
-        };
-        if let Some(column) = found {
+        if let Some(column) = line_match(line, query, sensitive) {
             hits.push((ix + 1, column + 1, line.trim().to_string()));
         }
     }
     hits
+}
+
+/// How many lines of `text` hold `query` — what [`search_text`] would list
+/// with no limit, without building the rows.
+pub fn count_lines(text: &str, query: &str) -> usize {
+    if query.is_empty() {
+        return 0;
+    }
+    let sensitive = case_sensitive(query);
+    if !sensitive && query.is_ascii() && text.is_ascii() {
+        let query = query.to_ascii_lowercase();
+        return text
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().contains(&query))
+            .count();
+    }
+    text.lines()
+        .filter(|line| line_match(line, query, sensitive).is_some())
+        .count()
 }
 
 /// Search `files` in the order given, at most `limit` hits in total.
@@ -84,30 +119,43 @@ pub fn search_files(files: &[PathBuf], query: &str, limit: usize) -> Vec<Hit> {
         files,
         query,
         limit,
+        limit,
         &std::sync::atomic::AtomicBool::new(false),
     )
     .hits
 }
 
+/// The most hits one file shows, so a single huge file cannot take the
+/// whole [`MAX_HITS`] and hide every other file's results.
+pub const MAX_HITS_PER_FILE: usize = 1_000;
+
 /// What a search of a folder found, and how much of the folder it read.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FolderSearch {
+    /// The hits shown: at most [`MAX_HITS`], at most [`MAX_HITS_PER_FILE`]
+    /// from one file.
     pub hits: Vec<Hit>,
+    /// Every matching line in the folder, shown or not.
+    pub total_hits: usize,
+    /// Matching lines per file, shown or not.
+    pub file_counts: std::collections::HashMap<PathBuf, usize>,
     /// Files with at least one hit.
     pub files_matched: usize,
-    /// Files read before the search stopped.
+    /// Files read before the search stopped (all of them unless cancelled).
     pub files_searched: usize,
     /// Files the folder listing holds.
     pub files_total: usize,
-    /// The hit cap stopped the search before the last file.
+    /// Fewer hits are shown than the folder holds.
     pub limited: bool,
 }
 
-/// Search `files` in order, at most `limit` hits, counting how far it got.
+/// Search every one of `files` in order. Every match is counted; at most
+/// `limit` are kept as rows, and at most `per_file` from any one file.
 pub fn search_folder_files(
     files: &[PathBuf],
     query: &str,
     limit: usize,
+    per_file: usize,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> FolderSearch {
     let mut out = FolderSearch {
@@ -121,34 +169,33 @@ pub fn search_folder_files(
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        let left = limit.saturating_sub(out.hits.len());
-        if left == 0 {
-            out.limited = true;
-            break;
-        }
         out.files_searched += 1;
         let Some(text) = read_text(path) else {
             continue;
         };
-        let found = search_text(&text, query, left);
-        if found.is_empty() {
+        let count = count_lines(&text, query);
+        if count == 0 {
             continue;
         }
         out.files_matched += 1;
-        if found.len() == left {
-            // The cap may have cut this file short; whether more files were
-            // left is settled on the next turn round the loop.
-            out.limited = out.files_searched < files.len()
-                || search_text(&text, query, left + 1).len() > left;
+        out.total_hits += count;
+        out.file_counts.insert(path.clone(), count);
+        let room = limit.saturating_sub(out.hits.len()).min(per_file);
+        if room > 0 {
+            out.hits
+                .extend(
+                    search_text(&text, query, room)
+                        .into_iter()
+                        .map(|(line, column, text)| Hit {
+                            path: path.clone(),
+                            line,
+                            column,
+                            text,
+                        }),
+                );
         }
-        out.hits
-            .extend(found.into_iter().map(|(line, column, text)| Hit {
-                path: path.clone(),
-                line,
-                column,
-                text,
-            }));
     }
+    out.limited = out.hits.len() < out.total_hits;
     out
 }
 
@@ -274,13 +321,13 @@ mod tests {
         let files = vec![file.clone(), file];
         let cancel = std::sync::atomic::AtomicBool::new(true);
         assert!(
-            search_folder_files(&files, "needle", 10, &cancel)
+            search_folder_files(&files, "needle", 10, 10, &cancel)
                 .hits
                 .is_empty()
         );
         cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            search_folder_files(&files, "needle", 10, &cancel)
+            search_folder_files(&files, "needle", 10, 10, &cancel)
                 .hits
                 .len(),
             2
@@ -361,9 +408,9 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_search_reads_every_file_and_says_when_the_hit_cap_bit() {
+    fn a_folder_search_reads_every_file_and_counts_past_the_caps() {
         let dir = scratch("folder");
-        let files: Vec<PathBuf> = (0..30)
+        let mut files: Vec<PathBuf> = (0..30)
             .map(|ix| {
                 let path = dir.join(format!("f{ix:02}.rs"));
                 let body = if ix == 0 || ix == 29 {
@@ -375,18 +422,32 @@ mod tests {
                 path
             })
             .collect();
+        // One big file first: it must not eat the whole cap.
+        let big = dir.join("big.rs");
+        std::fs::write(&big, "fn f() {}\n".repeat(500)).unwrap();
+        files.insert(0, big.clone());
         let none = std::sync::atomic::AtomicBool::new(false);
         // The first and last file are both reached: nothing caps the walk.
-        let found = search_folder_files(&files, "token_", 100, &none);
+        let found = search_folder_files(&files, "token_", 100, 10, &none);
         assert_eq!(found.hits.len(), 2);
-        assert_eq!((found.files_searched, found.files_total), (30, 30));
-        assert_eq!(found.files_matched, 2);
+        assert_eq!((found.files_searched, found.files_total), (31, 31));
+        assert_eq!((found.files_matched, found.total_hits), (2, 2));
         assert!(!found.limited);
-        // Only the hit cap stops it, and then it says how far it got.
-        let found = search_folder_files(&files, "fn", 5, &none);
-        assert_eq!(found.hits.len(), 5);
+        // Every match is counted; rows are capped per file and in total.
+        let found = search_folder_files(&files, "fn", 25, 10, &none);
+        assert_eq!(found.total_hits, 530);
+        assert_eq!(found.files_matched, 31);
+        assert_eq!(found.file_counts[&big], 500);
+        assert_eq!(found.hits.len(), 25);
+        assert_eq!(found.hits.iter().filter(|hit| hit.path == big).count(), 10);
         assert!(found.limited);
-        assert_eq!(found.files_searched, 5);
+        assert_eq!(count_lines("Fn a\nfn b\nnone\n", "fn"), 2);
+        assert_eq!(count_lines("Fn a\nfn b\n", "Fn"), 1);
+        assert_eq!(match_bytes("src/M099.rs", "m09"), Some(4..7));
+        assert_eq!(match_bytes("ab", "B"), Some(1..2));
+        assert_eq!(match_bytes("éa", "A"), Some(2..3));
+        assert_eq!(match_bytes("abc", "abc"), Some(0..3));
+        assert_eq!(match_bytes("abc", "x"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
