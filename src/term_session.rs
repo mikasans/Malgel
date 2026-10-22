@@ -41,7 +41,7 @@ use alacritty_terminal::{
     index::{Column, Line, Point},
     sync::FairMutex,
     term::{Config, TermMode, cell::Flags},
-    vte::ansi::{self, Handler as _},
+    vte::ansi::{self, Color, Handler as _, NamedColor},
 };
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 
@@ -62,6 +62,18 @@ const WRITE_CHUNK: usize = 1024;
 const MAX_PARSE_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
 /// Throttle accounting window.
 const THROTTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+/// Output that keeps saturating the parse budget this long (`yes`, a runaway
+/// log; `cat` of a big file is done well before) is parsed at
+/// [`SUSTAINED_PARSE_BYTES_PER_SEC`]: the PTY backpressures the producer, so
+/// a never-ending flood costs a sliver of a core instead of most of one.
+const SUSTAINED_FLOOD_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+const SUSTAINED_PARSE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+/// Line feeds cost far more than bytes (each one scrolls a full row of
+/// cells), so `yes` is limited by lines too: bursts like `seq 5000000` run
+/// unthrottled, a flood that never ends is cut to a rate the eye cannot
+/// follow anyway.
+const MAX_PARSE_LINES_PER_SEC: u64 = 4_000_000;
+const SUSTAINED_PARSE_LINES_PER_SEC: u64 = 200_000;
 /// After the shell process exits, how long to wait for EOF on the PTY before
 /// declaring the session over anyway (a background job can hold it open).
 const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -215,6 +227,114 @@ pub struct ViewInfo {
     pub cursor: Option<(usize, usize)>,
     pub alt_screen: bool,
     pub app_cursor: bool,
+}
+
+/// A cell color, independent of any UI toolkit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellColor {
+    /// The terminal's default foreground / background (follows the theme).
+    Default,
+    /// One of the 256 xterm palette entries (0–15 follow the theme).
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// Look of a run of cells that differs from the defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellStyle {
+    pub fg: CellColor,
+    pub bg: CellColor,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub dim: bool,
+}
+
+impl CellStyle {
+    const PLAIN: CellStyle = CellStyle {
+        fg: CellColor::Default,
+        bg: CellColor::Default,
+        bold: false,
+        italic: false,
+        underline: false,
+        dim: false,
+    };
+}
+
+/// A row's text plus its non-default style runs (byte ranges into `text`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StyledRow {
+    pub text: String,
+    pub runs: Vec<(std::ops::Range<usize>, CellStyle)>,
+}
+
+fn cell_color(color: Color) -> CellColor {
+    match color {
+        Color::Spec(rgb) => CellColor::Rgb(rgb.r, rgb.g, rgb.b),
+        Color::Indexed(ix) => CellColor::Indexed(ix),
+        Color::Named(named) => match named {
+            NamedColor::Black | NamedColor::DimBlack => CellColor::Indexed(0),
+            NamedColor::Red | NamedColor::DimRed => CellColor::Indexed(1),
+            NamedColor::Green | NamedColor::DimGreen => CellColor::Indexed(2),
+            NamedColor::Yellow | NamedColor::DimYellow => CellColor::Indexed(3),
+            NamedColor::Blue | NamedColor::DimBlue => CellColor::Indexed(4),
+            NamedColor::Magenta | NamedColor::DimMagenta => CellColor::Indexed(5),
+            NamedColor::Cyan | NamedColor::DimCyan => CellColor::Indexed(6),
+            NamedColor::White | NamedColor::DimWhite => CellColor::Indexed(7),
+            NamedColor::BrightBlack => CellColor::Indexed(8),
+            NamedColor::BrightRed => CellColor::Indexed(9),
+            NamedColor::BrightGreen => CellColor::Indexed(10),
+            NamedColor::BrightYellow => CellColor::Indexed(11),
+            NamedColor::BrightBlue => CellColor::Indexed(12),
+            NamedColor::BrightMagenta => CellColor::Indexed(13),
+            NamedColor::BrightCyan => CellColor::Indexed(14),
+            NamedColor::BrightWhite => CellColor::Indexed(15),
+            _ => CellColor::Default,
+        },
+    }
+}
+
+fn cell_style(cell: &alacritty_terminal::term::cell::Cell) -> CellStyle {
+    let mut fg = cell_color(cell.fg);
+    let mut bg = cell_color(cell.bg);
+    let flags = cell.flags;
+    if flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+        // Inverse of the defaults: the UI swaps theme fg/bg for these.
+        if fg == CellColor::Default && bg == CellColor::Default {
+            return inverse_defaults(flags);
+        }
+    }
+    CellStyle {
+        fg,
+        bg,
+        bold: flags.contains(Flags::BOLD),
+        italic: flags.contains(Flags::ITALIC),
+        underline: flags.intersects(Flags::ALL_UNDERLINES),
+        dim: flags.contains(Flags::DIM),
+    }
+}
+
+/// Marker style for "inverse video on default colors" (reverse-video status
+/// lines in less / top / vim). `fg == bg == Rgb(0,0,0)` with `underline`
+/// unset is otherwise invisible text, so the UI reads it as "swap theme
+/// foreground and background".
+fn inverse_defaults(flags: Flags) -> CellStyle {
+    CellStyle {
+        fg: CellColor::Rgb(0, 0, 0),
+        bg: CellColor::Rgb(0, 0, 0),
+        bold: flags.contains(Flags::BOLD),
+        italic: flags.contains(Flags::ITALIC),
+        underline: flags.intersects(Flags::ALL_UNDERLINES),
+        dim: flags.contains(Flags::DIM),
+    }
+}
+
+impl CellStyle {
+    /// See [`inverse_defaults`].
+    pub fn is_inverse_default(&self) -> bool {
+        self.fg == CellColor::Rgb(0, 0, 0) && self.bg == CellColor::Rgb(0, 0, 0)
+    }
 }
 
 /// A live shell (or any command) on a PTY.
@@ -403,9 +523,22 @@ impl PtySession {
 
     /// Text of view rows `range` (indices as in [`ViewInfo::line_count`]),
     /// clamped to what exists now.
+    #[cfg(test)]
     pub fn rows(&self, range: std::ops::Range<usize>) -> Vec<String> {
         let term = self.shared.term.lock();
         rows_term(&term, range)
+    }
+
+    /// [`Self::rows`] with colors and attributes.
+    pub fn styled_rows(&self, range: std::ops::Range<usize>) -> Vec<StyledRow> {
+        let term = self.shared.term.lock();
+        let (top, bottom) = view_bounds(&term);
+        let count = (bottom - top + 1).max(0) as usize;
+        let end = range.end.min(count);
+        let start = range.start.min(end);
+        (start..end)
+            .map(|ix| styled_row(&term, Line(top + ix as i32)))
+            .collect()
     }
 
     /// Everything in scrollback and on screen, soft-wrapped rows rejoined.
@@ -565,23 +698,47 @@ fn pty_size(size: GridSize) -> PtySize {
 fn reader_loop(mut reader: Box<dyn Read + Send>, poll_fd: Option<i32>, shared: Arc<Shared>) {
     let mut processor: ansi::Processor = ansi::Processor::new();
     let mut buf = vec![0u8; READ_CHUNK];
-    let window_budget = MAX_PARSE_BYTES_PER_SEC * THROTTLE_WINDOW.as_millis() as u64 / 1000;
+    let budget = |rate: u64| rate * THROTTLE_WINDOW.as_millis() as u64 / 1000;
     let mut window_start = std::time::Instant::now();
-    let mut window_bytes = 0u64;
+    // Work done in the current window; overshoot carries into the next ones.
+    let mut used_bytes = 0u64;
+    let mut used_lines = 0u64;
+    // Start of the run of windows that all used their whole budget.
+    let mut flood_since: Option<std::time::Instant> = None;
     loop {
         if shared.stop.load(Ordering::Acquire) {
             break;
         }
-        if window_bytes >= window_budget {
+        let sustained = flood_since.is_some_and(|since| since.elapsed() >= SUSTAINED_FLOOD_AFTER);
+        let (byte_budget, line_budget) = if sustained {
+            (
+                budget(SUSTAINED_PARSE_BYTES_PER_SEC),
+                budget(SUSTAINED_PARSE_LINES_PER_SEC),
+            )
+        } else {
+            (
+                budget(MAX_PARSE_BYTES_PER_SEC),
+                budget(MAX_PARSE_LINES_PER_SEC),
+            )
+        };
+        if used_bytes >= byte_budget || used_lines >= line_budget {
+            // Over budget: wait out the window (the PTY backpressures the
+            // producer meanwhile), then pay the overshoot off.
+            flood_since.get_or_insert_with(std::time::Instant::now);
             let elapsed = window_start.elapsed();
             if elapsed < THROTTLE_WINDOW {
                 thread::sleep(THROTTLE_WINDOW - elapsed);
             }
             window_start = std::time::Instant::now();
-            window_bytes = 0;
+            used_bytes = used_bytes.saturating_sub(byte_budget);
+            used_lines = used_lines.saturating_sub(line_budget);
+            continue;
         } else if window_start.elapsed() >= THROTTLE_WINDOW {
+            // A window that did not fill its budget: the flood is over.
+            flood_since = None;
             window_start = std::time::Instant::now();
-            window_bytes = 0;
+            used_bytes = 0;
+            used_lines = 0;
         }
         if !wait_readable(poll_fd) {
             continue;
@@ -593,7 +750,8 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, poll_fd: Option<i32>, shared: A
                     let mut term = shared.term.lock();
                     processor.advance(&mut *term, &buf[..n]);
                 }
-                window_bytes += n as u64;
+                used_bytes += n as u64;
+                used_lines += buf[..n].iter().filter(|&&b| b == b'\n').count() as u64;
                 shared.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
                 shared.dirty.store(true, Ordering::Release);
             }
@@ -660,6 +818,51 @@ fn row_text<T>(term: &Term<T>, line: Line) -> (String, bool) {
     }
     let wrapped = row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
     (text, wrapped)
+}
+
+/// One grid row as text plus style runs; trailing blank default cells are
+/// trimmed (a colored background keeps its cells).
+fn styled_row<T>(term: &Term<T>, line: Line) -> StyledRow {
+    let grid = term.grid();
+    let row = &grid[line];
+    let cols = grid.columns();
+    let mut text = String::with_capacity(cols);
+    let mut runs: Vec<(std::ops::Range<usize>, CellStyle)> = Vec::new();
+    // Byte length of text up to the last cell worth keeping.
+    let mut keep = 0;
+    for col in 0..cols {
+        let cell = &row[Column(col)];
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        let start = text.len();
+        text.push(cell.c);
+        if let Some(extra) = cell.zerowidth() {
+            text.extend(extra.iter());
+        }
+        let end = text.len();
+        let style = cell_style(cell);
+        let visible_bg = style.bg != CellColor::Default || style.is_inverse_default();
+        if cell.c != ' ' || visible_bg {
+            keep = end;
+        }
+        if style == CellStyle::PLAIN {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((range, last)) if *last == style && range.end == start => range.end = end,
+            _ => runs.push((start..end, style)),
+        }
+    }
+    text.truncate(keep);
+    runs.retain_mut(|(range, _)| {
+        range.end = range.end.min(keep);
+        range.start < range.end
+    });
+    StyledRow { text, runs }
 }
 
 fn row_is_blank<T>(term: &Term<T>, line: Line) -> bool {
@@ -1097,6 +1300,37 @@ mod tests {
         assert_eq!(rows, vec!["1", "2", "3"]);
         assert!(s.rows(info.line_count..info.line_count + 10).is_empty());
         assert_eq!(s.rows(49..50), vec!["50"]);
+        s.shutdown();
+        let _ = s.poll_exited();
+    }
+
+    #[test]
+    fn colors_survive_as_style_runs() {
+        let mut s = PtySession::spawn(
+            sh(r"printf '\033[31mred\033[0m plain \033[1;44mbb\033[0m\n\033[7minv\033[0m\n'; sleep 1"),
+            GridSize::DEFAULT,
+        )
+        .unwrap();
+        assert!(wait_until(Duration::from_secs(5), || s
+            .view_info()
+            .line_count
+            >= 2
+            && screen_text(&s).contains("inv")));
+        let info = s.view_info();
+        let rows = s.styled_rows(0..info.line_count);
+        let red = rows.iter().find(|r| r.text.starts_with("red")).unwrap();
+        assert_eq!(red.text, "red plain bb");
+        assert_eq!(red.runs[0].0, 0..3);
+        assert_eq!(red.runs[0].1.fg, CellColor::Indexed(1));
+        let bb = red
+            .runs
+            .iter()
+            .find(|(r, _)| &red.text[r.clone()] == "bb")
+            .unwrap();
+        assert!(bb.1.bold);
+        assert_eq!(bb.1.bg, CellColor::Indexed(4));
+        let inv = rows.iter().find(|r| r.text == "inv").unwrap();
+        assert!(inv.runs[0].1.is_inverse_default());
         s.shutdown();
         let _ = s.poll_exited();
     }

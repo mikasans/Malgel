@@ -331,6 +331,9 @@ pub fn bind_keys(cx: &mut App) {
         // No key-context: palette tip resolution (same as Toggle Side Bar).
         KeyBinding::new("ctrl-`", SummonTerminal, None),
         KeyBinding::new("ctrl-shift-`", NewTerminal, None),
+        // VS Code: Split Terminal (Ctrl+Shift+5; X11 may report it as Ctrl+%).
+        KeyBinding::new("ctrl-shift-5", SplitTerminal, None),
+        KeyBinding::new("ctrl-%", SplitTerminal, None),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-j", SummonTerminal, None),
         KeyBinding::new("secondary-q", Quit, None),

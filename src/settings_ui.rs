@@ -68,6 +68,15 @@ const ROWS: &[SettingRow] = &[
         section: "WORKSPACE",
     },
     SettingRow {
+        id: "terminal-shell-config",
+        title: "Terminal Loads Shell Config",
+        description: "Start terminal shells with your ~/.bashrc / ~/.zshrc (off: a clean shell).",
+        keywords: &["terminal", "shell", "bashrc", "zshrc", "profile"],
+        get: |s| s.terminal_shell_config,
+        set: |s, on| s.terminal_shell_config = on,
+        section: "WORKSPACE",
+    },
+    SettingRow {
         id: "minimap",
         title: "Minimap",
         description: "Show a code overview strip beside the editor.",

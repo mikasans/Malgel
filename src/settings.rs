@@ -100,6 +100,10 @@ pub struct Settings {
     /// Center the text column in a wide editor, line numbers with it (VS
     /// Code's Centered Layout). Off: the line numbers sit at the left edge.
     pub centered_layout: bool,
+    /// Start terminal shells with the user's rc files (~/.bashrc, ~/.zshrc)
+    /// like VS Code. Off: a clean shell (`bash --norc --noprofile`), for a
+    /// broken rc that would kill the session.
+    pub terminal_shell_config: bool,
 
     /// Hide everything but the text, dimming all but the current paragraph.
     /// Lasts until turned off or Malgel quits.
@@ -124,6 +128,7 @@ impl Default for Settings {
             tabs: true,
             show_hidden_entries: false,
             centered_layout: false,
+            terminal_shell_config: true,
             file_sidebar: false,
             outline_sidebar: false,
             problems_panel: false,

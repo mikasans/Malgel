@@ -37,9 +37,10 @@ use std::{
 
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EntityInputHandler as _,
-    EventEmitter, FocusHandle, Focusable, Global, InteractiveElement as _, IntoElement, Keystroke,
-    MouseButton, ParentElement as _, Pixels, Render, ScrollDelta, ScrollStrategy, ScrollWheelEvent,
-    SharedString, Size, Styled as _, UniformListScrollHandle, WeakEntity, Window,
+    EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, Global, HighlightStyle, Hsla,
+    InteractiveElement as _, IntoElement, Keystroke, MouseButton, ParentElement as _, Pixels,
+    Render, ScrollDelta, ScrollStrategy, ScrollWheelEvent, SharedString, Size, Styled as _,
+    StyledText, UnderlineStyle, UniformListScrollHandle, WeakEntity, Window,
     assets::IconName,
     base::Disableable as _,
     canvas,
@@ -56,7 +57,9 @@ use gpui_kit::{
 };
 use portable_pty::CommandBuilder;
 
-use crate::term_session::{GridSize, PtySession, ViewInfo, encode_key};
+use crate::term_session::{
+    CellColor, CellStyle, GridSize, PtySession, StyledRow, ViewInfo, encode_key,
+};
 
 /// Transcript kept from a stopped / exited shell above the next one.
 const MAX_PRELUDE_LINES: usize = 500;
@@ -69,6 +72,11 @@ const PUMP_INTERVAL: Duration = Duration::from_millis(16);
 /// While output streams (a flood, not an echo), repaint at most this often:
 /// nobody reads 60 frames of `yes`, and every frame repaints the window.
 const FLOOD_FRAME: Duration = Duration::from_millis(80);
+/// A flood that has gone on this long (`yes`, a runaway log) drops to
+/// [`SUSTAINED_FLOOD_FRAME`]: on a software renderer each frame of a full
+/// window costs a core-fraction, and the text is a blur anyway.
+const SUSTAINED_FLOOD_AFTER: Duration = Duration::from_secs(1);
+const SUSTAINED_FLOOD_FRAME: Duration = Duration::from_millis(250);
 /// Bytes per tick below which output counts as interactive (echo, prompt)
 /// and is painted at once.
 const ECHO_BYTES: u64 = 4096;
@@ -142,6 +150,8 @@ pub struct TerminalPanel {
     rem: Pixels,
     last_paint: Instant,
     bytes_at_paint: u64,
+    /// When the current flood (painting throttled) began.
+    flood_since: Option<Instant>,
     _pump: Option<gpui_kit::Task<()>>,
     /// Stick output viewport to the end while the user has not scrolled up.
     follow_tail: bool,
@@ -206,6 +216,7 @@ impl TerminalPanel {
             rem: px(16.),
             last_paint: Instant::now(),
             bytes_at_paint: 0,
+            flood_since: None,
             _pump: None,
             follow_tail: true,
         }
@@ -483,7 +494,7 @@ impl TerminalPanel {
     fn start_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_shell();
         let size = self.wanted_grid_size().unwrap_or(GridSize::DEFAULT);
-        let mut cmd = default_shell();
+        let mut cmd = default_shell(crate::themes::AppSettings::get(cx).terminal_shell_config);
         if let Some(cwd) = &self.cwd {
             cmd.cwd(cwd);
         }
@@ -495,6 +506,7 @@ impl TerminalPanel {
             }
         }
         self.bytes_at_paint = 0;
+        self.flood_since = None;
         self._pump = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(PUMP_INTERVAL).await;
@@ -540,12 +552,24 @@ impl TerminalPanel {
         if !exited {
             let bytes = session.bytes_read();
             let streaming = bytes.saturating_sub(self.bytes_at_paint) > ECHO_BYTES;
-            if streaming && self.last_paint.elapsed() < FLOOD_FRAME {
+            let frame = match self.flood_since {
+                Some(since) if since.elapsed() >= SUSTAINED_FLOOD_AFTER => SUSTAINED_FLOOD_FRAME,
+                _ => FLOOD_FRAME,
+            };
+            if streaming && self.last_paint.elapsed() < frame {
                 // Leave the dirty flag set; paint on a later tick.
                 return true;
             }
             if !session.take_dirty() {
+                if self.last_paint.elapsed() > FLOOD_FRAME {
+                    self.flood_since = None;
+                }
                 return true;
+            }
+            if streaming {
+                self.flood_since.get_or_insert_with(Instant::now);
+            } else {
+                self.flood_since = None;
             }
             self.bytes_at_paint = bytes;
         }
@@ -563,17 +587,13 @@ impl TerminalPanel {
         !exited
     }
 
-    /// Text of view rows `range` (prelude, then the live session).
-    fn row_texts(&self, range: Range<usize>) -> Vec<SharedString> {
+    /// Styled view rows `range` (prelude, then the live session).
+    fn row_texts(&self, range: Range<usize>) -> Vec<StyledRow> {
         if self.view.alt_screen {
             let Some(session) = &self.session else {
                 return Vec::new();
             };
-            return session
-                .rows(range)
-                .into_iter()
-                .map(SharedString::from)
-                .collect();
+            return session.styled_rows(range);
         }
         let split = self.prelude.len();
         let mut out = Vec::with_capacity(range.len());
@@ -581,7 +601,10 @@ impl TerminalPanel {
             out.extend(
                 self.prelude[range.start..range.end.min(split)]
                     .iter()
-                    .cloned(),
+                    .map(|line| StyledRow {
+                        text: line.to_string(),
+                        runs: Vec::new(),
+                    }),
             );
         }
         if range.end > split
@@ -589,7 +612,7 @@ impl TerminalPanel {
         {
             let from = range.start.saturating_sub(split);
             let to = range.end - split;
-            out.extend(session.rows(from..to).into_iter().map(SharedString::from));
+            out.extend(session.styled_rows(from..to));
         }
         out
     }
@@ -620,6 +643,152 @@ fn grid_size_for(
     let cols = (w / f32::from(cell_w).max(1.)).floor().max(0.) as usize;
     let rows = (h / f32::from(line_h).max(1.)).floor().max(0.) as usize;
     GridSize::clamped(cols, rows)
+}
+
+/// Theme-following terminal colors: the 16 ANSI colors use VS Code's
+/// terminal palette for the light or dark theme; 16–255 are xterm's cube
+/// and gray ramp.
+#[derive(Clone, Copy)]
+struct TermColors {
+    fg: Hsla,
+    bg: Hsla,
+    ansi: [u32; 16],
+}
+
+const VSCODE_DARK_ANSI: [u32; 16] = [
+    0x000000, 0xcd3131, 0x0dbc79, 0xe5e510, 0x2472c8, 0xbc3fbc, 0x11a8cd, 0xe5e5e5, 0x666666,
+    0xf14c4c, 0x23d18b, 0xf5f543, 0x3b8eea, 0xd670d6, 0x29b8db, 0xe5e5e5,
+];
+const VSCODE_LIGHT_ANSI: [u32; 16] = [
+    0x000000, 0xcd3131, 0x00bc00, 0x949800, 0x0451a5, 0xbc05bc, 0x0598bc, 0x555555, 0x666666,
+    0xcd3131, 0x14ce14, 0xb5ba00, 0x0451a5, 0xbc05bc, 0x0598bc, 0xa5a5a5,
+];
+
+impl TermColors {
+    fn new(dark: bool, fg: Hsla, bg: Hsla) -> Self {
+        Self {
+            fg,
+            bg,
+            ansi: if dark {
+                VSCODE_DARK_ANSI
+            } else {
+                VSCODE_LIGHT_ANSI
+            },
+        }
+    }
+
+    fn resolve(&self, color: CellColor, default: Hsla) -> Hsla {
+        match color {
+            CellColor::Default => default,
+            CellColor::Rgb(r, g, b) => rgb_hsla(r, g, b),
+            CellColor::Indexed(ix) => {
+                let (r, g, b) = xterm_rgb(ix, &self.ansi);
+                rgb_hsla(r, g, b)
+            }
+        }
+    }
+
+    fn highlight(&self, style: &CellStyle) -> HighlightStyle {
+        let (fg, bg) = if style.is_inverse_default() {
+            (self.bg, Some(self.fg))
+        } else {
+            let bg = (style.bg != CellColor::Default).then(|| self.resolve(style.bg, self.bg));
+            (self.resolve(style.fg, self.fg), bg)
+        };
+        HighlightStyle {
+            color: Some(if style.dim { fg.opacity(0.6) } else { fg }),
+            background_color: bg,
+            font_weight: style.bold.then_some(FontWeight::BOLD),
+            font_style: style.italic.then_some(FontStyle::Italic),
+            underline: style.underline.then(|| UnderlineStyle {
+                thickness: px(1.),
+                color: Some(fg),
+                wavy: false,
+            }),
+            ..HighlightStyle::default()
+        }
+    }
+}
+
+fn rgb_hsla(r: u8, g: u8, b: u8) -> Hsla {
+    gpui_kit::rgb((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)).into()
+}
+
+/// xterm-256 palette entry `ix`, with 0–15 from `ansi`.
+fn xterm_rgb(ix: u8, ansi: &[u32; 16]) -> (u8, u8, u8) {
+    match ix {
+        0..=15 => {
+            let c = ansi[ix as usize];
+            ((c >> 16) as u8, (c >> 8) as u8, c as u8)
+        }
+        16..=231 => {
+            let n = ix - 16;
+            let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            (level(n / 36), level((n / 6) % 6), level(n % 6))
+        }
+        _ => {
+            let v = 8 + (ix - 232) * 10;
+            (v, v, v)
+        }
+    }
+}
+
+/// Text and highlight runs for one row, with the cursor (char column) drawn
+/// as an inverted cell. Runs come back sorted and non-overlapping.
+fn row_highlights(
+    row: StyledRow,
+    cursor_col: Option<usize>,
+    colors: &TermColors,
+) -> (SharedString, Vec<(Range<usize>, HighlightStyle)>) {
+    let StyledRow { mut text, runs } = row;
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = runs
+        .iter()
+        .map(|(range, style)| (range.clone(), colors.highlight(style)))
+        .collect();
+    if let Some(col) = cursor_col {
+        // Pad so the cursor sits at its column.
+        let chars = text.chars().count();
+        if chars <= col {
+            text.extend(std::iter::repeat_n(' ', col + 1 - chars));
+        }
+        let start = text.char_indices().nth(col).map_or(text.len(), |(i, _)| i);
+        let end = text[start..]
+            .chars()
+            .next()
+            .map_or(text.len(), |c| start + c.len_utf8());
+        let under = runs
+            .iter()
+            .find(|(r, _)| r.start <= start && start < r.end)
+            .map(|(_, s)| colors.highlight(s));
+        let cell_fg = under.and_then(|h| h.color).unwrap_or(colors.fg);
+        let cell_bg = under.and_then(|h| h.background_color).unwrap_or(colors.bg);
+        let cursor = HighlightStyle {
+            color: Some(cell_bg),
+            background_color: Some(cell_fg),
+            ..under.unwrap_or_default()
+        };
+        let mut split = Vec::with_capacity(highlights.len() + 2);
+        for (range, style) in highlights {
+            if range.end <= start || range.start >= end {
+                split.push((range, style));
+                continue;
+            }
+            if range.start < start {
+                split.push((range.start..start, style));
+            }
+            if range.end > end {
+                split.push((end..range.end, style));
+            }
+        }
+        split.push((start..end, cursor));
+        split.sort_by_key(|(r, _)| r.start);
+        highlights = split;
+    }
+    if text.is_empty() {
+        // Non-breaking space keeps an empty row's height.
+        text.push('\u{00a0}');
+    }
+    (SharedString::from(text), highlights)
 }
 
 fn cap_prelude(prelude: &mut Vec<SharedString>) {
@@ -654,8 +823,11 @@ impl Render for TerminalPanel {
         self.cell = (cell_w, line_h);
         self.rem = rem;
         let viewport = self.viewport.clone();
-        let cursor_fg = cx.theme().background;
-        let cursor_bg = cx.theme().foreground;
+        let colors = TermColors::new(
+            cx.theme().is_dark(),
+            cx.theme().foreground,
+            cx.theme().background,
+        );
         let row_count = self.total_rows().max(1);
 
         v_flex()
@@ -787,63 +959,29 @@ impl Render for TerminalPanel {
                                 let start = range.start;
                                 let cursor = this.cursor_row();
                                 let mut texts = this.row_texts(range.clone());
-                                texts.resize(range.len(), SharedString::default());
+                                texts.resize(range.len(), StyledRow::default());
                                 texts
                                     .into_iter()
                                     .enumerate()
                                     .map(|(i, line)| {
                                         let ix = start + i;
-                                        let row = div()
+                                        let cursor_col = match cursor {
+                                            Some((cr, cc)) if cr == ix => Some(cc),
+                                            _ => None,
+                                        };
+                                        let (text, highlights) =
+                                            row_highlights(line, cursor_col, &colors);
+                                        div()
                                             .id(ElementId::NamedInteger(
                                                 SharedString::from(format!("term-line-{eid}")),
                                                 ix as u64,
                                             ))
                                             .h(line_h)
                                             .w_full()
-                                            .whitespace_nowrap();
-                                        match cursor {
-                                            Some((cr, cc)) if cr == ix => {
-                                                let chars: Vec<char> = line.chars().collect();
-                                                let mut before: String =
-                                                    chars.iter().take(cc).collect();
-                                                // Pad so the cursor sits at its column.
-                                                while before.chars().count() < cc {
-                                                    before.push(' ');
-                                                }
-                                                let at = chars.get(cc).copied().unwrap_or(' ');
-                                                let after: String =
-                                                    chars.iter().skip(cc + 1).collect();
-                                                row.child(
-                                                    h_flex()
-                                                        .when(!before.is_empty(), |r| {
-                                                            r.child(before)
-                                                        })
-                                                        .child(
-                                                            div()
-                                                                .bg(cursor_bg)
-                                                                .text_color(cursor_fg)
-                                                                .child(if at == ' ' {
-                                                                    "\u{00a0}".to_string()
-                                                                } else {
-                                                                    at.to_string()
-                                                                }),
-                                                        )
-                                                        .when(!after.is_empty(), |r| {
-                                                            r.child(after)
-                                                        }),
-                                                )
-                                            }
-                                            _ => {
-                                                // Non-breaking space keeps an empty
-                                                // row's height.
-                                                let shown = if line.is_empty() {
-                                                    SharedString::from("\u{00a0}")
-                                                } else {
-                                                    line
-                                                };
-                                                row.child(shown)
-                                            }
-                                        }
+                                            .whitespace_nowrap()
+                                            .child(
+                                                StyledText::new(text).with_highlights(highlights),
+                                            )
                                     })
                                     .collect::<Vec<_>>()
                             }),
@@ -893,15 +1031,19 @@ impl Render for TerminalPanel {
                         div()
                             .flex_1()
                             .min_w_0()
+                            // Monospace like the output, so typed commands
+                            // line up with what the shell prints.
+                            .font_family(cx.theme().mono_font_family.clone())
                             .child(Input::new(&self.input).appearance(false)),
                     ),
             )
     }
 }
 
-fn default_shell() -> CommandBuilder {
+fn default_shell(load_config: bool) -> CommandBuilder {
     #[cfg(windows)]
     {
+        let _ = load_config;
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
         CommandBuilder::new(shell)
     }
@@ -909,16 +1051,23 @@ fn default_shell() -> CommandBuilder {
     {
         let shell = crate::term_session::user_shell();
         let mut cmd = CommandBuilder::new(&shell);
-        // Skip rc/profile so a broken ~/.bashrc cannot kill the session under
-        // headless / Xvfb runs; still interactive for a prompt + job control.
-        if shell.ends_with("/bash") || shell.ends_with("bash") {
-            cmd.arg("--norc");
-            cmd.arg("--noprofile");
+        let is_bash = shell.ends_with("bash");
+        if !load_config {
+            // Clean shell: a broken rc cannot kill the session.
+            if is_bash {
+                cmd.arg("--norc");
+                cmd.arg("--noprofile");
+            } else if shell.ends_with("zsh") {
+                cmd.arg("-f");
+            }
+            cmd.env("PS1", "$ ");
         }
+        // Interactive (prompt, job control, rc), not a login shell — VS
+        // Code's Linux default.
         cmd.arg("-i");
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("PS1", "$ ");
+        cmd.env("TERM_PROGRAM", "malgel");
         cmd
     }
 }

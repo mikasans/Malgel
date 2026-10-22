@@ -119,6 +119,12 @@ lag_since() {
   tail -n +"$(($1 + 1))" "$APP_LOG" | sed -n 's/.*ui_lag max=\([0-9.]*\)ms.*/\1/p' |
     sort -g | tail -1 | awk '{printf "%.0f", $1}'
 }
+# 95th percentile of the per-second worst ui_lag since log line $1: an upper
+# bound on how long a keystroke waits for the UI thread.
+lag_p95_since() {
+  tail -n +"$(($1 + 1))" "$APP_LOG" | sed -n 's/.*ui_lag max=\([0-9.]*\)ms.*/\1/p' | sort -g |
+    awk '{v[NR] = $1} END {if (!NR) {print 0; exit} i = int(NR * 0.95 + 0.5); if (i < 1) i = 1; if (i > NR) i = NR; printf "%.0f", v[i]}'
+}
 PEAK=0
 sample_rss() { local r; r=$(rss_mib); ((r > PEAK)) && PEAK=$r; }
 watch_rss() { # run a sampler until $1 exists or $2 seconds pass
@@ -329,14 +335,15 @@ if want 3; then
     || { record s3-ctrl-l FAIL "shell confused after Ctrl+L"; recover; }
 fi
 
-# ---- P2. 10s `yes` flood: CPU, RSS, Ctrl+P latency, interrupt-to-prompt ---------
+# ---- P2. `yes` flood (P2_SECS, default 30): CPU, RSS, Ctrl+P latency, ^C ------
 cpu_ticks() { awk '{print $14 + $15}' "/proc/$APP_PID/stat"; }
 crop() { import -window root -crop 700x160+450+30 "$ART_DIR/$1.png" 2>/dev/null; }
+P2_SECS="${P2_SECS:-30}"
 if want p2; then
   lm=$(log_mark); r0=$(rss_mib); PEAK=$r0
   run "yes $TAG"; sleep 1
   c0=$(cpu_ticks); t0=$(now_ms)
-  for i in $(seq 1 25); do sample_rss; sleep 0.2; done
+  for i in $(seq 1 $((P2_SECS * 5 / 2))); do sample_rss; sleep 0.2; done
   plateau=$(rss_mib)
   # Ctrl+P (Quick Open) while flooding: time until the palette area changes.
   crop p2-before; tp=$(now_ms); key ctrl+p; opened=no
@@ -347,7 +354,7 @@ if want p2; then
   done
   tp1=$(now_ms); key Escape; sleep 0.3
   # Back into the terminal (Escape returns focus to the editor).
-  for i in $(seq 1 25); do sample_rss; sleep 0.2; done
+  for i in $(seq 1 $((P2_SECS * 5 / 2))); do sample_rss; sleep 0.2; done
   c1=$(cpu_ticks); t1=$(now_ms)
   hz=$(getconf CLK_TCK)
   cpu=$(awk -v a="$c0" -v b="$c1" -v t0="$t0" -v t1="$t1" -v hz="$hz" 'BEGIN{printf "%.0f", (b-a)/hz/((t1-t0)/1000)*100}')
@@ -358,11 +365,11 @@ if want p2; then
   wait_for 3 gone "[y]es $TAG"
   gone=$(pgrep -f "yes $TAG" >/dev/null && echo n || echo y); tg=$(now_ms)
   mark=$(fresh_marker p2.done); run "touch $mark"; wait_for 5 test -e "$mark"; tm=$(now_ms)
-  lag=$(lag_since "$lm")
+  lag=$(lag_since "$lm"); p95=$(lag_p95_since "$lm")
   status=PASS
   [[ $gone == y && $opened == yes ]] || status=FAIL
-  ((cpu > 100)) && status=FAIL
-  record p2-yes-10s "$status" "cpu=${cpu}% rss=${r0}->${PEAK}MiB (plateau ${plateau}) ctrl+p=$([[ $opened == yes ]] && echo "$((tp1 - tp))ms" || echo never) ^C->yes-gone=$((tg - ti))ms ^C->prompt=$((tm - ti))ms ui_lag_max=${lag}ms"
+  ((cpu > 100 || p95 > 100)) && status=FAIL
+  record p2-yes-flood "$status" "${P2_SECS}s cpu=${cpu}% rss=${r0}->${PEAK}MiB (plateau ${plateau}) ctrl+p=$([[ $opened == yes ]] && echo "$((tp1 - tp))ms" || echo never) ^C->yes-gone=$((tg - ti))ms ^C->prompt=$((tm - ti))ms ui_lag_p95=${p95}ms ui_lag_max=${lag}ms"
   [[ $gone == y ]] || { pkill -f "yes $TAG"; recover; }
 fi
 

@@ -8176,6 +8176,7 @@ impl Render for Workspace {
                 },
                 focus_mode,
                 rem,
+                window.viewport_size().height,
                 cx,
             ))
             .when(!focus_mode, |this| this.child(self.render_status_bar(cx)))
@@ -9202,6 +9203,7 @@ impl Workspace {
         main: impl IntoElement,
         focus_mode: bool,
         rem: Pixels,
+        viewport_h: Pixels,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let show_problems = AppSettings::get(cx).problems_panel && !focus_mode;
@@ -9248,7 +9250,12 @@ impl Workspace {
                     )
                     .into_any_element()
             } else {
-                let term_h = rems(12.).to_pixels(rem);
+                // VS Code opens the panel at about a third of the window; a
+                // fixed 12rem left ~4 rows of output. Drag the divider to
+                // resize (up to 80% of the window).
+                let min_h = rems(6.).to_pixels(rem);
+                let max_h = (viewport_h * 0.8).max(rems(28.).to_pixels(rem));
+                let term_h = (viewport_h / 3.).max(rems(12.).to_pixels(rem)).min(max_h);
                 v_resizable("center-with-terminal")
                     .child(
                         resizable_panel()
@@ -9258,7 +9265,7 @@ impl Workspace {
                     .child(
                         resizable_panel()
                             .size(term_h)
-                            .size_range(rems(6.).to_pixels(rem)..rems(28.).to_pixels(rem))
+                            .size_range(min_h..max_h)
                             .child(self.render_terminal_area(cx)),
                     )
                     .into_any_element()
