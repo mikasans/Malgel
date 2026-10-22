@@ -1247,9 +1247,17 @@ impl FileTree {
     fn render_rows(
         &mut self,
         range: Range<usize>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<gpui_kit::AnyElement> {
+        // While the tree has the keyboard, the row the arrow keys move from
+        // wears the focus ring, as VS Code's Explorer draws it.
+        let keyboard_row = self
+            .focus_handle
+            .contains_focused(window, cx)
+            .then(|| self.anchor.clone())
+            .flatten();
+        let ring = cx.theme().ring;
         let theme = cx.theme();
         let (hover, active_bg, muted, fg, marker) = (
             theme.list_hover,
@@ -1311,6 +1319,12 @@ impl FileTree {
                         .pr_2()
                         .gap_1p5()
                         .rounded_md()
+                        .border_1()
+                        .border_color(if keyboard_row.as_ref() == Some(&entry.path) {
+                            ring
+                        } else {
+                            gpui_kit::transparent_black()
+                        })
                         .text_sm()
                         .cursor_pointer()
                         .when(is_active, |this| {
@@ -1588,8 +1602,7 @@ impl FileTree {
 }
 
 impl Render for FileTree {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let _focused = self.focus_handle.contains_focused(window, cx);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let name = self
             .root
