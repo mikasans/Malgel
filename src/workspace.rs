@@ -3647,16 +3647,19 @@ impl Workspace {
     }
 
     fn tree_open(&mut self, _: &OpenInTree, window: &mut Window, cx: &mut Context<Self>) {
-        // VS Code-ish: Enter on a file starts rename; on a folder, expand/collapse.
-        // Double-click still opens files from the tree row click handler.
-        let Some((_, is_dir)) = self.file_tree.read(cx).single_selection() else {
+        // Enter on a folder opens or closes it. On a file it does what
+        // VS Code's Enter does there: open it on Linux and Windows (F2
+        // renames), rename it on macOS.
+        let Some((path, is_dir)) = self.file_tree.read(cx).single_selection() else {
             return;
         };
         if is_dir {
             self.file_tree
                 .update(cx, |tree, cx| tree.open_selection(cx));
-        } else {
+        } else if cfg!(target_os = "macos") {
             self.tree_rename(&RenameInTree, window, cx);
+        } else {
+            self.open_paths(vec![path], Placement::NewTab, window, cx);
         }
     }
 

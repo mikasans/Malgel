@@ -534,9 +534,8 @@ impl FileTree {
         }
     }
 
-    /// Enter on a folder opens or closes it. Files are renamed from the
-    /// workspace's Enter binding (VS Code's rename-on-Enter habit); a double
-    /// click still opens them from the row click handler.
+    /// Enter on a folder opens or closes it. Files are handled by the
+    /// workspace's Enter binding (open, or rename on macOS).
     pub fn open_selection(&mut self, cx: &mut Context<Self>) {
         let Some(ix) = self.anchor_row() else {
             return;
@@ -546,8 +545,9 @@ impl FileTree {
         if is_dir {
             self.toggle(path, cx);
         }
-        // Files: Enter is handled upstream as RenameInTree; keep this a no-op
-        // so callers that only want folder expand/collapse stay safe.
+        // Files: Enter is handled upstream (open, or rename on macOS); keep
+        // this a no-op so callers that only want folder expand/collapse stay
+        // safe.
     }
 
     // ---------------------------------------------------------------------
