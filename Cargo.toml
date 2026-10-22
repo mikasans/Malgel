@@ -170,7 +170,9 @@ strip = true
 # frame, widens the fold column (~24px hitbox), and adds toggle_fold / fold_at
 # / unfold_line_at. It also stops an idle caret blinking after 10 s (as GTK's
 # gtk-cursor-blink-timeout): each blink repainted the whole window, ~20% of a
-# core on a software renderer while nobody typed. Remove when upstream ships
+# core on a software renderer while nobody typed. A keystroke while the caret
+# already shows no longer repaints (it was one whole-window frame per key).
+# Remove when upstream ships
 # the same.
 [patch.crates-io]
 gpui-base = { git = "https://github.com/mikasans/gpui-kit", branch = "malgel-0.7.0" }

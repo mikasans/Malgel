@@ -2830,7 +2830,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.7.0"
-source = "git+https://github.com/mikasans/gpui-kit?branch=malgel-0.7.0#e22e1580775414c3c1bcddab75a8faaa8453bf55"
+source = "git+https://github.com/mikasans/gpui-kit?branch=malgel-0.7.0#6aac6eda127a32d01882e02247406182bc5a063b"
 dependencies = [
  "aho-corasick",
  "anyhow",
