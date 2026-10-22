@@ -1,0 +1,21 @@
+{
+  "_comment": "Upper bounds on the median of perf_scenes.sh runs. A metric over its max fails the gate unless blocking is false (then it only warns; PERF_STRICT=1 makes it block).",
+  "first_frame_ms": {
+    "max": 1500
+  },
+  "editor_input_p95_ms": {
+    "max": 150
+  },
+  "terminal_input_p95_ms": {
+    "max": 150
+  },
+  "ctrl_c_to_prompt_ms": {
+    "max": 300
+  },
+  "rss_peak_mib": {
+    "max": 600
+  },
+  "idle_cpu_pct": {
+    "max": 5
+  }
+}

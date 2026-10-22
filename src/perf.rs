@@ -170,6 +170,27 @@ pub fn release_free_memory() {
     }
 }
 
+/// `MALGEL_PERF_INJECT_SLEEP_MS=N` (only with `MALGEL_PERF=1`): stall every
+/// workspace frame by N ms. A deliberate regression, so the perf gate
+/// (scripts/e2e/perf_scenes.sh) can be shown to trip; never set otherwise.
+pub fn injected_frame_delay() {
+    static DELAY: OnceLock<Option<Duration>> = OnceLock::new();
+    let delay = DELAY.get_or_init(|| {
+        if !enabled() {
+            return None;
+        }
+        parse_inject_ms(std::env::var("MALGEL_PERF_INJECT_SLEEP_MS").ok().as_deref())
+    });
+    if let Some(delay) = delay {
+        thread::sleep(*delay);
+    }
+}
+
+fn parse_inject_ms(value: Option<&str>) -> Option<Duration> {
+    let ms: u64 = value?.trim().parse().ok()?;
+    (ms > 0).then(|| Duration::from_millis(ms.min(5_000)))
+}
+
 // ---------------------------------------------------------------------------
 // Quiet status-bar pulse (RSS · CPU). One background thread; 1.5s sample.
 // ---------------------------------------------------------------------------
@@ -307,6 +328,21 @@ mod pulse_tests {
         assert_eq!(format_rss_compact(Some(512)), Some("512K".into()));
         assert_eq!(format_rss_compact(Some(128 * 1024)), Some("128M".into()));
         assert_eq!(format_rss_compact(Some(1536 * 1024)), Some("1.5G".into()));
+    }
+
+    #[test]
+    fn injected_delay_parses_only_positive_millis() {
+        assert_eq!(parse_inject_ms(None), None);
+        assert_eq!(parse_inject_ms(Some("0")), None);
+        assert_eq!(parse_inject_ms(Some("x")), None);
+        assert_eq!(
+            parse_inject_ms(Some(" 120 ")),
+            Some(Duration::from_millis(120))
+        );
+        assert_eq!(
+            parse_inject_ms(Some("99999")),
+            Some(Duration::from_millis(5_000))
+        );
     }
 
     #[test]

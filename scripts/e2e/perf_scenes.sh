@@ -1,115 +1,126 @@
 #!/usr/bin/env bash
-# Exercise large Typst / Mermaid, multi-tab, preview switch, cold start under Xvfb.
+#
+# Performance regression gate: runs Malgel under its own Xvfb N times (3 by
+# default), measures each run with perf_probe.py, and writes the medians to
+# perf.json. Exits non-zero when a blocking threshold in perf_thresholds.json
+# is exceeded.
+#
+#     scripts/e2e/perf_scenes.sh                 # release binary, 3 runs
+#     PERF_RUNS=5 scripts/e2e/perf_scenes.sh
+#     PERF_THRESHOLDS=my.json scripts/e2e/perf_scenes.sh
+#     PERF_STRICT=1 ...                          # non-blocking checks block too
+#     E2E_GPU=1 ...                              # Vulkan (lavapipe when found)
+#
+# Metrics (see scripts/e2e/README.md): first frame / settled, Typst 12-page
+# completion, RSS peak/final, editor and terminal-composer input latency
+# p50/p95, terminal throughput (seq 1 200000, cat 20MB), Ctrl+C-to-prompt,
+# idle CPU (window in the background; with focus is reported too).
+#
+# The run owns everything it touches: a display number nobody holds, its own
+# Xvfb (killed by PID, never by name), and a throwaway HOME/XDG per run.
+
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+if [[ -z "${E2E_INNER:-}" ]]; then
+  E2E_INNER=1 exec timeout --kill-after=10 "${E2E_TIMEOUT:-900}" "$0" "$@"
+fi
+trap 'echo "FAIL: line $LINENO: $BASH_COMMAND (exit $?)" >&2' ERR
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
 BIN="${MALGEL_BIN:-$ROOT/target/release/malgel}"
 ART="${E2E_ARTIFACTS:-$ROOT/target/e2e-artifacts/perf-scenes}"
-DISP="${E2E_DISPLAY:-:98}"
+RUNS="${PERF_RUNS:-3}"
+THRESHOLDS="${PERF_THRESHOLDS:-$ROOT/scripts/e2e/perf_thresholds.json}"
+[[ -x "$BIN" ]] || { echo "missing $BIN — cargo build --release first" >&2; exit 2; }
+for tool in Xvfb xdotool python3; do
+  command -v "$tool" >/dev/null || { echo "$tool not installed" >&2; exit 2; }
+done
 mkdir -p "$ART"
-[[ -x "$BIN" ]] || { echo "missing $BIN"; exit 1; }
+rm -f "$ART"/run-*.json "$ART"/perf.json
 
+TMP_ROOT="$(mktemp -d -t malgel-perf.XXXXXX)"
+XVFB_PID=""
 cleanup() {
-  [[ -n "${APP_PID:-}" ]] && kill "$APP_PID" 2>/dev/null || true
-  [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
-  wait 2>/dev/null || true
+  [[ -n "$XVFB_PID" ]] && kill "$XVFB_PID" 2>/dev/null || true
+  [[ -n "$XVFB_PID" ]] && wait "$XVFB_PID" 2>/dev/null || true
+  rm -rf "$TMP_ROOT"
+  return 0
 }
 trap cleanup EXIT
 
-pkill -f "Xvfb $DISP" 2>/dev/null || true
-sleep 0.2
-Xvfb "$DISP" -screen 0 1440x900x24 -ac >/dev/null 2>&1 &
-XVFB_PID=$!
-export DISPLAY="$DISP"
-export LIBGL_ALWAYS_SOFTWARE=1
-export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-export MALGEL_PERF=1
-export RUST_LOG=malgel=info,malgel::typst_live=info
-export XDG_CONFIG_HOME="$ART/config"
-export XDG_DATA_HOME="$ART/data"
-export XDG_CACHE_HOME="$ART/cache"
-rm -rf "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
-mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
-
-LOG="$ART/scenes.log"
-: >"$LOG"
-SCENE_DIR="$ROOT/samples/perf-scenes"
-FIX_TYP="$SCENE_DIR/multi-page.typ"
-FIX_MD="$SCENE_DIR/large-mermaid.md"
-FIX_HEAVY="$SCENE_DIR/heavy-budget.typ"
-FIX_MAIN="${PERF_FIX:-$ROOT/samples/perf-preview/main.typ}"
-
-echo "=== cold open typst + preview switch ==="
-"$BIN" --new-instance "$FIX_TYP" "$FIX_MD" "$FIX_MAIN" >>"$LOG" 2>&1 &
-APP_PID=$!
-deadline=$((SECONDS + 70))
-got_first=0
-while kill -0 "$APP_PID" 2>/dev/null && (( SECONDS < deadline )); do
-  if grep -q 'first_typst_preview_pages_applied\|malgel-perf: window_' "$LOG" 2>/dev/null; then
-    got_first=1
-    break
-  fi
-  sleep 0.15
-done
-echo "boot_marker=$got_first"
-
-if command -v xdotool >/dev/null; then
-  sleep 1.2
-  WID=$(xdotool search --name Malgel 2>/dev/null | head -1 || true)
-  if [[ -n "${WID:-}" ]]; then
-    xdotool windowactivate --sync "$WID" 2>/dev/null || true
-    # Preview-only, editor-only, split — layout churn.
-    for key in ctrl+3 ctrl+1 ctrl+2 ctrl+shift+v; do
-      xdotool key --window "$WID" "$key" 2>/dev/null || true
-      sleep 0.45
-    done
-    # Multi-tab: next/prev
-    xdotool key --window "$WID" ctrl+Tab 2>/dev/null || true
-    sleep 0.35
-    xdotool key --window "$WID" ctrl+shift+Tab 2>/dev/null || true
-    sleep 0.35
-    # Terminal summon + flood output
-    xdotool key --window "$WID" ctrl+grave 2>/dev/null || true
-    sleep 0.5
-    xdotool type --window "$WID" --delay 8 'seq 1 4000 | sed "s/^/line /"' 2>/dev/null || true
-    xdotool key --window "$WID" Return 2>/dev/null || true
-    sleep 2.5
-    # Open heavy budget typ via quick open is hard; instead Ctrl+P type path
-    xdotool key --window "$WID" ctrl+p 2>/dev/null || true
-    sleep 0.4
-    xdotool key --window "$WID" Escape 2>/dev/null || true
-    sleep 0.3
+start_xvfb() {
+  local n
+  if [[ -n "${E2E_DISPLAY:-}" ]]; then
+    DISP="$E2E_DISPLAY"
   else
-    echo "WARN: no Malgel window for xdotool"
+    for n in $(seq 170 240); do
+      [[ -e "/tmp/.X${n}-lock" || -e "/tmp/.X11-unix/X${n}" ]] || break
+    done
+    DISP=":$n"
   fi
-fi
+  Xvfb "$DISP" -screen 0 1440x900x24 +extension GLX +render -nolisten tcp \
+    >"$ART/xvfb.log" 2>&1 &
+  XVFB_PID=$!
+  for _ in $(seq 1 100); do
+    DISPLAY="$DISP" xdotool getdisplaygeometry >/dev/null 2>&1 && return 0
+    kill -0 "$XVFB_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill "$XVFB_PID" 2>/dev/null || true
+  XVFB_PID=""
+  return 1
+}
+start_xvfb || start_xvfb || { cat "$ART/xvfb.log" >&2; echo "Xvfb did not start" >&2; exit 2; }
+export DISPLAY="$DISP"
+echo "display $DISPLAY (Xvfb pid $XVFB_PID)"
 
-sleep 1
-rss=$(awk '/VmRSS:/ {print $2}' /proc/$APP_PID/status 2>/dev/null || echo 0)
-echo "rss_kib=$rss"
-grep -E 'malgel-perf:' "$LOG" | tee "$ART/perf-lines.txt" | tail -40 || true
-# Budget gate should not auto-render 22-page heavy without consent when opened;
-# multi-page (12) stays under 150 MiB.
+if [[ "${E2E_GPU:-0}" == "1" ]]; then
+  # Vulkan: prefer Mesa's lavapipe where it is installed. The file name
+  # differs by distro (lvp_icd.json on Debian, lvp_icd.x86_64.json on Fedora).
+  if [[ -z "${VK_ICD_FILENAMES:-}" ]]; then
+    for icd in /usr/share/vulkan/icd.d/lvp_icd*.json /etc/vulkan/icd.d/lvp_icd*.json; do
+      [[ -e "$icd" ]] && { export VK_ICD_FILENAMES="$icd"; break; }
+    done
+  fi
+  echo "renderer: Vulkan (VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-system default})"
+else
+  # Software GL: Xvfb has no DRI3, so Vulkan present would not paint.
+  export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+  export VK_ICD_FILENAMES="$TMP_ROOT/no-such-icd.json"
+  echo "renderer: software GL (llvmpipe)"
+fi
+export MALGEL_PERF=1
+export RUST_LOG="${RUST_LOG:-malgel=info}"
+
+# The render-budget heuristic still has to keep the 12-page sample under the
+# consent line and the 22-page one over it.
 python3 - <<'PY'
 from pathlib import Path
-import sys
-sys.path.insert(0, ".")
-# Inline estimate check matching render_budget heuristics
-def estimate_typst(source: str):
-    pagebreaks = source.count("#pagebreak")
-    length_pages = max(len(source)//2500, 1)
-    pages = max(pagebreaks + 1, length_pages)
-    return pages * 7.7
-
-multi = Path("samples/perf-scenes/multi-page.typ").read_text()
-heavy = Path("samples/perf-scenes/heavy-budget.typ").read_text()
-em, eh = estimate_typst(multi), estimate_typst(heavy)
-print(f"estimate_multi_mib={em:.1f} estimate_heavy_mib={eh:.1f}")
-assert em < 150, em
-assert eh >= 150, eh
-print("budget_estimates_ok")
+def estimate(src):
+    return max(src.count("#pagebreak") + 1, max(len(src) // 2500, 1)) * 7.7
+em = estimate(Path("samples/perf-scenes/multi-page.typ").read_text())
+eh = estimate(Path("samples/perf-scenes/heavy-budget.typ").read_text())
+assert em < 150 <= eh, (em, eh)
+print(f"budget estimates ok ({em:.0f} / {eh:.0f} MiB)")
 PY
 
-kill "$APP_PID" 2>/dev/null || true
-wait "$APP_PID" 2>/dev/null || true
-APP_PID=
-echo "DONE $ART"
+declare -a RUN_FILES=()
+for i in $(seq 1 "$RUNS"); do
+  echo "=== run $i/$RUNS ==="
+  RUN_TMP="$TMP_ROOT/run-$i"
+  mkdir -p "$RUN_TMP/home" "$ART/run-$i"
+  mkdir -m 700 "$RUN_TMP/xdg"
+  HOME="$RUN_TMP/home" XDG_CONFIG_HOME="$RUN_TMP/home/.config" \
+    XDG_DATA_HOME="$RUN_TMP/home/.local/share" XDG_CACHE_HOME="$RUN_TMP/home/.cache" \
+    XDG_RUNTIME_DIR="$RUN_TMP/xdg" \
+    python3 "$ROOT/scripts/e2e/perf_probe.py" run --bin "$BIN" --tmp "$RUN_TMP" \
+      --art "$ART/run-$i" --out "$ART/run-$i.json"
+  RUN_FILES+=("$ART/run-$i.json")
+done
+
+echo "=== gate ($THRESHOLDS) ==="
+status=0
+python3 "$ROOT/scripts/e2e/perf_probe.py" gate --thresholds "$THRESHOLDS" \
+  --out "$ART/perf.json" "${RUN_FILES[@]}" || status=$?
+echo "perf.json: $ART/perf.json"
+exit "$status"

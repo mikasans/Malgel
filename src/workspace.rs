@@ -7690,6 +7690,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::injected_frame_delay();
         self.update_window_title(window, cx);
         // Keyboard commands need a focused element inside the workspace; if
         // focus was lost (e.g. its element left the layout), take it back.

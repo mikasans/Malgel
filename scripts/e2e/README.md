@@ -89,3 +89,39 @@ a frame land before each screenshot — raise it on a slow machine).
 
 A passing run prints `PASS` and the list of screenshots; any failed check
 exits non-zero with the reason.
+
+## Performance gate
+
+`perf_scenes.sh` is a regression gate, not a demo: it starts its own Xvfb
+(on a display number nobody holds, killed by PID on the way out), runs the
+release binary three times with a fresh HOME each time, and has
+`perf_probe.py` measure every run from the outside — XTest key events in,
+root-window read-backs (XGetImage, every few ms) out. The medians land in
+`target/e2e-artifacts/perf-scenes/perf.json` together with each run's
+numbers and screenshots.
+
+| Metric | How |
+|---|---|
+| `first_frame_ms`, `settled_ms` | launch → first changed pixel; → last change before 700 ms of stillness |
+| `typst_done_ms` | the 12-page sample's `first_typst_preview_pages_applied` mark |
+| `editor_input_p50_ms` / `p95` | key → changed frame, 21 keys typed into Markdown |
+| `terminal_input_p50_ms` / `p95` | the same in the terminal composer |
+| `terminal_seq_ms`, `terminal_cat20mb_ms` | Enter → shell done and panel still (`seq 1 200000`, `cat` of 20 MB) |
+| `ctrl_c_to_prompt_ms` | Ctrl+C during `sleep` → process gone and transcript repainted |
+| `idle_cpu_pct` | app + children CPU over 5 s with the window in the background |
+| `idle_cpu_focused_pct` | the same with focus (caret blinking); reported, not gated |
+| `rss_peak_mib`, `rss_final_mib` | VmHWM / VmRSS at the end |
+
+`perf_thresholds.json` holds the budget. A median over a blocking `max`
+exits 1; `"blocking": false` only warns (`PERF_STRICT=1` makes it block).
+
+```sh
+cargo build --release
+scripts/e2e/perf_scenes.sh                        # software GL (CI)
+E2E_GPU=1 scripts/e2e/perf_scenes.sh              # Vulkan, lavapipe autodetected
+python3 scripts/e2e/perf_probe.py compare a/perf.json b/perf.json   # ±15%
+```
+
+To prove the gate bites, `MALGEL_PERF_INJECT_SLEEP_MS=200` stalls every
+frame by 200 ms (honoured only under `MALGEL_PERF=1`, which the script sets)
+and the run fails on first frame and input latency.

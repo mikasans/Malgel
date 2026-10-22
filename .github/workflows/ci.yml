@@ -96,6 +96,32 @@ jobs:
             target/e2e-terminal/*.log
           if-no-files-found: warn
 
+  perf:
+    # Performance regression gate: medians of three runs against
+    # scripts/e2e/perf_thresholds.json (see scripts/e2e/README.md).
+    name: perf gate (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system and GUI test libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 \
+            fonts-noto-cjk xvfb xdotool imagemagick libgl1-mesa-dri libglx-mesa0 libegl1 libegl-mesa0 libgles2 libgbm1 \
+            fonts-dejavu-core libxtst6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: perf-release
+      - run: cargo build --release --locked
+      - run: scripts/e2e/perf_scenes.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-scenes
+          path: target/e2e-artifacts/perf-scenes
+          if-no-files-found: ignore
+
   windows:
     runs-on: windows-latest
     env:
