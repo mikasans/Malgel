@@ -418,6 +418,12 @@ fn pulse_needs_repaint(generation: u64, shown: u64, window_active: bool) -> bool
     window_active && generation != shown
 }
 
+/// Where a reopened tab goes: where it was, or last when fewer tabs are open
+/// now than then.
+fn reopen_position(was: usize, open: usize) -> usize {
+    was.min(open.saturating_sub(1))
+}
+
 /// The next hit to show after `current`, `forward` or back, wrapping.
 fn step_hit(current: Option<usize>, len: usize, forward: bool) -> Option<usize> {
     if len == 0 {
@@ -612,7 +618,7 @@ pub struct Workspace {
     approved_opens: HashMap<PathBuf, OpenMode>,
     /// The paths of editors closed recently, newest last, so Ctrl+Shift+T
     /// can bring the last one back the way VS Code does.
-    closed_documents: Vec<PathBuf>,
+    closed_documents: Vec<(PathBuf, usize)>,
     /// Tabs held open: Close Other Tabs and Close All Editors leave them
     /// alone, and their close box becomes a pin, as in VS Code.
     pinned: HashSet<EntityId>,
@@ -668,6 +674,11 @@ pub struct Workspace {
     terminal_subscriptions: Vec<Subscription>,
     /// Second editor group: another open document beside or below the active one.
     editor_split: Option<EditorSplit>,
+    /// Pending copy of an edited buffer into the other views of its file
+    /// (Split Editor shows one file twice), debounced while typing.
+    twin_sync: Option<Task<()>>,
+    /// `(revision, dirty)` of each view as last copied to its twins.
+    twin_synced: HashMap<EntityId, (usize, bool)>,
     /// Debounce for title-bar path copy toasts.
     last_path_copy: Option<std::time::Instant>,
     _subscriptions: Vec<Subscription>,
@@ -887,6 +898,8 @@ impl Workspace {
             terminal_maximized: false,
             terminal_subscriptions,
             editor_split: None,
+            twin_sync: None,
+            twin_synced: HashMap::new(),
             last_path_copy: None,
             _subscriptions: subscriptions,
         };
@@ -1207,6 +1220,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let subscriptions = vec![
+            // A file shown twice (Split Editor) stays one buffer: what is
+            // typed into one view reaches the other.
+            cx.observe_in(doc, window, |this, doc, window, cx| {
+                this.schedule_twin_sync(doc, window, cx);
+            }),
             cx.observe(doc, |this, doc, cx| {
                 // Editing a file takes it out of the preview slot: from then
                 // on it keeps a tab of its own, as in VS Code.
@@ -1248,9 +1266,10 @@ impl Workspace {
         };
         // Remember where it was, so Reopen Closed Editor can bring it back.
         if let Some(path) = self.documents[ix].read(cx).path().cloned() {
-            self.remember_closed(path);
+            self.remember_closed(path, ix);
         }
         let doc = self.documents.remove(ix);
+        self.twin_synced.remove(&id);
         doc.update(cx, |doc, _| doc.discard_recovery());
         self.document_subscriptions
             .retain(|(subscribed, _)| *subscribed != id);
@@ -1387,7 +1406,7 @@ impl Workspace {
             && self.document_index(id).is_some()
         {
             self.remove_document(id, window, cx);
-            self.closed_documents.retain(|closed| closed != path);
+            self.closed_documents.retain(|(closed, _)| closed != path);
         }
     }
 
@@ -1545,12 +1564,12 @@ impl Workspace {
         self.nav_index = self.nav_history.len().saturating_sub(1);
     }
 
-    /// Remember a closed editor's file for Reopen Closed Editor, newest
-    /// last. A path that is already in the list moves to the end.
-    fn remember_closed(&mut self, path: PathBuf) {
+    /// Remember a closed editor's file and tab position for Reopen Closed
+    /// Editor, newest last. A path that is already in the list moves to the end.
+    fn remember_closed(&mut self, path: PathBuf, ix: usize) {
         self.closed_documents
-            .retain(|remembered| remembered != &path);
-        self.closed_documents.push(path);
+            .retain(|(remembered, _)| remembered != &path);
+        self.closed_documents.push((path, ix));
         if self.closed_documents.len() > 20 {
             self.closed_documents.remove(0);
         }
@@ -3359,9 +3378,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        while let Some(path) = self.closed_documents.pop() {
+        while let Some((path, ix)) = self.closed_documents.pop() {
             if path.is_file() {
-                self.open_paths(vec![path], Placement::Default, window, cx);
+                let before = self.documents.len();
+                self.open_paths(vec![path.clone()], Placement::Default, window, cx);
+                // Back where it was in the tab strip, as VS Code reopens it.
+                // The tab (or its loading stand-in) is in place by now.
+                if self.documents.len() > before
+                    && let Some(from) = self
+                        .documents
+                        .iter()
+                        .rposition(|doc| doc.read(cx).path() == Some(&path))
+                {
+                    let to = reopen_position(ix, self.documents.len());
+                    if from != to {
+                        let gap = if to > from { to + 1 } else { to };
+                        self.move_tab(from, gap, window, cx);
+                    }
+                }
                 return;
             }
         }
@@ -6283,18 +6317,41 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Split Editor (Ctrl+\\): a second view of the file that is open, the
+    /// way VS Code splits the active editor. The new view is a tab of its
+    /// own beside the original, and edits in either reach the other.
     fn open_editor_split(&mut self, vertical: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.documents.is_empty() {
             return;
         }
-        // Prefer a different open tab; otherwise mirror the active document
-        // (VS Code opens a second view of the same file).
-        let other = if self.documents.len() == 1 {
-            self.active
-        } else if self.active > 0 {
-            self.active - 1
+        let active = self.active_document().clone();
+        let path = active.read(cx).path().cloned();
+        let already = self.editor_split.is_some_and(|split| {
+            split.vertical == vertical
+                && path.is_some()
+                && self
+                    .documents
+                    .get(split.other)
+                    .is_some_and(|other| other.read(cx).path() == path.as_ref())
+        });
+        if already {
+            self.focus_active(window, cx);
+            return;
+        }
+        let other = if active.read(cx).is_media() {
+            // A viewer cannot be shown twice; split with another tab.
+            if self.documents.len() == 1 {
+                return;
+            }
+            if self.active > 0 { self.active - 1 } else { 1 }
         } else {
-            1
+            let copy = active.update(cx, |doc, cx| doc.duplicate(window, cx));
+            let copy_cursor = active.read(cx).cursor(cx);
+            copy.update(cx, |doc, cx| doc.set_cursor(copy_cursor, window, cx));
+            self.watch_document(&copy, window, cx);
+            let at = self.active + 1;
+            self.documents.insert(at, copy);
+            at
         };
         self.editor_split = Some(EditorSplit { other, vertical });
         // Probe #15: nested Layout::Split (edit|preview) inside each group needs
@@ -6305,8 +6362,62 @@ impl Workspace {
             settings.layout = Layout::Editor;
         });
         self.tab_split_preview = None;
+        self.sync_preview_pin_roles(cx);
         self.focus_active(window, cx);
         cx.notify();
+    }
+
+    /// The views of the same file as `doc`, other than `doc` itself.
+    fn twins_of(&self, doc: &Entity<DocumentView>, cx: &App) -> Vec<Entity<DocumentView>> {
+        let Some(path) = doc.read(cx).path() else {
+            return Vec::new();
+        };
+        let id = doc.entity_id();
+        self.documents
+            .iter()
+            .filter(|other| other.entity_id() != id && other.read(cx).path() == Some(path))
+            .cloned()
+            .collect()
+    }
+
+    /// After a change in the view being typed into, copy its buffer to the
+    /// file's other views once typing pauses.
+    fn schedule_twin_sync(
+        &mut self,
+        doc: Entity<DocumentView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = {
+            let view = doc.read(cx);
+            if view.is_media() || !view.editor().focus_handle(cx).is_focused(window) {
+                return;
+            }
+            (view.revision(), view.is_dirty())
+        };
+        if self.twin_synced.get(&doc.entity_id()) == Some(&key)
+            || self.twins_of(&doc, cx).is_empty()
+        {
+            return;
+        }
+        self.twin_sync = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            _ = this.update_in(cx, |this, window, cx| {
+                let (text, dirty, saved) = doc.read(cx).mirror_state(cx);
+                let key = (doc.read(cx).revision(), doc.read(cx).is_dirty());
+                this.twin_synced.insert(doc.entity_id(), key);
+                for twin in this.twins_of(&doc, cx) {
+                    twin.update(cx, |twin, cx| {
+                        twin.mirror_text(text.clone(), dirty, saved, window, cx)
+                    });
+                    // The twin's own change must not echo back.
+                    let twin_key = (twin.read(cx).revision(), twin.read(cx).is_dirty());
+                    this.twin_synced.insert(twin.entity_id(), twin_key);
+                }
+            });
+        }));
     }
 
     /// Probe #14: land a dragged tab as a real second editor group (move, not
@@ -8169,22 +8280,37 @@ impl Workspace {
             .pinned_preview
             .and_then(|id| self.document_index(id))
             .filter(|&ix| ix != active);
+        // Each DocumentView is mounted once: in a split the secondary pane
+        // holds only its own document and the primary every other one. A
+        // view mounted in both stacks was laid out twice per frame at two
+        // sizes and repainted without end (~50 notifies a second).
+        let secondary = split.map(|split| split.other.min(self.documents.len().saturating_sub(1)));
         let stack = |active_ix: usize, id: &'static str| {
+            let in_secondary = id == "doc-stack-secondary";
             div()
                 .id(id)
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
                 .relative()
-                .children(self.documents.iter().enumerate().map(move |(ix, doc)| {
-                    let shown = ix == active_ix;
-                    div()
-                        .id((id, ix))
-                        .absolute()
-                        .inset_0()
-                        .when(!shown, |this| this.invisible())
-                        .child(doc.clone())
-                }))
+                .children(
+                    self.documents
+                        .iter()
+                        .enumerate()
+                        .filter(move |(ix, _)| match secondary {
+                            Some(other) => (*ix == other) == in_secondary,
+                            None => true,
+                        })
+                        .map(move |(ix, doc)| {
+                            let shown = ix == active_ix;
+                            div()
+                                .id((id, ix))
+                                .absolute()
+                                .inset_0()
+                                .when(!shown, |this| this.invisible())
+                                .child(doc.clone())
+                        }),
+                )
         };
 
         // Pinned preview of another tab: editor (active) | preview (pinned).

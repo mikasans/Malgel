@@ -430,6 +430,47 @@ impl DocumentView {
         })
     }
 
+    /// What a second view of this file (Split Editor) needs to show the
+    /// same buffer: its text, whether it is unsaved, and the saved text's hash.
+    pub fn mirror_state(&self, cx: &App) -> (String, bool, u64) {
+        (
+            self.editor.read(cx).value().to_string(),
+            self.dirty,
+            self.saved_hash,
+        )
+    }
+
+    /// Bumped on every change to the text.
+    pub fn revision(&self) -> usize {
+        self.revision
+    }
+
+    /// Show another view's buffer (see [`Self::mirror_state`]), keeping this
+    /// view's caret where it was, so both sides of a split stay one file.
+    pub fn mirror_text(
+        &mut self,
+        text: String,
+        dirty: bool,
+        saved_hash: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_media() {
+            return;
+        }
+        if self.editor.read(cx).value().as_ref() != text.as_str() {
+            let cursor = self.cursor(cx);
+            self.editor
+                .update(cx, |editor, cx| editor.set_value(text, window, cx));
+            // `set_value` does not emit a change event.
+            self.on_text_changed(true, cx);
+            self.set_cursor(cursor, window, cx);
+        }
+        self.saved_hash = saved_hash;
+        self.dirty = dirty;
+        cx.notify();
+    }
+
     /// Insert a Markdown link to `path` at the caret, for a file dragged
     /// from the sidebar into the text (VS Code's drop-into-editor).
     pub fn insert_drop_link(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
