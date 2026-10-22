@@ -571,6 +571,7 @@ pass "F2 in the Explorer renames the picked file on disk"
 # 7. Close the editor showing a second file, then bring it back with
 #    Ctrl+Shift+T, the way VS Code's Reopen Closed Editor does.
 xdotool key --clearmodifiers ctrl+p
+sleep 0.8
 xdotool type --delay 40 'todo'
 xdotool key --clearmodifiers Return
 sleep 0.8
