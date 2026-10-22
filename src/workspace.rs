@@ -2381,10 +2381,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let sub = cx.subscribe_in(&term, window, {
-            move |this, panel, event: &TerminalEvent, window, cx| {
-                if matches!(event, TerminalEvent::CloseSession) {
+            move |this, panel, event: &TerminalEvent, window, cx| match event {
+                TerminalEvent::CloseSession => {
                     let id = panel.entity_id();
                     this.close_terminal_by_id(id, window, cx);
+                }
+                TerminalEvent::HidePanel => {
+                    this.terminal_visible = false;
+                    this.terminal_maximized = false;
+                    this.focus_active(window, cx);
+                    cx.notify();
                 }
             }
         });

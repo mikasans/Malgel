@@ -166,6 +166,8 @@ pub enum TerminalEvent {
     /// User asked to kill this session (toolbar Kill). Workspace closes the tab
     /// when another session remains; otherwise leaves a Restart affordance.
     CloseSession,
+    /// Toolbar Close (X): hide the panel, sessions keep running (VS Code).
+    HidePanel,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalPanel {}
@@ -465,7 +467,25 @@ impl TerminalPanel {
         let printable =
             !m.control && !m.alt && (keys.key == "space" || keys.key.chars().count() == 1);
         if printable {
-            return false;
+            let input_focused = self.input.read(cx).focus_handle(cx).is_focused(window);
+            if input_focused {
+                return false;
+            }
+            // Focus is on the panel itself (a click on the output can land
+            // the panel's own focus after the input's, and the redirect runs
+            // on a later frame): the text has no input to go to, so send it
+            // straight to the shell and put focus back for the next key.
+            let text = match keys.key_char.as_deref() {
+                Some(text) if !text.is_empty() => text.to_string(),
+                _ if keys.key == "space" => " ".to_string(),
+                _ if m.shift => keys.key.to_uppercase(),
+                _ => keys.key.clone(),
+            };
+            session.write(text.as_bytes());
+            self.follow_tail = true;
+            self.scroll_to_end();
+            self.focus_input(window, cx);
+            return true;
         }
         let Some(bytes) = encode_key(
             &keys.key,
@@ -874,8 +894,7 @@ impl Render for TerminalPanel {
                             .ghost()
                             .small()
                             .icon(Icon::new(IconName::Copy))
-                            .label("Copy")
-                            .tooltip("Copy all output (Ctrl+Shift+C)")
+                            .tooltip("Copy All Output (Ctrl+Shift+C)")
                             .on_click(cx.listener(|this, _, _, cx| this.copy_all(cx))),
                     )
                     .child(
@@ -883,8 +902,7 @@ impl Render for TerminalPanel {
                             .ghost()
                             .small()
                             .icon(Icon::new(IconName::Clipboard))
-                            .label("Paste")
-                            .tooltip("Paste into shell (Ctrl+Shift+V)")
+                            .tooltip("Paste (Ctrl+Shift+V)")
                             .disabled(!shell_running)
                             .on_click(cx.listener(|this, _, _, cx| this.paste_clipboard(cx))),
                     )
@@ -892,9 +910,8 @@ impl Render for TerminalPanel {
                         Button::new(ElementId::NamedInteger("terminal-clear".into(), eid))
                             .ghost()
                             .small()
-                            .icon(Icon::new(IconName::Trash))
-                            .label("Clear")
-                            .tooltip("Clear terminal output")
+                            .icon(Icon::new(IconName::Eraser))
+                            .tooltip("Clear")
                             .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
                     )
                     .when(!shell_running, |this| {
@@ -910,13 +927,34 @@ impl Render for TerminalPanel {
                                 })),
                         )
                     })
+                    .child(div().w(px(1.)).h(px(16.)).bg(cx.theme().border))
+                    // VS Code's panel actions: New, Split, Kill, Maximize, Close.
+                    .child(
+                        Button::new(ElementId::NamedInteger("terminal-new".into(), eid))
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(IconName::Plus))
+                            .tooltip("New Terminal (Ctrl+Shift+`)")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::actions::NewTerminal), cx)
+                            }),
+                    )
+                    .child(
+                        Button::new(ElementId::NamedInteger("terminal-split".into(), eid))
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(IconName::Columns2))
+                            .tooltip("Split Terminal (Ctrl+Shift+5)")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::actions::SplitTerminal), cx)
+                            }),
+                    )
                     .child(
                         Button::new(ElementId::NamedInteger("terminal-kill".into(), eid))
                             .ghost()
                             .small()
-                            .icon(Icon::new(IconName::X))
-                            .label("Kill")
-                            .tooltip("Kill the shell and close this session (VS Code)")
+                            .icon(Icon::new(IconName::Trash))
+                            .tooltip("Kill Terminal")
                             .disabled(!shell_running)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.stop_shell();
@@ -925,6 +963,27 @@ impl Render for TerminalPanel {
                                 // Workspace closes the tab when another session remains.
                                 cx.emit(TerminalEvent::CloseSession);
                             })),
+                    )
+                    .child(
+                        Button::new(ElementId::NamedInteger("terminal-maximize".into(), eid))
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(IconName::ChevronUp))
+                            .tooltip("Maximize Panel Size")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(crate::actions::ToggleMaximizedPanel),
+                                    cx,
+                                )
+                            }),
+                    )
+                    .child(
+                        Button::new(ElementId::NamedInteger("terminal-close".into(), eid))
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(IconName::X))
+                            .tooltip("Hide Panel (Ctrl+`)")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(TerminalEvent::HidePanel))),
                     ),
             )
             .child(
@@ -944,6 +1003,10 @@ impl Render for TerminalPanel {
                         cx.listener(|this, _, window, cx| {
                             this.follow_tail = true;
                             this.focus_input(window, cx);
+                            // Otherwise the panel's own tracked focus takes the
+                            // click after us (bubble phase) and typed text has
+                            // no input to land in.
+                            window.prevent_default();
                             cx.notify();
                         }),
                     )
@@ -1029,6 +1092,7 @@ impl Render for TerminalPanel {
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
                             this.focus_input(window, cx);
+                            window.prevent_default();
                         }),
                     )
                     .when(!shell_running, |this| {

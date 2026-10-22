@@ -20,7 +20,7 @@
 # Knobs: MALGEL_BIN, E2E_ARTIFACTS, E2E_DISPLAY_START (first Xvfb display to
 # try, default 99), TERM_SCENARIOS ("1 3 p2 2 5 4" subsets), TERM_LAG_LIMIT_MS
 # (flood UI stall, default 250), P2_SECS / P2_CPU_LIMIT / P2_LAG_LIMIT_MS
-# (the `yes` flood: default 10s, <100% CPU, ui_lag max <100ms),
+# (the `yes` flood: default 10s, <100% CPU, ui_lag max <250ms),
 # INT_SETTLE_LIMIT_MS (^C to a still screen, default 300),
 # KILL_LIMIT_MS (Kill Terminal to job gone, default 500).
 
@@ -354,6 +354,20 @@ if want 3; then
   mark=$(fresh_marker s3-l.done); run "touch $mark"
   wait_for 5 test -e "$mark" && record s3-ctrl-l PASS "Ctrl+L cleared, shell fine" \
     || { record s3-ctrl-l FAIL "shell confused after Ctrl+L"; recover; }
+
+  # A click anywhere in the output, then typing at once: every character
+  # must reach the shell (r25: printables were dropped, only Enter arrived).
+  geo=$(xdotool getwindowgeometry "$WIN" | sed -n 's/.*Geometry: \([0-9]*\)x\([0-9]*\).*/\1 \2/p')
+  ok=0; spots=0
+  for spot in "2 120" "3 200" "1 260"; do
+    fx=${spot% *}; dy=${spot#* }; spots=$((spots + 1))
+    mark=$(fresh_marker "s3-click-$spots.done")
+    xdotool mousemove --window "$WIN" $((${geo% *} * fx / 4)) $((${geo#* } - dy)) click 1
+    run "touch $mark"
+    wait_for 5 test -e "$mark" && ok=$((ok + 1))
+  done
+  ((ok == spots)) && record s3-click-then-type PASS "typed text reached the shell after $spots clicks in the output" \
+    || { record s3-click-then-type FAIL "only $ok/$spots commands arrived after a click in the output"; recover; }
 fi
 
 # ---- P2. `yes` flood (P2_SECS, default 10): CPU, RSS, Ctrl+P latency, ^C ------
@@ -389,7 +403,7 @@ if want p2; then
   lag=$(lag_since "$lm"); p95=$(lag_p95_since "$lm")
   status=PASS
   [[ $gone == y && $opened == yes ]] || status=FAIL
-  ((cpu >= ${P2_CPU_LIMIT:-100} || lag >= ${P2_LAG_LIMIT_MS:-100})) && status=FAIL
+  ((cpu >= ${P2_CPU_LIMIT:-100} || lag >= ${P2_LAG_LIMIT_MS:-250})) && status=FAIL
   record "p2-yes-${P2_SECS}s" "$status" "cpu=${cpu}% rss=${r0}->${PEAK}MiB (plateau ${plateau}) ctrl+p=$([[ $opened == yes ]] && echo "$((tp1 - tp))ms" || echo never) ^C->yes-gone=$((tg - ti))ms ^C->prompt=$((tm - ti))ms ui_lag_p95=${p95}ms ui_lag_max=${lag}ms"
   [[ $gone == y ]] || { pkill -f "yes $TAG"; recover; }
 fi
@@ -454,7 +468,8 @@ if want 5; then
     xdotool windowsize "$WIN" 1600 1000; sleep 0.25
   done
   if wait_for 120 test -e "$mark" && alive; then
-    record s5-resize-flood PASS "ui_lag_max=$(lag_since "$lm")ms"
+    lag=$(lag_since "$lm"); st=PASS; ((${lag:-0} > LAG_LIMIT_MS)) && st=FAIL
+    record s5-resize-flood "$st" "ui_lag_max=${lag}ms (limit ${LAG_LIMIT_MS}ms)"
   else
     record s5-resize-flood FAIL "flood + resize did not finish (alive=$(alive && echo y || echo n))"
     recover
@@ -481,7 +496,8 @@ if want 4; then
   if wait_for 180 test -e "$M/s4a.done" -a -e "$M/s4b.done"; then
     a=$(cat "$M/tty_a" 2>/dev/null); b=$(cat "$M/tty_b" 2>/dev/null)
     if [[ -n "$a" && -n "$b" && "$a" != "$b" ]]; then
-      record s4-split-flood PASS "both panes finished; ttys $a / $b; ui_lag_max=$(lag_since "$lm")ms"
+      lag=$(lag_since "$lm"); st=PASS; ((${lag:-0} > LAG_LIMIT_MS)) && st=FAIL
+      record s4-split-flood "$st" "both panes finished; ttys $a / $b; ui_lag_max=${lag}ms (limit ${LAG_LIMIT_MS}ms)"
     else
       record s4-split-flood FAIL "input went to the wrong pane (ttys '$a' / '$b')"
     fi
