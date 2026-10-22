@@ -400,28 +400,25 @@ shot 07d-quick-open-one-escape
 editor_has_focus || fail "after Quick Open closed, typing did not reach the editor"
 pass "one Escape closes the palette and Quick Open, focus back in the editor"
 
-# 4c. Find in Files: the results, then Ctrl+Shift+F over them asks again
-#     with the last text (Enter alone repeats the search), and one Escape
-#     closes the results with the keyboard back in the editor.
+# 4c. Find in Files: Ctrl+Shift+F puts the keyboard in the Search view's
+#     Find field, Enter runs the search and the results land in the sidebar
+#     (no dialog), and one Escape puts the keyboard back in the editor.
+shot 07d2-before-find
 xdotool key --clearmodifiers ctrl+shift+f
 sleep 0.5
 xdotool type --delay 40 'paragraph'
 xdotool key --clearmodifiers Return
+sleep 1.5
 shot 07e-find-results
-xdotool key --clearmodifiers ctrl+shift+f
-shot 07f-find-again-prefilled
-[[ "$(pixels_differ 07e-find-results 07f-find-again-prefilled)" -gt 500 ]] \
-  || fail "Ctrl+Shift+F over the results did not ask again"
-xdotool key --clearmodifiers Return
-shot 07g-find-results-again
-[[ "$(pixels_differ 07e-find-results 07g-find-results-again)" -lt 500 ]] \
-  || fail "the prefilled query did not repeat the same search"
+[[ "$(pixels_differ 07d2-before-find 07e-find-results)" -gt 1000 ]] \
+  || fail "Enter in the Search view's Find field showed no results"
 xdotool key --clearmodifiers Escape
-shot 07h-find-closed
-[[ "$(pixels_differ 07g-find-results-again 07h-find-closed)" -gt 1000 ]] \
-  || fail "one Escape did not close the Find in Files results"
-editor_has_focus || fail "after the results closed, typing did not reach the editor"
-pass "Find in Files: Ctrl+Shift+F asks again prefilled, one Escape closes"
+sleep 0.4
+shot 07h-find-escaped
+[[ "$(pixels_differ 07e-find-results 07h-find-escaped)" -lt 4000 ]] \
+  || fail "Escape in the Search view did more than move the keyboard"
+editor_has_focus || fail "after Escape in the Search view, typing did not reach the editor"
+pass "Find in Files: results in the sidebar on Enter, Escape back to the editor"
 
 # 4d. Palette ▸ Color theme…: the color theme picker previews as it moves and Escape
 #     puts the theme back, with nothing kept in the settings.
@@ -614,9 +611,10 @@ shot 17-after-close-all
   || fail "Close All Editors closed the pinned editor too"
 pass "a pinned tab survives Close All Editors (Ctrl+K Ctrl+W)"
 
-# 9. Find in Files (Ctrl+Shift+F): search the folder's files for text, then
-#    take a hit, type into the file it opened and save — so the assertion is
-#    on the file the hit came from, not on a changed frame.
+# 9. Find in Files (Ctrl+Shift+F): search the folder's files for text (the
+#    last query is selected, so typing replaces it), then Enter again takes
+#    the first hit; type into the file it opened and save — so the assertion
+#    is on the file the hit came from, not on a changed frame.
 xdotool key --clearmodifiers ctrl+shift+f
 sleep 0.5
 xdotool type --delay 40 'SMOKE'
@@ -624,7 +622,7 @@ xdotool key --clearmodifiers Return
 sleep 1.5
 shot 18-find-in-files
 [[ "$(pixels_differ 17-after-close-all 18-find-in-files)" -gt 1000 ]] \
-  || fail "Ctrl+Shift+F did not open the Find in Files results"
+  || fail "Ctrl+Shift+F did not show the Find in Files results"
 xdotool key --clearmodifiers Return
 sleep 1.0
 shot 19-search-hit-open

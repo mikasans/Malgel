@@ -20,7 +20,7 @@ use gpui_kit::{
     Entity, EntityId, ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement as _,
     IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, PathPromptOptions,
     Pixels, Point, Render, ScrollHandle, SharedString, Size, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window, WindowBounds, anchored,
+    Styled as _, Subscription, Task, UniformListScrollHandle, Window, WindowBounds, anchored,
     assets::IconName,
     base::Disableable as _,
     component::{
@@ -43,7 +43,7 @@ use gpui_kit::{
     },
     deferred, div,
     prelude::FluentBuilder as _,
-    px, rems,
+    px, rems, uniform_list,
 };
 
 use crate::{
@@ -142,6 +142,36 @@ struct QuickOpenRow {
 
 /// The picker's rows for `query`: a typed path's own file or folder entries
 /// first, then the listing (which the picker filters by itself).
+/// The most file rows Quick Open draws at once; typing more of the name
+/// narrows the rest down, as in VS Code.
+const QUICK_OPEN_SHOWN: usize = 500;
+
+/// The rows the palette would keep for `query` (a case-insensitive
+/// substring of the label, the file name or the keyword — the palette's own
+/// test), at most `limit` of them, in order.
+fn matching_quick_open_rows(
+    rows: Vec<QuickOpenRow>,
+    query: &str,
+    limit: usize,
+) -> Vec<QuickOpenRow> {
+    let query = query.to_lowercase();
+    rows.into_iter()
+        .filter(|row| {
+            query.is_empty()
+                || row.label.to_lowercase().contains(&query)
+                || row
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().to_lowercase().contains(&query))
+                || row
+                    .keyword
+                    .as_ref()
+                    .is_some_and(|keyword| keyword.to_lowercase().contains(&query))
+        })
+        .take(limit)
+        .collect()
+}
+
 fn quick_open_rows(
     query: &str,
     root: &Path,
@@ -315,14 +345,84 @@ fn open_choices(check: document::OpenCheck, media: bool) -> &'static [OpenChoice
     }
 }
 
-/// A PDF or picture read and decoded in the background.
-/// A Find in Files search: what was asked, where, a flag that stops it,
-/// and its matches once it has finished.
-struct FindProgress {
-    root: PathBuf,
-    query: String,
-    cancel: Arc<AtomicBool>,
-    hits: Option<Vec<Hit>>,
+/// The Search view's results (Ctrl+Shift+F): nothing asked yet, a search
+/// running, or what one found.
+#[derive(Default)]
+enum SidebarSearch {
+    #[default]
+    Idle,
+    Searching {
+        query: String,
+        cancel: Arc<AtomicBool>,
+    },
+    Done {
+        query: String,
+        root: PathBuf,
+        found: search::FolderSearch,
+    },
+}
+
+/// One row of the Search view's results tree: a file with its hit count, or
+/// one hit (an index into the hits) under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SearchRow {
+    File { path: PathBuf, count: usize },
+    Hit(usize),
+}
+
+/// The results tree's rows: hits grouped under their file, in the order the
+/// search found them, with the hits of a collapsed file left out.
+fn search_rows(hits: &[Hit], collapsed: &HashSet<PathBuf>) -> Vec<SearchRow> {
+    let mut rows = Vec::new();
+    let mut ix = 0;
+    while ix < hits.len() {
+        let path = &hits[ix].path;
+        let end = hits[ix..]
+            .iter()
+            .position(|hit| &hit.path != path)
+            .map_or(hits.len(), |n| ix + n);
+        rows.push(SearchRow::File {
+            path: path.clone(),
+            count: end - ix,
+        });
+        if !collapsed.contains(path) {
+            rows.extend((ix..end).map(SearchRow::Hit));
+        }
+        ix = end;
+    }
+    rows
+}
+
+/// The results header: `12 results in 3 files`, and how far a capped search
+/// got, the way VS Code says its results were limited.
+fn search_summary(found: &search::FolderSearch) -> String {
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut text = format!(
+        "{} in {}",
+        plural(found.hits.len(), "result", "results"),
+        plural(found.files_matched, "file", "files")
+    );
+    if found.limited || found.files_total >= quick_open::MAX_FILES {
+        text.push_str(&format!(
+            " \u{2014} results limited; searched {} of {} files",
+            found.files_searched, found.files_total
+        ));
+    }
+    text
+}
+
+/// The next hit to show after `current`, `forward` or back, wrapping.
+fn step_hit(current: Option<usize>, len: usize, forward: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match (current, forward) {
+        (None, true) => 0,
+        (None, false) => len - 1,
+        (Some(ix), true) => (ix + 1) % len,
+        (Some(ix), false) => (ix + len - 1) % len,
+    })
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -470,12 +570,6 @@ pub struct Workspace {
     go_to_line: Entity<CommandState>,
     /// The one-line prompt New File / New Folder / Rename ask their name in.
     tree_prompt: Entity<CommandState>,
-    /// Find in Files (Ctrl+Shift+F): one for the query it asks for, one for
-    /// the hits it lists.
-    find_query: Entity<CommandState>,
-    find_results: Entity<CommandState>,
-    /// The running or finished Find in Files search its dialog shows.
-    find_progress: Option<FindProgress>,
     /// The text Find in Files last looked for, offered again next time.
     last_find: String,
     /// The replacement text Replace in Files last used.
@@ -486,12 +580,18 @@ pub struct Workspace {
     search_find: Entity<InputState>,
     /// Replace field in the Search activity sidebar.
     search_replace: Entity<InputState>,
-    /// Hits shown in the Search activity sidebar (separate from dialog Find).
-    sidebar_hits: Option<Vec<Hit>>,
+    /// The Search view's results (Ctrl+Shift+F lands here).
+    sidebar_search: SidebarSearch,
+    /// The rows of its results tree, rebuilt when the results or a
+    /// collapsed file change.
+    sidebar_rows: Vec<SearchRow>,
+    /// Files whose hits the tree hides.
+    sidebar_collapsed: HashSet<PathBuf>,
+    /// The hit Enter / Shift+Enter in the Find field last opened.
+    sidebar_cursor: Option<usize>,
+    sidebar_scroll: UniformListScrollHandle,
     /// Open Compare / diff session, if any.
     diff_session: Option<DiffSession>,
-    /// Focus for the "Searching…" dialog, so its keys reach it.
-    find_focus: FocusHandle,
     file_tree: Entity<FileTree>,
     app_menu_bar: Entity<TitleMenuBar>,
 
@@ -592,8 +692,6 @@ impl Workspace {
         let theme_picker = cx.new(|cx| CommandState::new(window, cx));
         let go_to_line = cx.new(|cx| CommandState::new(window, cx));
         let tree_prompt = cx.new(|cx| CommandState::new(window, cx));
-        let find_query = cx.new(|cx| CommandState::new(window, cx));
-        let find_results = cx.new(|cx| CommandState::new(window, cx));
         let search_find = cx.new(|cx| InputState::new(window, cx).placeholder("Find"));
         let search_replace = cx.new(|cx| InputState::new(window, cx).placeholder("Replace"));
         let file_tree = cx.new(FileTree::new);
@@ -601,6 +699,28 @@ impl Workspace {
         let terminal_subscriptions: Vec<Subscription> = Vec::new();
 
         let subscriptions = vec![
+            // Enter in the Search view's Find field runs the search; once
+            // it has results for that text, Enter and Shift+Enter step
+            // through them. Escape (see render_search_sidebar) goes back to
+            // the editor.
+            cx.subscribe_in(
+                &search_find,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { shift, .. } = event {
+                        this.search_find_enter(!*shift, window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &search_replace,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.sidebar_run_replace(true, window, cx);
+                    }
+                },
+            ),
             cx.subscribe_in(
                 &file_tree,
                 window,
@@ -710,17 +830,17 @@ impl Workspace {
             fallback_save_sub: None,
             go_to_line,
             tree_prompt,
-            find_query,
-            find_results,
-            find_progress: None,
             last_find: String::new(),
             last_replace: String::new(),
             activity_view: ActivityView::Explorer,
             search_find,
             search_replace,
-            sidebar_hits: None,
+            sidebar_search: SidebarSearch::Idle,
+            sidebar_rows: Vec::new(),
+            sidebar_collapsed: HashSet::new(),
+            sidebar_cursor: None,
+            sidebar_scroll: UniformListScrollHandle::new(),
             diff_session: None,
-            find_focus: cx.focus_handle(),
             file_tree,
             app_menu_bar,
             window_title: String::new(),
@@ -3522,239 +3642,99 @@ impl Workspace {
     // ---------------------------------------------------------------------
     // Find in Files
 
-    /// Ask what to look for, then search the open folder's files for it, the
-    /// way VS Code's Search view (Ctrl+Shift+F) does.
+    /// VS Code's Search view (Ctrl+Shift+F): show it in the sidebar with the
+    /// keyboard in its Find field, the last text selected so typing
+    /// replaces it. The results land in the sidebar, under the field.
     fn find_in_files(&mut self, _: &FindInFiles, window: &mut Window, cx: &mut Context<Self>) {
         if self.file_tree.read(cx).root().is_none() {
             window.push_notification(Notification::info("Open a folder to search its files."), cx);
             return;
         }
+        self.reveal_search(false, window, cx);
+    }
+
+    /// Show the Search view and put the keyboard in its Find field (or its
+    /// Replace field), with the text there selected.
+    fn reveal_search(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.activity_view = ActivityView::Search;
-        if !AppSettings::get(cx).file_sidebar {
-            AppSettings::update(cx, |settings| settings.file_sidebar = true);
-        }
-        // Ctrl+Shift+F over the results (or while searching) starts over:
-        // the results give way to the question, asked again with the last
-        // text, selected so typing replaces it.
-        if window.has_active_dialog(cx) {
-            // Only take over a Find dialog (searching or results). Any other
-            // picker keeps the key - the workspace binding never reaches it
-            // anyway, and esc_closes turns Ctrl+Shift+F into FindInFiles only
-            // when that picker opted in.
-            let Some(progress) = self.find_progress.take() else {
-                return;
-            };
-            progress.cancel.store(true, Ordering::Relaxed);
-            window.close_dialog(cx);
+        if !AppSettings::get(cx).file_sidebar || AppSettings::get(cx).focus_mode {
+            AppSettings::update(cx, |settings| {
+                settings.file_sidebar = true;
+                settings.focus_mode = false;
+            });
         }
         let last = self.last_find.clone();
-        Self::prompt_line(
-            &self.find_query.clone(),
-            "Find in files".into(),
-            "Text to find".into(),
-            &last,
-            window,
-            cx,
-            |this, query, window, cx| this.search_folder(query, window, cx),
-        );
-        if !last.is_empty() {
-            cx.spawn_in(window, async move |_, cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(60))
-                    .await;
-                _ = cx.update(|window, cx| {
-                    window.dispatch_action(Box::new(gpui_kit::component::input::SelectAll), cx)
-                });
-            })
-            .detach();
+        if !last.is_empty() && self.search_find.read(cx).value().is_empty() {
+            self.search_find
+                .update(cx, |input, cx| input.set_value(last, window, cx));
         }
+        let field = if replace {
+            &self.search_replace
+        } else {
+            &self.search_find
+        };
+        // Select the field's text now (the field may not be on screen yet,
+        // so no action can reach it), and focus it once it is drawn.
+        let field = field.clone();
+        field.update(cx, |input, cx| input.select_all(window, cx));
+        let focus = field.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        cx.notify();
     }
 
-    /// Walk the folder's files and search their text.
-    fn search_folder(&mut self, needle: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.file_tree.read(cx).root().map(Path::to_path_buf) else {
+    /// Enter / Shift+Enter in the Find field: search when the text is new,
+    /// otherwise show the next (or previous) hit.
+    fn search_find_enter(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_find.read(cx).value().to_string();
+        let len = match &self.sidebar_search {
+            SidebarSearch::Done {
+                query: done, found, ..
+            } if *done == query => found.hits.len(),
+            _ => {
+                if forward {
+                    self.sidebar_run_find(window, cx);
+                }
+                return;
+            }
+        };
+        let Some(next) = step_hit(self.sidebar_cursor, len, forward) else {
+            // No hits: run it again (the folder may have changed).
+            self.sidebar_run_find(window, cx);
             return;
         };
-        if needle.is_empty() {
-            return;
-        }
-        self.last_find = needle.clone();
-        // The walk and the reads are off the UI thread: a folder of notes
-        // runs to thousands of files, and the window used to sit still while
-        // Quick Open listed them for the same reason. The results dialog
-        // opens at once, saying it is searching, and closing it stops the
-        // search between files.
-        if let Some(previous) = self.find_progress.take() {
-            previous.cancel.store(true, Ordering::Relaxed);
-        }
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.find_progress = Some(FindProgress {
-            root: root.clone(),
-            query: needle.clone(),
-            cancel: cancel.clone(),
-            hits: None,
-        });
-        let show_hidden = AppSettings::get(cx).show_hidden_entries;
-        let opened = self.file_tree.read(cx).expanded_folders();
-        let walk_root = root;
-        let wanted = needle;
-        let stop = cancel.clone();
-        let listing = cx.background_executor().spawn(async move {
-            let files =
-                quick_open::files_under(&walk_root, show_hidden, &opened, quick_open::MAX_FILES);
-            search::search_files_until(&files, &wanted, search::MAX_HITS, &stop)
-        });
-        // The prompt that asked for the text is closing; open after it.
-        let workspace = cx.entity();
-        window.defer(cx, move |window, cx| {
-            workspace.update(cx, |this, cx| this.open_find_results(window, cx));
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let hits = listing.await;
-            _ = this.update_in(cx, |this, window, cx| {
-                let Some(progress) = this.find_progress.as_mut() else {
-                    return;
-                };
-                if !Arc::ptr_eq(&progress.cancel, &cancel) || cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                progress.hits = Some(hits);
-                this.find_results
-                    .update(cx, |state, cx| state.set_query("", window, cx));
-                let focus = this.find_results.read(cx).focus_handle(cx);
-                window.defer(cx, move |window, cx| focus.focus(window, cx));
-                window.refresh();
-            });
-        })
-        .detach();
+        self.open_search_hit(next, window, cx);
     }
 
-    /// The Find in Files dialog: “Searching…” with a Cancel button while
-    /// the search runs, then the matches, or “No matches” in place, so the
-    /// answer is where the question was asked rather than a passing toast.
-    /// Confirming a match opens its file with the caret on its line.
-    fn open_find_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.find_progress.is_none() || window.has_active_dialog(cx) {
+    /// Open hit `ix` of the Search view's results and put the caret on it.
+    fn open_search_hit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let SidebarSearch::Done { found, .. } = &self.sidebar_search else {
             return;
+        };
+        let Some(hit) = found.hits.get(ix).cloned() else {
+            return;
+        };
+        self.sidebar_cursor = Some(ix);
+        if self.sidebar_collapsed.remove(&hit.path) {
+            self.rebuild_search_rows();
         }
-        let state = self.find_results.clone();
-        let workspace = cx.weak_entity();
-        let find_focus = self.find_focus.clone();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let Some(this) = workspace.upgrade() else {
-                return dialog;
-            };
-            let Some(progress) = this.read(cx).find_progress.as_ref() else {
-                return dialog;
-            };
-            let query = progress.query.clone();
-            let stop = progress.cancel.clone();
-            let hits = progress.hits.clone();
-            let root = progress.root.clone();
-            // Closing (Esc, Cancel, backdrop) stops the search and puts the
-            // keyboard back in the editor — otherwise the caret vanishes and
-            // shortcuts stop until a click.
-            let on_close_ws = workspace.clone();
-            let dialog = dialog.close_button(false).p_0().on_close({
-                let stop = stop.clone();
-                move |_, window, cx| {
-                    stop.store(true, Ordering::Relaxed);
-                    if let Some(this) = on_close_ws.upgrade() {
-                        this.update(cx, |this, cx| {
-                            this.find_progress = None;
-                            this.focus_active(window, cx);
-                        });
-                    }
-                }
-            });
-            // One wrapper hears Esc and Ctrl+Shift+F for every state
-            // (searching, empty, results), including when the Command filter
-            // has focus — the workspace binding never reaches a dialog.
-            let wrap = |body: gpui_kit::AnyElement| {
-                // esc_closes hears Esc and Ctrl+Shift+F; the latter closes
-                // this dialog (on_close clears find_progress and restores
-                // editor focus) then re-dispatches Find in Files.
-                esc_closes(div().track_focus(&find_focus).child(body))
-            };
-            let Some(hits) = hits else {
-                let focus = find_focus.clone();
-                window.defer(cx, move |window, cx| focus.focus(window, cx));
-                return dialog.child(wrap(
-                    h_flex()
-                        .id("find-in-files-searching")
-                        .p_4()
-                        .gap_3()
-                        .items_center()
-                        .child(Spinner::new())
-                        .child(
-                            div()
-                                .flex_1()
-                                .child(format!("Searching for \u{201c}{query}\u{201d}\u{2026}")),
-                        )
-                        .child(
-                            Button::new("find-in-files-cancel")
-                                .label("Cancel")
-                                .on_click(move |_, window, cx| {
-                                    stop.store(true, Ordering::Relaxed);
-                                    window.close_dialog(cx);
-                                }),
-                        )
-                        .into_any_element(),
-                ));
-            };
-            if hits.is_empty() {
-                let focus = find_focus.clone();
-                window.defer(cx, move |window, cx| focus.focus(window, cx));
-                return dialog.child(wrap(
-                    h_flex()
-                        .id("find-in-files-none")
-                        .p_4()
-                        .gap_3()
-                        .items_center()
-                        .child(
-                            div()
-                                .flex_1()
-                                .child(format!("No matches for \u{201c}{query}\u{201d}.")),
-                        )
-                        .child(
-                            Button::new("find-in-files-ok")
-                                .primary()
-                                .label("OK")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                        )
-                        .into_any_element(),
-                ));
-            }
-            let items = hits.iter().map(|hit| {
-                let shown = hit
-                    .path
-                    .strip_prefix(&root)
-                    .unwrap_or(hit.path.as_path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let label: SharedString = format!("{shown}:{}  {}", hit.line, hit.text).into();
-                command_item_with_path_icon(label, [shown, hit.text.clone()], &hit.path, false)
-            });
-            let picked = hits.clone();
-            let confirm_ws = workspace.clone();
-            dialog.child(wrap(
-                Command::new(&state)
-                    .bordered(false)
-                    .placeholder("Filter the matches")
-                    .max_h(rems(24.))
-                    .items(items)
-                    .empty(|_, _, _| div().px_3().py_2().child("No matching lines"))
-                    .on_confirm(move |index: IndexPath, window, cx| {
-                        window.close_dialog(cx);
-                        let Some(hit) = picked.get(index.row).cloned() else {
-                            return;
-                        };
-                        _ = confirm_ws.update(cx, |this, cx| this.open_hit(&hit, window, cx));
-                    })
-                    .on_cancel(|window, cx| window.close_dialog(cx))
-                    .into_any_element(),
-            ))
-        });
+        if let Some(row) = self
+            .sidebar_rows
+            .iter()
+            .position(|row| *row == SearchRow::Hit(ix))
+        {
+            self.sidebar_scroll
+                .scroll_to_item(row, gpui_kit::ScrollStrategy::Center);
+        }
+        self.open_hit(&hit, window, cx);
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn rebuild_search_rows(&mut self) {
+        self.sidebar_rows = match &self.sidebar_search {
+            SidebarSearch::Done { found, .. } => search_rows(&found.hits, &self.sidebar_collapsed),
+            _ => Vec::new(),
+        };
     }
 
     /// Show the file a hit came from, on its line.
@@ -3773,8 +3753,8 @@ impl Workspace {
         self.load_path(path, Placement::Default, Target::Line(hit.line), window, cx);
     }
 
-    /// Ask for find text, then replacement, then preview and apply across the
-    /// open folder (VS Code Replace in Files / Ctrl+Shift+H).
+    /// VS Code's Replace in Files (Ctrl+Shift+H): the Search view, with the
+    /// keyboard in its Replace field.
     fn replace_in_files(
         &mut self,
         _: &ReplaceInFiles,
@@ -3788,44 +3768,7 @@ impl Workspace {
             );
             return;
         }
-        if window.has_active_dialog(cx) {
-            if let Some(progress) = self.find_progress.take() {
-                progress.cancel.store(true, Ordering::Relaxed);
-                window.close_dialog(cx);
-            } else {
-                return;
-            }
-        }
-        self.activity_view = ActivityView::Search;
-        let last = self.last_find.clone();
-        Self::prompt_line(
-            &self.find_query.clone(),
-            "Replace in files".into(),
-            "Text to find".into(),
-            &last,
-            window,
-            cx,
-            |this, query, window, cx| this.prompt_replace_with(query, window, cx),
-        );
-    }
-
-    fn prompt_replace_with(&mut self, find: String, window: &mut Window, cx: &mut Context<Self>) {
-        if find.is_empty() {
-            return;
-        }
-        self.last_find = find.clone();
-        let last = self.last_replace.clone();
-        Self::prompt_line(
-            &self.tree_prompt.clone(),
-            "Replace with".into(),
-            "Replacement text".into(),
-            &last,
-            window,
-            cx,
-            move |this, replace, window, cx| {
-                this.confirm_replace_in_files(find.clone(), replace, window, cx)
-            },
-        );
+        self.reveal_search(true, window, cx);
     }
 
     fn confirm_replace_in_files(
@@ -3843,22 +3786,19 @@ impl Workspace {
         let opened = self.file_tree.read(cx).expanded_folders();
         let walk_root = root;
         let wanted = find.clone();
+        // Every file in the folder, and every occurrence in them: what the
+        // dialog counts is what Replace All then changes.
         let listing = cx.background_executor().spawn(async move {
             let files =
                 quick_open::files_under(&walk_root, show_hidden, &opened, quick_open::MAX_FILES);
-            let hits = search::search_files_until(
-                &files,
-                &wanted,
-                search::MAX_HITS,
-                &std::sync::atomic::AtomicBool::new(false),
-            );
-            (files, hits)
+            let (count, file_count) = search::count_in_files(&files, &wanted);
+            (files, count, file_count)
         });
         let workspace = cx.weak_entity();
         cx.spawn_in(window, async move |this, cx| {
-            let (files, hits) = listing.await;
+            let (files, count, file_count) = listing.await;
             _ = this.update_in(cx, |this, window, cx| {
-                if hits.is_empty() {
+                if count == 0 {
                     window.push_notification(
                         Notification::info(format!(
                             "No matches for \u{201c}{find}\u{201d}."
@@ -3868,14 +3808,6 @@ impl Workspace {
                     this.focus_active(window, cx);
                     return;
                 }
-                let count = hits.len();
-                let file_count = {
-                    let mut seen = std::collections::HashSet::new();
-                    for hit in &hits {
-                        seen.insert(hit.path.clone());
-                    }
-                    seen.len()
-                };
                 let description = format!(
                     "Replace {count} occurrence(s) in {file_count} file(s)?\n\nFind: {find}\nReplace: {replace}"
                 );
@@ -3902,16 +3834,8 @@ impl Workspace {
                         })
                         .on_ok(move |_, window, cx| {
                             window.close_dialog(cx);
-                            let n = search::replace_in_files(&files_ok, &find_ok, &replace_ok);
                             _ = ws_ok.update(cx, |this, cx| {
-                                this.reload_replaced_files(&files_ok, window, cx);
-                                window.push_notification(
-                                    Notification::info(format!(
-                                        "Replaced {n} occurrence(s)."
-                                    )),
-                                    cx,
-                                );
-                                this.focus_active(window, cx);
+                                this.apply_replace_all(&files_ok, &find_ok, &replace_ok, window, cx);
                             });
                             true
                         })
@@ -3945,20 +3869,11 @@ impl Workspace {
                                                 let files2 = files2.clone();
                                                 move |_, window, cx| {
                                                     window.close_dialog(cx);
-                                                    let n = search::replace_in_files(
-                                                        &files2, &find2, &replace2,
-                                                    );
                                                     _ = ws.update(cx, |this, cx| {
-                                                        this.reload_replaced_files(
-                                                            &files2, window, cx,
-                                                        );
-                                                        window.push_notification(
-                                                            Notification::info(format!(
-                                                                "Replaced {n} occurrence(s)."
-                                                            )),
+                                                        this.apply_replace_all(
+                                                            &files2, &find2, &replace2, window,
                                                             cx,
                                                         );
-                                                        this.focus_active(window, cx);
                                                     });
                                                 }
                                             }),
@@ -3971,6 +3886,34 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Replace All: rewrite every file, reload the open ones, say how many
+    /// changed, and refresh the Search view's results.
+    fn apply_replace_all(
+        &mut self,
+        files: &[PathBuf],
+        find: &str,
+        replace: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (n, written) = search::replace_in_files(files, find, replace);
+        crate::perf::release_free_memory();
+        self.reload_replaced_files(&written, window, cx);
+        window.push_notification(
+            Notification::info(format!(
+                "Replaced {n} occurrence{} in {} file{}.",
+                if n == 1 { "" } else { "s" },
+                written.len(),
+                if written.len() == 1 { "" } else { "s" },
+            )),
+            cx,
+        );
+        if !matches!(self.sidebar_search, SidebarSearch::Idle) {
+            self.sidebar_run_find(window, cx);
+        }
+        self.focus_active(window, cx);
     }
 
     /// Reload open editors whose paths were rewritten by Replace in Files.
@@ -4137,19 +4080,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.activity_view = ActivityView::Search;
-        if !AppSettings::get(cx).file_sidebar {
-            AppSettings::update(cx, |settings| settings.file_sidebar = true);
-        }
-        // Prefill Find from last search; focus the sidebar field (probe #11).
-        let last = self.last_find.clone();
-        if !last.is_empty() {
-            self.search_find
-                .update(cx, |input, cx| input.set_value(last, window, cx));
-        }
-        let focus = self.search_find.read(cx).focus_handle(cx);
-        window.defer(cx, move |window, cx| focus.focus(window, cx));
-        cx.notify();
+        self.reveal_search(false, window, cx);
     }
 
     /// Carry out the name a tree prompt collected. `target` names the folder
@@ -5866,6 +5797,11 @@ impl Workspace {
             let query = state.read(cx).query(cx).trim().to_string();
             let rows = quick_open_rows(&query, &root, home.as_deref(), &listing);
             let (first, rows) = split_recent(rows, &recent, current.as_deref());
+            // Only the rows the query can show reach the palette: a folder
+            // of 20,000 files would otherwise rebuild 20,000 rows on every
+            // frame. Same test the palette filters with, so nothing it would
+            // have shown is lost, up to QUICK_OPEN_SHOWN of them.
+            let rows = matching_quick_open_rows(rows, &query, QUICK_OPEN_SHOWN);
             let item = |row: &QuickOpenRow| {
                 let shown: SharedString = row.label.clone().into();
                 let name: SharedString = row
@@ -8802,11 +8738,21 @@ impl Workspace {
     fn render_search_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let workspace = cx.weak_entity();
-        let hits = self.sidebar_hits.clone().unwrap_or_default();
         v_flex()
             .id("search-sidebar")
             .size_full()
             .bg(theme.sidebar)
+            // Escape in the Find or Replace field puts the keyboard back in
+            // the editor, as VS Code's Search view does.
+            .capture_key_down(
+                cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                    let keys = &event.keystroke;
+                    if keys.key == "escape" && !keys.modifiers.modified() {
+                        this.focus_active(window, cx);
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .child(
                 div()
                     .h(px(32.))
@@ -8880,62 +8826,199 @@ impl Workspace {
                             }),
                     ),
             )
+            .child(self.render_search_results(cx))
+    }
+
+    /// Under the fields: a line saying what the search found (or that it
+    /// is running, or found nothing), then the hits grouped by file.
+    fn render_search_results(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let theme = cx.theme();
+        let note = |text: String| {
+            div()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(text)
+        };
+        let found = match &self.sidebar_search {
+            SidebarSearch::Idle => {
+                return note("Type and press Enter to search the folder.".into())
+                    .id("search-sidebar-idle")
+                    .into_any_element();
+            }
+            SidebarSearch::Searching { query, .. } => {
+                return h_flex()
+                    .id("search-sidebar-searching")
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .child(Spinner::new().xsmall())
+                    .child(note(format!(
+                        "Searching for \u{201c}{query}\u{201d}\u{2026}"
+                    )))
+                    .into_any_element();
+            }
+            SidebarSearch::Done { query, found, .. } if found.hits.is_empty() => {
+                return note(format!("No results found for \u{201c}{query}\u{201d}."))
+                    .id("search-sidebar-none")
+                    .into_any_element();
+            }
+            SidebarSearch::Done { found, .. } => found,
+        };
+        v_flex()
+            .id("search-sidebar-hits")
+            .flex_1()
+            .min_h_0()
+            .child(note(search_summary(found)).id("search-sidebar-summary"))
             .child(
-                v_flex()
-                    .id("search-sidebar-hits")
+                div()
                     .flex_1()
                     .min_h_0()
                     .px_1()
                     .pb_2()
-                    .overflow_y_scrollbar()
-                    .when(hits.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .p_3()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("No results yet — Find to search the folder."),
+                    .child(
+                        uniform_list(
+                            "search-sidebar-rows",
+                            self.sidebar_rows.len(),
+                            cx.processor(Self::render_search_rows),
                         )
-                    })
-                    .children(hits.into_iter().enumerate().map(|(ix, hit)| {
-                        let theme = cx.theme();
-                        let path = hit.path.clone();
-                        let line = hit.line;
-                        let label = format!(
-                            "{}:{}  {}",
-                            hit.path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| hit.path.display().to_string()),
-                            hit.line,
-                            hit.text
-                        );
-                        div()
-                            .id(("sidebar-hit", ix))
-                            .flex_none()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .text_xs()
-                            .truncate()
-                            .cursor_pointer()
-                            .text_color(theme.muted_foreground)
-                            .hover(|s| s.bg(theme.list_hover).text_color(theme.foreground))
-                            .child(label)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_paths(vec![path.clone()], Placement::Default, window, cx);
-                                this.with_active(window, cx, |doc, window, cx| {
-                                    doc.go_to_line(line, window, cx);
-                                });
-                            }))
-                    })),
+                        .size_full()
+                        .track_scroll(&self.sidebar_scroll),
+                    )
+                    .vertical_scrollbar(&self.sidebar_scroll),
             )
+            .into_any_element()
+    }
+
+    fn render_search_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui_kit::AnyElement> {
+        let SidebarSearch::Done { root, found, .. } = &self.sidebar_search else {
+            return Vec::new();
+        };
+        let theme = cx.theme();
+        let (hover, active_bg, muted, fg) = (
+            theme.list_hover,
+            theme.list_active,
+            theme.muted_foreground,
+            theme.foreground,
+        );
+        let badge_bg = theme.secondary;
+        range
+            .filter_map(|row_ix| {
+                let row = self.sidebar_rows.get(row_ix)?;
+                let element = match row {
+                    SearchRow::File { path, count } => {
+                        let relative = path.strip_prefix(root).unwrap_or(path);
+                        let name = relative
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| relative.display().to_string());
+                        let dir = relative
+                            .parent()
+                            .map(|d| d.to_string_lossy().replace('\\', "/"))
+                            .unwrap_or_default();
+                        let collapsed = self.sidebar_collapsed.contains(path);
+                        let toggle = path.clone();
+                        h_flex()
+                            .id(("search-file", row_ix))
+                            .h(px(22.))
+                            .px_1()
+                            .gap_1()
+                            .items_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .hover(|s| s.bg(hover))
+                            .child(
+                                Icon::new(if collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .xsmall()
+                                .text_color(muted),
+                            )
+                            .child(file_type_icon(path).size_4())
+                            .child(div().flex_none().text_color(fg).child(name))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(muted)
+                                    .child(dir),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px_1p5()
+                                    .rounded_full()
+                                    .bg(badge_bg)
+                                    .text_color(fg)
+                                    .child(count.to_string()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.sidebar_collapsed.remove(&toggle) {
+                                    this.sidebar_collapsed.insert(toggle.clone());
+                                }
+                                this.rebuild_search_rows();
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                    }
+                    SearchRow::Hit(ix) => {
+                        let ix = *ix;
+                        let hit = found.hits.get(ix)?;
+                        let selected = self.sidebar_cursor == Some(ix);
+                        h_flex()
+                            .id(("search-hit", row_ix))
+                            .h(px(22.))
+                            .pl(px(26.))
+                            .pr_1()
+                            .gap_2()
+                            .items_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .when(selected, |this| this.bg(active_bg))
+                            .hover(|s| s.bg(hover))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(muted)
+                                    .child(hit.line.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(fg)
+                                    .child(hit.text.clone()),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_search_hit(ix, window, cx);
+                            }))
+                            .into_any_element()
+                    }
+                };
+                Some(element)
+            })
+            .collect()
     }
 
     fn sidebar_run_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let find = self.search_find.read(cx).value().to_string();
         if find.is_empty() {
-            window.push_notification(Notification::info("Enter text to find."), cx);
+            self.sidebar_search = SidebarSearch::Idle;
+            self.rebuild_search_rows();
+            cx.notify();
             return;
         }
         let Some(root) = self.file_tree.read(cx).root().map(Path::to_path_buf) else {
@@ -8943,22 +9026,57 @@ impl Workspace {
             return;
         };
         self.last_find = find.clone();
+        if let SidebarSearch::Searching { cancel, .. } = &self.sidebar_search {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.sidebar_search = SidebarSearch::Searching {
+            query: find.clone(),
+            cancel: cancel.clone(),
+        };
+        self.sidebar_cursor = None;
+        self.sidebar_collapsed.clear();
+        self.rebuild_search_rows();
+        cx.notify();
         let show_hidden = AppSettings::get(cx).show_hidden_entries;
         let opened = self.file_tree.read(cx).expanded_folders();
-        let wanted = find;
+        let wanted = find.clone();
+        let walk_root = root.clone();
+        let stop = cancel.clone();
+        // The whole folder, in a fixed order; only the hit count is capped.
+        // The file list lives and dies on this task, so a finished search
+        // keeps nothing but its hits.
         let listing = cx.background_executor().spawn(async move {
-            let files = quick_open::files_under(&root, show_hidden, &opened, quick_open::MAX_FILES);
-            search::search_files_until(
-                &files,
-                &wanted,
-                search::MAX_HITS,
-                &std::sync::atomic::AtomicBool::new(false),
-            )
+            let _span = crate::perf::Span::new("folder_search");
+            let files =
+                quick_open::files_under(&walk_root, show_hidden, &opened, quick_open::MAX_FILES);
+            let found = search::search_folder_files(&files, &wanted, search::MAX_HITS, &stop);
+            drop(files);
+            crate::perf::release_free_memory();
+            found
         });
-        cx.spawn_in(window, async move |this, cx| {
-            let hits = listing.await;
+        cx.spawn(async move |this, cx| {
+            let found = listing.await;
             _ = this.update(cx, |this, cx| {
-                this.sidebar_hits = Some(hits);
+                let current = matches!(
+                    &this.sidebar_search,
+                    SidebarSearch::Searching { cancel: c, .. } if Arc::ptr_eq(c, &cancel)
+                );
+                if !current || cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                crate::perf::mark(&format!(
+                    "folder_search_done hits={} files={}/{}",
+                    found.hits.len(),
+                    found.files_searched,
+                    found.files_total
+                ));
+                this.sidebar_search = SidebarSearch::Done {
+                    query: find,
+                    root,
+                    found,
+                };
+                this.rebuild_search_rows();
                 cx.notify();
             });
         })
@@ -9712,14 +9830,95 @@ mod tests {
         assert!(stroke.key.eq_ignore_ascii_case("f"));
     }
 
-    /// Closing the find dialog clears progress and restores editor focus
-    /// (see open_find_results on_close); gui_smoke asserts one Esc and
-    /// Ctrl+Shift+F reopen prefilled.
+    fn hit(path: &str, line: usize) -> Hit {
+        Hit {
+            path: PathBuf::from(path),
+            line,
+            column: 1,
+            text: format!("line {line}"),
+        }
+    }
+
     #[test]
-    fn find_dialog_cancel_flag_stops_the_search() {
-        let cancel = Arc::new(AtomicBool::new(false));
-        cancel.store(true, Ordering::Relaxed);
-        assert!(cancel.load(Ordering::Relaxed));
+    fn quick_open_hands_the_palette_only_rows_the_query_matches() {
+        let row = |label: &str| QuickOpenRow {
+            label: label.to_string(),
+            keyword: None,
+            path: PathBuf::from("/r").join(label),
+            line: None,
+            is_dir: false,
+        };
+        let rows: Vec<_> = (0..2000)
+            .map(|ix| row(&format!("pkg{:03}/src/m{:03}.rs", ix / 10, ix % 100)))
+            .collect();
+        let kept = matching_quick_open_rows(rows.clone(), "M099", 500);
+        assert_eq!(kept.len(), 20);
+        assert_eq!(kept[0].label, "pkg009/src/m099.rs");
+        assert_eq!(matching_quick_open_rows(rows.clone(), "", 500).len(), 500);
+        assert!(matching_quick_open_rows(rows, "nothing", 500).is_empty());
+    }
+
+    #[test]
+    fn search_results_group_hits_under_their_file() {
+        let hits = [hit("/r/a.rs", 1), hit("/r/a.rs", 9), hit("/r/sub/b.rs", 3)];
+        let rows = search_rows(&hits, &HashSet::new());
+        assert_eq!(
+            rows,
+            [
+                SearchRow::File {
+                    path: PathBuf::from("/r/a.rs"),
+                    count: 2
+                },
+                SearchRow::Hit(0),
+                SearchRow::Hit(1),
+                SearchRow::File {
+                    path: PathBuf::from("/r/sub/b.rs"),
+                    count: 1
+                },
+                SearchRow::Hit(2),
+            ]
+        );
+        // A collapsed file keeps its row and count, without its hits.
+        let collapsed = HashSet::from([PathBuf::from("/r/a.rs")]);
+        let rows = search_rows(&hits, &collapsed);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[1],
+            SearchRow::File {
+                path: PathBuf::from("/r/sub/b.rs"),
+                count: 1
+            }
+        );
+    }
+
+    #[test]
+    fn the_search_summary_counts_results_and_files_and_says_when_it_was_limited() {
+        let mut found = search::FolderSearch {
+            hits: vec![hit("/r/a.rs", 1), hit("/r/b.rs", 2)],
+            files_matched: 2,
+            files_searched: 20_000,
+            files_total: 20_000,
+            limited: false,
+        };
+        assert_eq!(search_summary(&found), "2 results in 2 files");
+        found.hits.truncate(1);
+        found.files_matched = 1;
+        assert_eq!(search_summary(&found), "1 result in 1 file");
+        found.limited = true;
+        found.files_searched = 700;
+        assert_eq!(
+            search_summary(&found),
+            "1 result in 1 file \u{2014} results limited; searched 700 of 20000 files"
+        );
+    }
+
+    #[test]
+    fn enter_and_shift_enter_walk_the_hits_round() {
+        assert_eq!(step_hit(None, 0, true), None);
+        assert_eq!(step_hit(None, 3, true), Some(0));
+        assert_eq!(step_hit(None, 3, false), Some(2));
+        assert_eq!(step_hit(Some(2), 3, true), Some(0));
+        assert_eq!(step_hit(Some(0), 3, false), Some(2));
     }
 
     #[test]

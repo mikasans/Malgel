@@ -8,9 +8,10 @@
 
 use std::path::PathBuf;
 
-/// The most hits one search hands the window. A common word in a large folder
-/// matches tens of thousands of lines; the cap keeps the palette usable.
-pub const MAX_HITS: usize = 500;
+/// The most hits one search hands the window, as VS Code's
+/// `search.maxResults` does. Only the hit count is capped — never the files
+/// walked — and a capped search says so ([`FolderSearch::limited`]).
+pub const MAX_HITS: usize = 10_000;
 
 /// One line of one file that holds the query.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,54 +80,120 @@ pub fn search_text(text: &str, query: &str, limit: usize) -> Vec<(usize, usize, 
 /// Search `files` in the order given, at most `limit` hits in total.
 #[cfg(test)]
 pub fn search_files(files: &[PathBuf], query: &str, limit: usize) -> Vec<Hit> {
-    search_files_until(
+    search_folder_files(
         files,
         query,
         limit,
         &std::sync::atomic::AtomicBool::new(false),
     )
+    .hits
 }
 
-/// [`search_files`], stopping between files once `cancel` is set, so a
-/// search the user dismissed stops reading the folder.
-pub fn search_files_until(
+/// What a search of a folder found, and how much of the folder it read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FolderSearch {
+    pub hits: Vec<Hit>,
+    /// Files with at least one hit.
+    pub files_matched: usize,
+    /// Files read before the search stopped.
+    pub files_searched: usize,
+    /// Files the folder listing holds.
+    pub files_total: usize,
+    /// The hit cap stopped the search before the last file.
+    pub limited: bool,
+}
+
+/// Search `files` in order, at most `limit` hits, counting how far it got.
+pub fn search_folder_files(
     files: &[PathBuf],
     query: &str,
     limit: usize,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Vec<Hit> {
-    let mut hits = Vec::new();
+) -> FolderSearch {
+    let mut out = FolderSearch {
+        files_total: files.len(),
+        ..FolderSearch::default()
+    };
     if query.is_empty() {
-        return hits;
+        return out;
     }
     for path in files {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        let left = limit.saturating_sub(hits.len());
+        let left = limit.saturating_sub(out.hits.len());
         if left == 0 {
+            out.limited = true;
             break;
         }
-        let Ok(bytes) = std::fs::read(path) else {
+        out.files_searched += 1;
+        let Some(text) = read_text(path) else {
             continue;
         };
-        if bytes.contains(&0) {
-            // A NUL byte means this is not text, whoever named it `.md`.
+        let found = search_text(&text, query, left);
+        if found.is_empty() {
             continue;
         }
-        let Ok(text) = String::from_utf8(bytes) else {
-            continue;
-        };
-        for (line, column, text) in search_text(&text, query, left) {
-            hits.push(Hit {
+        out.files_matched += 1;
+        if found.len() == left {
+            // The cap may have cut this file short; whether more files were
+            // left is settled on the next turn round the loop.
+            out.limited = out.files_searched < files.len()
+                || search_text(&text, query, left + 1).len() > left;
+        }
+        out.hits
+            .extend(found.into_iter().map(|(line, column, text)| Hit {
                 path: path.clone(),
                 line,
                 column,
                 text,
-            });
+            }));
+    }
+    out
+}
+
+/// A file's text, or `None` when it cannot be read or is not UTF-8 text.
+fn read_text(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// How many occurrences of `find` the files hold, and in how many files,
+/// with the same smart-case rule Replace uses. Uncapped: this is what a
+/// Replace All is about to change.
+pub fn count_in_files(files: &[PathBuf], find: &str) -> (usize, usize) {
+    let (mut occurrences, mut matched) = (0, 0);
+    for path in files {
+        let Some(text) = read_text(path) else {
+            continue;
+        };
+        let n = count_in_text(&text, find);
+        if n > 0 {
+            occurrences += n;
+            matched += 1;
         }
     }
-    hits
+    (occurrences, matched)
+}
+
+fn count_in_text(text: &str, find: &str) -> usize {
+    if find.is_empty() {
+        return 0;
+    }
+    if case_sensitive(find) {
+        return text.matches(find).count();
+    }
+    // Cheap pre-check before the character-wise walk.
+    if find.is_ascii() && text.is_ascii() {
+        return text
+            .to_ascii_lowercase()
+            .matches(&find.to_ascii_lowercase())
+            .count();
+    }
+    replace_in_text(text, find, "").1
 }
 
 /// Replace every occurrence of `find` in `text` with `replace`, using the same
@@ -165,28 +232,27 @@ pub fn replace_in_text(text: &str, find: &str, replace: &str) -> (String, usize)
 }
 
 /// Apply [`replace_in_text`] to each path that can be read as UTF-8 text.
-/// Returns total replacements across files that were written.
-pub fn replace_in_files(files: &[PathBuf], find: &str, replace: &str) -> usize {
+/// Returns `(replacements, files written)`, and the files written.
+pub fn replace_in_files(files: &[PathBuf], find: &str, replace: &str) -> (usize, Vec<PathBuf>) {
     let mut total = 0;
+    let mut written = Vec::new();
     for path in files {
-        let Ok(bytes) = std::fs::read(path) else {
+        let Some(text) = read_text(path) else {
             continue;
         };
-        if bytes.contains(&0) {
+        if count_in_text(&text, find) == 0 {
             continue;
         }
-        let Ok(text) = String::from_utf8(bytes) else {
-            continue;
-        };
         let (next, n) = replace_in_text(&text, find, replace);
         if n == 0 {
             continue;
         }
         if std::fs::write(path, next.as_bytes()).is_ok() {
             total += n;
+            written.push(path.clone());
         }
     }
-    total
+    (total, written)
 }
 
 #[cfg(test)]
@@ -207,9 +273,18 @@ mod tests {
         std::fs::write(&file, "needle\n").unwrap();
         let files = vec![file.clone(), file];
         let cancel = std::sync::atomic::AtomicBool::new(true);
-        assert!(search_files_until(&files, "needle", 10, &cancel).is_empty());
+        assert!(
+            search_folder_files(&files, "needle", 10, &cancel)
+                .hits
+                .is_empty()
+        );
         cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(search_files_until(&files, "needle", 10, &cancel).len(), 2);
+        assert_eq!(
+            search_folder_files(&files, "needle", 10, &cancel)
+                .hits
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -282,6 +357,59 @@ mod tests {
         // A file that is not there is passed over, not an error.
         assert!(search_files(&[dir.join("gone.md")], "needle", 10).is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_search_reads_every_file_and_says_when_the_hit_cap_bit() {
+        let dir = scratch("folder");
+        let files: Vec<PathBuf> = (0..30)
+            .map(|ix| {
+                let path = dir.join(format!("f{ix:02}.rs"));
+                let body = if ix == 0 || ix == 29 {
+                    format!("fn token_{ix}() {{}}\n")
+                } else {
+                    "fn other() {}\n".to_string()
+                };
+                std::fs::write(&path, body).unwrap();
+                path
+            })
+            .collect();
+        let none = std::sync::atomic::AtomicBool::new(false);
+        // The first and last file are both reached: nothing caps the walk.
+        let found = search_folder_files(&files, "token_", 100, &none);
+        assert_eq!(found.hits.len(), 2);
+        assert_eq!((found.files_searched, found.files_total), (30, 30));
+        assert_eq!(found.files_matched, 2);
+        assert!(!found.limited);
+        // Only the hit cap stops it, and then it says how far it got.
+        let found = search_folder_files(&files, "fn", 5, &none);
+        assert_eq!(found.hits.len(), 5);
+        assert!(found.limited);
+        assert_eq!(found.files_searched, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn counting_and_replacing_agree_on_every_file() {
+        let dir = scratch("replace-all");
+        let files: Vec<PathBuf> = (0..12)
+            .map(|ix| {
+                let path = dir.join(format!("r{ix}.md"));
+                let body = if ix % 3 == 0 {
+                    "Alpha alpha\n"
+                } else {
+                    "beta\n"
+                };
+                std::fs::write(&path, body).unwrap();
+                path
+            })
+            .collect();
+        assert_eq!(count_in_files(&files, "alpha"), (8, 4));
+        assert_eq!(count_in_files(&files, "Alpha"), (4, 4));
+        let (n, written) = replace_in_files(&files, "alpha", "gamma");
+        assert_eq!((n, written.len()), (8, 4));
+        assert_eq!(count_in_files(&files, "alpha"), (0, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

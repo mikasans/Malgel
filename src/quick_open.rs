@@ -15,10 +15,12 @@ use ignore::WalkBuilder;
 pub const MAX_DEPTH: usize = 6;
 /// The deepest a folder the user opened in the sidebar may pull the walk.
 const MAX_OPENED_DEPTH: usize = 24;
-/// The most files one listing hands to the palette. A writing folder runs to
-/// the hundreds; the cap keeps a folder opened by accident from filling the
-/// picker with tens of thousands of rows.
-pub const MAX_FILES: usize = 4000;
+/// The most files one listing holds. A writing folder runs to the hundreds and
+/// a big repository to tens of thousands; every one of those must reach Quick
+/// Open and Find in Files, so this is only a backstop against a folder opened
+/// by accident (a home directory, `/`). The walk is ordered, so when it does
+/// bite it keeps the same files every time, and callers can tell it did.
+pub const MAX_FILES: usize = 200_000;
 
 /// Every file under `root` the palette should offer, by path.
 ///
@@ -43,8 +45,10 @@ pub fn files_under(
         .ignore(true)
         .parents(true)
         .follow_links(false)
-        // One thread: this runs beside the UI, not in place of it.
+        // One thread: this runs beside the UI, not in place of it. Sorted, so
+        // the listing (and a capped one) is the same on every run.
         .threads(1)
+        .sort_by_file_name(|a, b| a.cmp(b))
         .filter_entry(move |entry| {
             let depth = entry.depth();
             if depth < MAX_DEPTH {

@@ -153,6 +153,23 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Hand memory the allocator holds but no longer uses back to the system,
+/// after a burst such as a folder search (its file list and the text of
+/// every file it read) — otherwise RSS stays at the burst's high-water mark.
+pub fn release_free_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: glibc's malloc_trim only returns free heap pages to the
+        // kernel; it touches no live allocation.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Quiet status-bar pulse (RSS · CPU). One background thread; 1.5s sample.
 // ---------------------------------------------------------------------------
