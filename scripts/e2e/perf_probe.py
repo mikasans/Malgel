@@ -491,12 +491,21 @@ def run(args):
 
         # Back to the editor, then idle.
         x.chord("ctrl+grave")
+        t_input = time.monotonic()
         time.sleep(2.5)
+        # While the caret still blinks (informational: each blink is a
+        # full-window repaint, which a software renderer pays for).
+        metrics["idle_cpu_focused_blink_pct"] = idle_cpu(app.pid, args.idle_seconds)
+        # Focused and idle: past the caret's blink timeout (10 s after the
+        # last input, as GTK's gtk-cursor-blink-timeout) it rests on.
+        rest = args.focused_settle_seconds - (time.monotonic() - t_input)
+        if rest > 0:
+            time.sleep(rest)
         metrics["idle_cpu_focused_pct"] = idle_cpu(app.pid, args.idle_seconds)
         x.steal_focus()
         time.sleep(2.5)
         metrics["idle_cpu_pct"] = idle_cpu(app.pid, args.idle_seconds)
-        log(f"idle cpu focused {metrics['idle_cpu_focused_pct']:.1f}% background {metrics['idle_cpu_pct']:.1f}%")
+        log(f"idle cpu blinking {metrics['idle_cpu_focused_blink_pct']:.1f}% focused {metrics['idle_cpu_focused_pct']:.1f}% background {metrics['idle_cpu_pct']:.1f}%")
 
         hwm = proc_status(app.pid, "VmHWM")
         rss = proc_status(app.pid, "VmRSS")
@@ -598,6 +607,7 @@ def main():
     r.add_argument("--art")
     r.add_argument("--out", required=True)
     r.add_argument("--idle-seconds", type=float, default=5.0)
+    r.add_argument("--focused-settle-seconds", type=float, default=11.0)
     r.add_argument("--ctrl-c-timeout-ms", type=float, default=3000.0)
     g = sub.add_parser("gate")
     g.add_argument("--thresholds", required=True)
@@ -614,7 +624,7 @@ def main():
     if args.cmd == "gate":
         return gate(args)
     # Absolute slack per metric for compare, where ±15% of a tiny number is noise.
-    args.floor = {"idle_cpu_pct": 2.0, "idle_cpu_focused_pct": 3.0}
+    args.floor = {"idle_cpu_pct": 2.0, "idle_cpu_focused_pct": 2.0, "idle_cpu_focused_blink_pct": 3.0}
     return compare(args)
 
 

@@ -15,6 +15,9 @@
   "rss_peak_mib": {
     "max": 600
   },
+  "idle_cpu_focused_pct": {
+    "max": 5
+  },
   "idle_cpu_pct": {
     "max": 5
   }

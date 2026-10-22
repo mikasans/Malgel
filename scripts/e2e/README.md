@@ -109,7 +109,8 @@ numbers and screenshots.
 | `terminal_seq_ms`, `terminal_cat20mb_ms` | Enter → shell done and panel still (`seq 1 200000`, `cat` of 20 MB) |
 | `ctrl_c_to_prompt_ms` | Ctrl+C during `sleep` → process gone and transcript repainted |
 | `idle_cpu_pct` | app + children CPU over 5 s with the window in the background |
-| `idle_cpu_focused_pct` | the same with focus (caret blinking); reported, not gated |
+| `idle_cpu_focused_pct` | the same with the window focused and idle: from 11 s after the last key, once the caret has stopped blinking (10 s timeout, as GTK) |
+| `idle_cpu_focused_blink_pct` | focused, 2.5–7.5 s after the last key, caret still blinking; reported, not gated |
 | `rss_peak_mib`, `rss_final_mib` | VmHWM / VmRSS at the end |
 
 `perf_thresholds.json` holds the budget. A median over a blocking `max`
