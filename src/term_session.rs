@@ -163,7 +163,7 @@ impl InputQueue {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn pending_len(&self) -> usize {
         self.state.lock().map(|s| s.pending.len()).unwrap_or(0)
     }
@@ -447,7 +447,7 @@ impl PtySession {
     }
 
     /// Bytes queued for the program but not yet written.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn pending_input(&self) -> usize {
         self.input.pending_len()
     }
@@ -532,7 +532,7 @@ impl PtySession {
 
     /// Text of view rows `range` (indices as in [`ViewInfo::line_count`]),
     /// clamped to what exists now.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn rows(&self, range: std::ops::Range<usize>) -> Vec<String> {
         let term = self.shared.term.lock();
         rows_term(&term, range)
@@ -1067,7 +1067,8 @@ pub fn encode_key(
     Some(bytes)
 }
 
-#[cfg(test)]
+// The sessions under test are `/bin/sh` scripts on a Unix PTY.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
