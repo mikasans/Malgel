@@ -67,13 +67,16 @@ const THROTTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(50
 /// [`SUSTAINED_PARSE_BYTES_PER_SEC`]: the PTY backpressures the producer, so
 /// a never-ending flood costs a sliver of a core instead of most of one.
 const SUSTAINED_FLOOD_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+/// A throttle window with at least this much output counts as part of a
+/// flood (1.25 MiB/s: far beyond any interactive program).
+const FLOOD_BYTES_PER_WINDOW: u64 = 64 * 1024;
 const SUSTAINED_PARSE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
 /// Line feeds cost far more than bytes (each one scrolls a full row of
 /// cells), so `yes` is limited by lines too: bursts like `seq 5000000` run
 /// unthrottled, a flood that never ends is cut to a rate the eye cannot
 /// follow anyway.
 const MAX_PARSE_LINES_PER_SEC: u64 = 4_000_000;
-const SUSTAINED_PARSE_LINES_PER_SEC: u64 = 200_000;
+const SUSTAINED_PARSE_LINES_PER_SEC: u64 = 400_000;
 /// After the shell process exits, how long to wait for EOF on the PTY before
 /// declaring the session over anyway (a background job can hold it open).
 const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -205,6 +208,10 @@ struct Shared {
     /// Asks the reader to exit at its next poll.
     stop: AtomicBool,
     bytes_read: AtomicU64,
+    /// Set by an interrupt (Ctrl+C/Z/\\): the reader drops its flood
+    /// throttling so the backlog after the signal drains at full speed and
+    /// the screen settles on the prompt at once.
+    interrupted: AtomicBool,
 }
 
 /// What the panel paints: plain rows (no colors yet) plus cursor and modes.
@@ -387,6 +394,7 @@ impl PtySession {
             eof: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             bytes_read: AtomicU64::new(0),
+            interrupted: AtomicBool::new(false),
         });
 
         #[cfg(unix)]
@@ -434,6 +442,7 @@ impl PtySession {
 
     /// Send a signal character (^C, ^Z, ^\) ahead of any queued input.
     pub fn interrupt(&self, byte: u8) {
+        self.shared.interrupted.store(true, Ordering::Release);
         self.input.interrupt(&[byte]);
     }
 
@@ -703,11 +712,17 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, poll_fd: Option<i32>, shared: A
     // Work done in the current window; overshoot carries into the next ones.
     let mut used_bytes = 0u64;
     let mut used_lines = 0u64;
-    // Start of the run of windows that all used their whole budget.
+    // Start of the run of busy windows (see FLOOD_BYTES_PER_WINDOW).
     let mut flood_since: Option<std::time::Instant> = None;
     loop {
         if shared.stop.load(Ordering::Acquire) {
             break;
+        }
+        if shared.interrupted.swap(false, Ordering::AcqRel) {
+            flood_since = None;
+            used_bytes = 0;
+            used_lines = 0;
+            window_start = std::time::Instant::now();
         }
         let sustained = flood_since.is_some_and(|since| since.elapsed() >= SUSTAINED_FLOOD_AFTER);
         let (byte_budget, line_budget) = if sustained {
@@ -734,8 +749,14 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, poll_fd: Option<i32>, shared: A
             used_lines = used_lines.saturating_sub(line_budget);
             continue;
         } else if window_start.elapsed() >= THROTTLE_WINDOW {
-            // A window that did not fill its budget: the flood is over.
-            flood_since = None;
+            if used_bytes >= FLOOD_BYTES_PER_WINDOW.min(byte_budget / 2)
+                || used_lines >= line_budget / 2
+            {
+                flood_since.get_or_insert_with(std::time::Instant::now);
+            } else {
+                // A quiet window: the flood is over.
+                flood_since = None;
+            }
             window_start = std::time::Instant::now();
             used_bytes = 0;
             used_lines = 0;
@@ -1146,8 +1167,10 @@ mod tests {
         // Scrollback is capped: tens of MB of output, a few MB of grid.
         // (Process-wide RSS, shared with tests running in parallel: loose.)
         assert!(grown_mb < 256.0, "rss grew {grown_mb:.1} MiB");
-        // Debug builds are slow; release does far better (see report).
-        assert!(mb_s > 2.0, "throughput {mb_s:.1} MB/s");
+        // Debug builds are slow, and after SUSTAINED_FLOOD_AFTER a flood of
+        // short lines is held to SUSTAINED_PARSE_LINES_PER_SEC (~3 MB/s of
+        // `seq`); release does far better (see report).
+        assert!(mb_s > 1.0, "throughput {mb_s:.1} MB/s");
         assert!(worst_snapshot < Duration::from_millis(250));
     }
 

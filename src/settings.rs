@@ -104,6 +104,9 @@ pub struct Settings {
     /// like VS Code. Off: a clean shell (`bash --norc --noprofile`), for a
     /// broken rc that would kill the session.
     pub terminal_shell_config: bool,
+    /// Terminal panel height in pixels after the user dragged its divider;
+    /// `None`: a third of the window (VS Code).
+    pub terminal_panel_height: Option<f32>,
 
     /// Hide everything but the text, dimming all but the current paragraph.
     /// Lasts until turned off or Malgel quits.
@@ -129,6 +132,7 @@ impl Default for Settings {
             show_hidden_entries: false,
             centered_layout: false,
             terminal_shell_config: true,
+            terminal_panel_height: None,
             file_sidebar: false,
             outline_sidebar: false,
             problems_panel: false,

@@ -9370,11 +9370,26 @@ impl Workspace {
             } else {
                 // VS Code opens the panel at about a third of the window; a
                 // fixed 12rem left ~4 rows of output. Drag the divider to
-                // resize (up to 80% of the window).
+                // resize (up to 80% of the window); the height is kept.
                 let min_h = rems(6.).to_pixels(rem);
                 let max_h = (viewport_h * 0.8).max(rems(28.).to_pixels(rem));
-                let term_h = (viewport_h / 3.).max(rems(12.).to_pixels(rem)).min(max_h);
+                let term_h = AppSettings::get(cx)
+                    .terminal_panel_height
+                    .map(px)
+                    .unwrap_or_else(|| (viewport_h / 3.).max(rems(12.).to_pixels(rem)))
+                    .clamp(min_h, max_h);
                 v_resizable("center-with-terminal")
+                    .on_resize(|state, _, cx| {
+                        let Some(height) = state.read(cx).sizes().get(1).copied() else {
+                            return;
+                        };
+                        let height = f32::from(height).round();
+                        if height > 0. {
+                            AppSettings::update(cx, |settings| {
+                                settings.terminal_panel_height = Some(height)
+                            });
+                        }
+                    })
                     .child(
                         resizable_panel()
                             .size_range(rems(12.).to_pixels(rem)..Pixels::MAX)

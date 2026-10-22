@@ -71,12 +71,14 @@ const FONT_REMS: f32 = 0.875;
 const PUMP_INTERVAL: Duration = Duration::from_millis(16);
 /// While output streams (a flood, not an echo), repaint at most this often:
 /// nobody reads 60 frames of `yes`, and every frame repaints the window.
-const FLOOD_FRAME: Duration = Duration::from_millis(80);
+const FLOOD_FRAME: Duration = Duration::from_millis(100);
 /// A flood that has gone on this long (`yes`, a runaway log) drops to
 /// [`SUSTAINED_FLOOD_FRAME`]: on a software renderer each frame of a full
 /// window costs a core-fraction, and the text is a blur anyway.
-const SUSTAINED_FLOOD_AFTER: Duration = Duration::from_secs(1);
-const SUSTAINED_FLOOD_FRAME: Duration = Duration::from_millis(250);
+const SUSTAINED_FLOOD_AFTER: Duration = Duration::from_millis(500);
+const SUSTAINED_FLOOD_FRAME: Duration = Duration::from_millis(333);
+/// How long after Ctrl+C/Z/\\ output is painted unthrottled.
+const INTERRUPT_FAST_PAINT: Duration = Duration::from_millis(1000);
 /// Bytes per tick below which output counts as interactive (echo, prompt)
 /// and is painted at once.
 const ECHO_BYTES: u64 = 4096;
@@ -152,6 +154,8 @@ pub struct TerminalPanel {
     bytes_at_paint: u64,
     /// When the current flood (painting throttled) began.
     flood_since: Option<Instant>,
+    /// After an interrupt, paint every tick until then.
+    fast_paint_until: Option<Instant>,
     _pump: Option<gpui_kit::Task<()>>,
     /// Stick output viewport to the end while the user has not scrolled up.
     follow_tail: bool,
@@ -217,6 +221,7 @@ impl TerminalPanel {
             last_paint: Instant::now(),
             bytes_at_paint: 0,
             flood_since: None,
+            fast_paint_until: None,
             _pump: None,
             follow_tail: true,
         }
@@ -437,6 +442,10 @@ impl TerminalPanel {
             };
             // Signals jump any queued input; a half-typed IME line is dropped.
             session.interrupt(byte);
+            // Skip the flood frame rate: paint what is there now and keep
+            // painting every tick until the prompt is up.
+            self.flood_since = None;
+            self.fast_paint_until = Some(Instant::now() + INTERRUPT_FAST_PAINT);
             if pending {
                 self.input
                     .update(cx, |input, cx| input.set_value("", window, cx));
@@ -556,7 +565,10 @@ impl TerminalPanel {
                 Some(since) if since.elapsed() >= SUSTAINED_FLOOD_AFTER => SUSTAINED_FLOOD_FRAME,
                 _ => FLOOD_FRAME,
             };
-            if streaming && self.last_paint.elapsed() < frame {
+            let fast = self
+                .fast_paint_until
+                .is_some_and(|until| Instant::now() < until);
+            if streaming && !fast && self.last_paint.elapsed() < frame {
                 // Leave the dirty flag set; paint on a later tick.
                 return true;
             }
@@ -566,7 +578,7 @@ impl TerminalPanel {
                 }
                 return true;
             }
-            if streaming {
+            if streaming && !fast {
                 self.flood_since.get_or_insert_with(Instant::now);
             } else {
                 self.flood_since = None;

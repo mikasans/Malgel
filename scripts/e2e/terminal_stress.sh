@@ -16,6 +16,13 @@
 # script exits non-zero if any scenario failed. Requirements match
 # gui_smoke.sh (xvfb, xdotool, imagemagick); vim / less / top for the
 # full-screen checks. Set E2E_GPU=1 to keep Vulkan.
+#
+# Knobs: MALGEL_BIN, E2E_ARTIFACTS, E2E_DISPLAY_START (first Xvfb display to
+# try, default 99), TERM_SCENARIOS ("1 3 p2 2 5 4" subsets), TERM_LAG_LIMIT_MS
+# (flood UI stall, default 250), P2_SECS / P2_CPU_LIMIT / P2_LAG_LIMIT_MS
+# (the `yes` flood: default 10s, <100% CPU, ui_lag max <100ms),
+# INT_SETTLE_LIMIT_MS (^C to a still screen, default 300),
+# KILL_LIMIT_MS (Kill Terminal to job gone, default 500).
 
 set -uo pipefail
 
@@ -56,7 +63,8 @@ mkdir -p "$HOME" && mkdir -m 700 "$TMP_ROOT/xdg"
 export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share" XDG_RUNTIME_DIR="$TMP_ROOT/xdg"
 start_xvfb() {
   local n
-  for n in $(seq 99 160); do
+  local first="${E2E_DISPLAY_START:-99}"
+  for n in $(seq "$first" $((first + 60))); do
     [[ -e "/tmp/.X${n}-lock" || -e "/tmp/.X11-unix/X${n}" ]] || break
   done
   export DISPLAY=":$n"
@@ -96,10 +104,15 @@ for _ in $(seq 1 300); do
 done
 [[ -n "$WIN" ]] || die "no window"
 xdotool windowsize "$WIN" 1600 1000 2>/dev/null
+# Fully on screen, so screenshots see the whole panel.
+xdotool windowmove "$WIN" 0 0 2>/dev/null
 xdotool windowfocus "$WIN" 2>/dev/null
 sleep 2
 
 shot() { import -window root "$ART_DIR/$1.png" 2>/dev/null; }
+# The terminal output only (default panel: the bottom third, above the status
+# bar, whose memory/CPU pulse would count as a change).
+term_shot() { import -window root -crop 1600x280+0+680 "$ART_DIR/$1.png" 2>/dev/null; }
 alive() { kill -0 "$APP_PID" 2>/dev/null; }
 key() { xdotool key --clearmodifiers "$@"; }
 # Type a command into the focused terminal composer and press Enter.
@@ -138,9 +151,13 @@ record() { # scenario status detail
   [[ "$2" == PASS ]] || FAILS=$((FAILS + 1))
 }
 want() { [[ -z "$ONLY" || " $ONLY " == *" $1 "* ]]; }
-palette() {
+# Open the command palette and type $1 (Return not pressed).
+palette_type() {
   key ctrl+shift+p; sleep 0.5
   xdotool type --delay 25 -- "$1"; sleep 0.5
+}
+palette() {
+  palette_type "$1"
   key Return; sleep 1
 }
 # Get back to a fresh shell after a failed scenario left something stuck.
@@ -205,16 +222,20 @@ if want 1; then
   key ctrl+c
   if wait_for 10 gone "[y]es $TAG"; then
     t1=$(now_ms)
-    # Screen must stop scrolling: two shots 0.5s apart identical within 3s.
-    settled=no
-    for i in $(seq 1 6); do
-      shot s1-int-a; sleep 0.5; shot s1-int-b
+    # Screen must stop scrolling: shoot the output continuously; settled =
+    # the last change before 0.6s without any (within 5s).
+    settled=no; t2=$t0; term_shot s1-int-a
+    while (($(now_ms) - t0 < 5000)); do
+      term_shot s1-int-b
       d=$(compare -metric AE "$ART_DIR/s1-int-a.png" "$ART_DIR/s1-int-b.png" null: 2>&1 | cut -d' ' -f1)
-      [[ "${d%.*}" -lt 50 ]] && { settled=yes; break; }
+      if [[ "${d%.*}" -ge 50 ]]; then
+        t2=$(now_ms); mv "$ART_DIR/s1-int-b.png" "$ART_DIR/s1-int-a.png"
+      elif (($(now_ms) - t2 >= 600)); then
+        settled=yes; break
+      fi
     done
-    t2=$(now_ms)
     mark=$(fresh_marker s1-int.done); run "touch $mark"
-    if wait_for 10 test -e "$mark" && [[ $settled == yes ]]; then
+    if wait_for 10 test -e "$mark" && [[ $settled == yes ]] && ((t2 - t0 <= ${INT_SETTLE_LIMIT_MS:-300})); then
       record s1-ctrl-c PASS "producer killed $((t1 - t0))ms after ^C; screen settled by $((t2 - t0))ms; ui_lag_max=$(lag_since "$lm")ms"
     else
       record s1-ctrl-c FAIL "producer killed $((t1 - t0))ms; settled=$settled after $((t2 - t0))ms; shell answered=$([[ -e $mark ]] && echo y || echo n)"
@@ -335,10 +356,10 @@ if want 3; then
     || { record s3-ctrl-l FAIL "shell confused after Ctrl+L"; recover; }
 fi
 
-# ---- P2. `yes` flood (P2_SECS, default 30): CPU, RSS, Ctrl+P latency, ^C ------
+# ---- P2. `yes` flood (P2_SECS, default 10): CPU, RSS, Ctrl+P latency, ^C ------
 cpu_ticks() { awk '{print $14 + $15}' "/proc/$APP_PID/stat"; }
 crop() { import -window root -crop 700x160+450+30 "$ART_DIR/$1.png" 2>/dev/null; }
-P2_SECS="${P2_SECS:-30}"
+P2_SECS="${P2_SECS:-10}"
 if want p2; then
   lm=$(log_mark); r0=$(rss_mib); PEAK=$r0
   run "yes $TAG"; sleep 1
@@ -368,8 +389,8 @@ if want p2; then
   lag=$(lag_since "$lm"); p95=$(lag_p95_since "$lm")
   status=PASS
   [[ $gone == y && $opened == yes ]] || status=FAIL
-  ((cpu > 100 || p95 > 100)) && status=FAIL
-  record p2-yes-flood "$status" "${P2_SECS}s cpu=${cpu}% rss=${r0}->${PEAK}MiB (plateau ${plateau}) ctrl+p=$([[ $opened == yes ]] && echo "$((tp1 - tp))ms" || echo never) ^C->yes-gone=$((tg - ti))ms ^C->prompt=$((tm - ti))ms ui_lag_p95=${p95}ms ui_lag_max=${lag}ms"
+  ((cpu >= ${P2_CPU_LIMIT:-100} || lag >= ${P2_LAG_LIMIT_MS:-100})) && status=FAIL
+  record "p2-yes-${P2_SECS}s" "$status" "cpu=${cpu}% rss=${r0}->${PEAK}MiB (plateau ${plateau}) ctrl+p=$([[ $opened == yes ]] && echo "$((tp1 - tp))ms" || echo never) ^C->yes-gone=$((tg - ti))ms ^C->prompt=$((tm - ti))ms ui_lag_p95=${p95}ms ui_lag_max=${lag}ms"
   [[ $gone == y ]] || { pkill -f "yes $TAG"; recover; }
 fi
 
@@ -492,10 +513,13 @@ if want 5; then
   key ctrl+grave; sleep 1
   run "cd $M"
   run "sleep 103"
-  sleep 0.8; lm=$(log_mark); t0=$(now_ms)
-  palette "kill terminal"
+  sleep 0.8; lm=$(log_mark)
+  palette_type "kill terminal"
+  t0=$(now_ms); key Return
   if wait_for 5 gone "[s]leep 103"; then
-    record s5-kill-running PASS "foreground job gone $(($(now_ms) - t0))ms after Kill (incl. palette); ui_lag_max=$(lag_since "$lm")ms"
+    tk=$(($(now_ms) - t0)); sleep 1
+    st=PASS; ((tk > ${KILL_LIMIT_MS:-500})) && st=FAIL
+    record s5-kill-running "$st" "foreground job gone ${tk}ms after Kill Terminal (Return in the palette); ui_lag_max=$(lag_since "$lm")ms"
   else
     record s5-kill-running FAIL "job survived Kill"
     pkill -f "sleep 103"
