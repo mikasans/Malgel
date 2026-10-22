@@ -107,6 +107,48 @@ impl Drop for Span {
     }
 }
 
+/// `MALGEL_PERF=1` only: a foreground heartbeat that measures how late the
+/// main thread wakes for a 10ms timer, logged once a second as
+/// `malgel-perf: ui_lag max=..ms over50=N ticks=N`. A stalled UI thread (a
+/// flooded terminal parsing on it, a blocking PTY write) shows up as a large
+/// `max` — the number the terminal stress script asserts on.
+pub fn start_ui_lag_probe(cx: &mut gpui_kit::App) {
+    if !enabled() {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        const TICK: Duration = Duration::from_millis(10);
+        let mut window_start = Instant::now();
+        let mut max_lag = Duration::ZERO;
+        let mut over_50 = 0u32;
+        let mut ticks = 0u32;
+        loop {
+            let before = Instant::now();
+            cx.background_executor().timer(TICK).await;
+            // Resumes on the main thread: lateness is time the UI was busy.
+            let lag = before.elapsed().saturating_sub(TICK);
+            ticks += 1;
+            max_lag = max_lag.max(lag);
+            if lag > Duration::from_millis(50) {
+                over_50 += 1;
+            }
+            if window_start.elapsed() >= Duration::from_secs(1) {
+                eprintln!(
+                    "malgel-perf: ui_lag max={:.1}ms over50={over_50} ticks={ticks} (at +{:.1}ms) rss={}",
+                    max_lag.as_secs_f64() * 1000.0,
+                    since_ms(),
+                    rss_label()
+                );
+                window_start = Instant::now();
+                max_lag = Duration::ZERO;
+                over_50 = 0;
+                ticks = 0;
+            }
+        }
+    })
+    .detach();
+}
+
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
