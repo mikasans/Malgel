@@ -201,12 +201,18 @@ struct PulseState {
     label: String,
     /// Generation bumped each sample so the UI can skip redundant notify.
     generation: u64,
+    /// The CPU step and RSS the label shows, kept while a new sample stays
+    /// near them (see [`hold_cpu`], [`hold_rss`]).
+    cpu_shown: Option<u32>,
+    rss_shown: Option<u64>,
 }
 
 static PULSE_ONCE: Once = Once::new();
 static PULSE: Mutex<PulseState> = Mutex::new(PulseState {
     label: String::new(),
     generation: 0,
+    cpu_shown: None,
+    rss_shown: None,
 });
 
 /// Ensure the quiet sampler thread is running. Safe to call many times.
@@ -241,22 +247,47 @@ pub fn pulse_snapshot() -> (String, u64) {
 }
 
 fn refresh_pulse() {
-    let rss = format_rss_compact(rss_kib());
-    let cpu = format_cpu_compact(cpu_percent());
+    let (rss_kib, cpu_pct) = (rss_kib(), cpu_percent());
+    let Ok(mut state) = PULSE.lock() else {
+        return;
+    };
+    state.rss_shown = rss_kib.map(|kib| hold_rss(state.rss_shown, kib));
+    state.cpu_shown = cpu_pct.map(|pct| hold_cpu(state.cpu_shown, pct));
+    let rss = format_rss_compact(state.rss_shown);
+    let cpu = state.cpu_shown.map(|n| format!("{n}%"));
     let label = match (rss, cpu) {
         (Some(r), Some(c)) => format!("{r} · {c}"),
         (Some(r), None) => r,
         (None, Some(c)) => c,
         (None, None) => String::new(),
     };
-    if let Ok(mut state) = PULSE.lock() {
-        // Only advance generation when the label changes — otherwise the
-        // status-bar task wakes every 1.5s and forces a full UI repaint for
-        // an identical "128M · 12%" string.
-        if state.label != label {
-            state.label = label;
-            state.generation = state.generation.wrapping_add(1);
-        }
+    // Only advance generation when the label changes — otherwise the
+    // status-bar task wakes every 1.5s and forces a full UI repaint for
+    // an identical "128M · 12%" string.
+    if state.label != label {
+        state.label = label;
+        state.generation = state.generation.wrapping_add(1);
+    }
+}
+
+/// The CPU figure to show for a sample of `pct`: the 5% step it rounds to,
+/// unless the figure shown is less than a whole step away. Without the
+/// hold an idle window sitting near 2.5% flipped between "0%" and "5%"
+/// every sample, and each flip was a full repaint, which on a software
+/// renderer is itself the CPU being measured.
+fn hold_cpu(shown: Option<u32>, pct: f32) -> u32 {
+    match shown {
+        Some(shown) if (pct - shown as f32).abs() < 5.0 => shown,
+        _ => ((pct / 5.0).round() * 5.0).clamp(0.0, 995.0) as u32,
+    }
+}
+
+/// The RSS to show for a sample of `kib`: the one shown until it moves by
+/// 2 MiB, so allocator noise does not repaint the window.
+fn hold_rss(shown: Option<u64>, kib: u64) -> u64 {
+    match shown {
+        Some(shown) if shown.abs_diff(kib) < 2 * 1024 => shown,
+        _ => kib,
     }
 }
 
@@ -270,15 +301,6 @@ fn format_rss_compact(kib: Option<u64>) -> Option<String> {
     } else {
         Some(format!("{kib}K"))
     }
-}
-
-fn format_cpu_compact(pct: Option<f32>) -> Option<String> {
-    let pct = pct?;
-    // One-core percent; can exceed 100 on multi-threaded bursts. In steps
-    // of 5: the exact figure jitters every sample, and each new label is a
-    // repaint that itself costs CPU.
-    let n = ((pct / 5.0).round() * 5.0).clamp(0.0, 995.0) as u32;
-    Some(format!("{n}%"))
 }
 
 /// Process CPU percent of one core since the previous call (or `None` first time).
@@ -346,11 +368,27 @@ mod pulse_tests {
     }
 
     #[test]
-    fn formats_cpu_compactly() {
-        assert_eq!(format_cpu_compact(Some(12.4)), Some("10%".into()));
-        assert_eq!(format_cpu_compact(Some(13.0)), Some("15%".into()));
-        assert_eq!(format_cpu_compact(Some(1.9)), Some("0%".into()));
-        assert_eq!(format_cpu_compact(Some(0.0)), Some("0%".into()));
+    fn cpu_is_shown_in_steps_of_five_and_held_near_the_last_step() {
+        // One-core percent in steps of 5.
+        assert_eq!(hold_cpu(None, 12.4), 10);
+        assert_eq!(hold_cpu(None, 13.0), 15);
+        assert_eq!(hold_cpu(None, 1.9), 0);
+        // Idle noise around 2.5% no longer flips the label (and repaints).
+        assert_eq!(hold_cpu(Some(5), 2.0), 5);
+        assert_eq!(hold_cpu(Some(5), 0.4), 5);
+        assert_eq!(hold_cpu(Some(0), 3.9), 0);
+        // A real change moves it.
+        assert_eq!(hold_cpu(Some(5), 12.4), 10);
+        assert_eq!(hold_cpu(Some(0), 5.0), 5);
+        assert_eq!(hold_cpu(Some(20), 0.0), 0);
+    }
+
+    #[test]
+    fn rss_is_held_until_it_moves_two_mebibytes() {
+        assert_eq!(hold_rss(None, 200_000), 200_000);
+        assert_eq!(hold_rss(Some(200_000), 201_000), 200_000);
+        assert_eq!(hold_rss(Some(200_000), 199_000), 200_000);
+        assert_eq!(hold_rss(Some(200_000), 203_000), 203_000);
     }
 
     // RSS comes from /proc/self/status, so the pulse label is only populated on Linux.
