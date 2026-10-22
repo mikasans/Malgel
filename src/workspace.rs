@@ -4297,7 +4297,13 @@ impl Workspace {
             .filter_map(|id| {
                 self.document_index(*id).and_then(|ix| {
                     let doc = &self.documents[ix];
-                    if doc.read(cx).is_dirty() && !self.discarded.contains(id) {
+                    // A view whose file stays open in another view that is
+                    // not closing asks nothing; that view keeps the edits.
+                    let kept_elsewhere = self
+                        .twins_of(doc, cx)
+                        .iter()
+                        .any(|twin| !valid_targets.contains(&twin.entity_id()));
+                    if doc.read(cx).is_dirty() && !self.discarded.contains(id) && !kept_elsewhere {
                         Some(doc.clone())
                     } else {
                         None
@@ -4305,6 +4311,30 @@ impl Workspace {
                 })
             })
             .collect();
+        // Both views of one file closing: ask about the file once.
+        let mut asked = HashSet::new();
+        let dirty: Vec<Entity<DocumentView>> = dirty
+            .into_iter()
+            .filter(|doc| match doc.read(cx).path() {
+                Some(path) => asked.insert(path.clone()),
+                None => true,
+            })
+            .collect();
+        // Views that close without asking hand their edits to the view
+        // that stays.
+        for id in &valid_targets {
+            if let Some(doc) = self
+                .document_index(*id)
+                .map(|ix| self.documents[ix].clone())
+                && doc.read(cx).is_dirty()
+                && self
+                    .twins_of(&doc, cx)
+                    .iter()
+                    .any(|twin| !valid_targets.contains(&twin.entity_id()))
+            {
+                self.flush_twins(&doc, window, cx);
+            }
+        }
 
         // Probe #11/#12: ≥2 dirty → one Save All / Don't Save All / Cancel.
         // Use if/else (not slice match) so the bulk path cannot fall through.
@@ -4377,6 +4407,15 @@ impl Workspace {
             .iter()
             .filter(|doc| doc.read(cx).is_dirty() && !self.discarded.contains(&doc.entity_id()))
             .cloned()
+            .collect();
+        // A file open in two views (Split Editor) is asked about once.
+        let mut asked = HashSet::new();
+        let dirty: Vec<_> = dirty
+            .into_iter()
+            .filter(|doc| match doc.read(cx).path() {
+                Some(path) => asked.insert(path.clone()),
+                None => true,
+            })
             .collect();
         match dirty.as_slice() {
             [] => self.run_after_confirm(next, window, cx),
@@ -4471,7 +4510,7 @@ impl Workspace {
                                                 this.documents[ix]
                                                     .update(cx, |doc, _| doc.discard_recovery());
                                             }
-                                            this.discarded.insert(id);
+                                            this.discard_with_twins(id, cx);
                                         }
                                         this.focus_active(window, cx);
                                         this.run_after_confirm(next, window, cx);
@@ -4526,6 +4565,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if !doc.read(cx).is_dirty() {
+            self.run_after_confirm(next, window, cx);
+            return;
+        }
+        // One of two views of a file (Split Editor): the other keeps the
+        // edits, so closing this one asks nothing, as in VS Code. Only the
+        // last view of a dirty file asks to save.
+        if matches!(next, AfterConfirm::CloseDocument(id) if id == doc.entity_id())
+            && self.flush_twins(&doc, window, cx)
+        {
             self.run_after_confirm(next, window, cx);
             return;
         }
@@ -4592,7 +4640,7 @@ impl Workspace {
                                     let id = discard_doc.entity_id();
                                     discard_doc.update(cx, |doc, _| doc.discard_recovery());
                                     _ = discard.update(cx, |this, cx| {
-                                        this.discarded.insert(id);
+                                        this.discard_with_twins(id, cx);
                                         this.focus_active(window, cx);
                                         this.run_after_confirm(next, window, cx)
                                     });
@@ -6472,6 +6520,64 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Copy `doc`'s buffer into its other views now, rather than after the
+    /// typing pause. Whether it has any.
+    fn flush_twins(
+        &mut self,
+        doc: &Entity<DocumentView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let twins = self.twins_of(doc, cx);
+        if twins.is_empty() {
+            return false;
+        }
+        let (text, dirty, saved) = doc.read(cx).mirror_state(cx);
+        for twin in twins {
+            twin.update(cx, |twin, cx| {
+                twin.mirror_text(text.clone(), dirty, saved, window, cx)
+            });
+            let key = (twin.read(cx).revision(), twin.read(cx).is_dirty());
+            self.twin_synced.insert(twin.entity_id(), key);
+        }
+        true
+    }
+
+    /// After `doc` was saved, its other views showing the same text are
+    /// clean too.
+    fn mark_twins_saved(
+        &mut self,
+        doc: &Entity<DocumentView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (text, _, saved) = doc.read(cx).mirror_state(cx);
+        for twin in self.twins_of(doc, cx) {
+            let same = {
+                let twin = twin.read(cx);
+                twin.is_dirty() && twin.mirror_state(cx).0 == text
+            };
+            if same {
+                twin.update(cx, |twin, cx| {
+                    twin.mirror_text(text.clone(), false, saved, window, cx)
+                });
+                let key = (twin.read(cx).revision(), twin.read(cx).is_dirty());
+                self.twin_synced.insert(twin.entity_id(), key);
+            }
+        }
+    }
+
+    /// Mark `id` discarded (Don't Save), and the other views of its file
+    /// with it: one answer covers the file.
+    fn discard_with_twins(&mut self, id: EntityId, cx: &App) {
+        self.discarded.insert(id);
+        if let Some(doc) = self.document_index(id).map(|ix| self.documents[ix].clone()) {
+            for twin in self.twins_of(&doc, cx) {
+                self.discarded.insert(twin.entity_id());
+            }
+        }
+    }
+
     /// The views of the same file as `doc`, other than `doc` itself.
     fn twins_of(&self, doc: &Entity<DocumentView>, cx: &App) -> Vec<Entity<DocumentView>> {
         let Some(path) = doc.read(cx).path() else {
@@ -6495,7 +6601,15 @@ impl Workspace {
     ) {
         let key = {
             let view = doc.read(cx);
-            if view.is_media() || !view.editor().focus_handle(cx).is_focused(window) {
+            if view.is_media() {
+                return;
+            }
+            if !view.editor().focus_handle(cx).is_focused(window) {
+                // Saved from a dialog or Save All while another view has
+                // the keyboard: the file's other views are saved too.
+                if !view.is_dirty() {
+                    self.mark_twins_saved(&doc, window, cx);
+                }
                 return;
             }
             (view.revision(), view.is_dirty())
