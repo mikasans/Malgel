@@ -6942,6 +6942,104 @@ impl Workspace {
             )
     }
 
+    /// Two editor groups side by side: each column has its own tab bar.
+    fn groups_side_by_side(&self) -> bool {
+        self.diff_session.is_none() && self.editor_split.is_some_and(|split| !split.vertical)
+    }
+
+    /// The second editor group's own tab bar: its one document's tab, with
+    /// the dirty dot and close box the main bar's tabs have.
+    fn render_group_tab(&self, ix: usize, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let theme = cx.theme();
+        let Some(doc_entity) = self.documents.get(ix) else {
+            return div().into_any_element();
+        };
+        let doc = doc_entity.read(cx);
+        let id = doc_entity.entity_id();
+        let dirty = doc.is_dirty();
+        let icon = doc.path().map(|path| file_type_icon(path));
+        h_flex()
+            .id("group-tabs")
+            .h(px(36.))
+            .w_full()
+            .flex_none()
+            .items_center()
+            .px_1p5()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.tab_bar)
+            .child(
+                h_flex()
+                    .id("group-tab")
+                    .group("group-tab")
+                    .h(px(28.))
+                    .max_w(px(220.))
+                    .pl_2p5()
+                    .pr_1p5()
+                    .gap_1p5()
+                    .items_center()
+                    .rounded_md()
+                    .text_sm()
+                    .bg(theme.tab_active)
+                    .text_color(theme.tab_active_foreground)
+                    .font_weight(FontWeight::MEDIUM)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        icon.unwrap_or_else(|| Icon::new(IconName::FileText))
+                            .xsmall(),
+                    )
+                    .child(div().truncate().child(doc.name().to_string()))
+                    .child(
+                        div()
+                            .id("group-tab-close")
+                            .size(px(18.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .hover(|style| style.bg(theme.list_active))
+                            .when(dirty, |this| {
+                                this.child(
+                                    div()
+                                        .size(px(7.))
+                                        .rounded_full()
+                                        .bg(theme.primary)
+                                        .group_hover("group-tab", |style| style.invisible()),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .absolute()
+                                    .invisible()
+                                    .when(!dirty, |this| this.visible())
+                                    .group_hover("group-tab", |style| style.visible())
+                                    .child(Icon::new(IconName::Close).xsmall()),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    let Some(doc) = this
+                                        .document_index(id)
+                                        .map(|ix| this.documents[ix].clone())
+                                    else {
+                                        return;
+                                    };
+                                    this.confirm_unsaved(
+                                        doc,
+                                        AfterConfirm::CloseDocument(id),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let active_ix = self.active;
@@ -6949,88 +7047,103 @@ impl Workspace {
         let workspace = cx.weak_entity();
         // A newly active tab, or one added or closed, is scrolled fully into
         // view; the handle waits for the tab's bounds if it has none yet.
+        // In a split the second group's document has a tab bar of its own
+        // (see `render_group_tab`), as each VS Code editor group does.
+        let split_other = self
+            .editor_split
+            .map(|split| split.other.min(count.saturating_sub(1)));
         let now = (active_ix, count);
         if tab_needs_reveal(self.tab_revealed.get(), now) {
-            self.tab_scroll.scroll_to_item(active_ix);
+            // The scroll area's children are the tabs shown.
+            let shown_ix = active_ix - usize::from(split_other.is_some_and(|o| o < active_ix));
+            self.tab_scroll.scroll_to_item(shown_ix);
             self.tab_revealed.set(Some(now));
         }
         let tab_scroll = self.tab_scroll.clone();
 
-        let bar = h_flex()
-            .id("tabs")
-            .h(px(36.))
-            .flex_none()
-            .items_center()
-            .px_1p5()
-            .gap_1()
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(theme.tab_bar)
-            // While a tab drags, remember the bar's bounds, the invert
-            // key's state, and, on drop, land the tab at the insertion
-            // point the tabs reported.
-            .on_drag_move::<TabDrag>(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _, cx| {
-                this.tab_bar_bounds.set(Some(event.bounds));
-                let copy = invert_key_held(&event.event.modifiers);
-                if this.tab_drag_copy.get() != copy {
-                    this.tab_drag_copy.set(copy);
-                }
-                this.note_tab_drag_move(event, cx);
-            }))
-            .on_drop(cx.listener(|this, _: &TabDrag, window, cx| {
-                this.finish_tab_drop(window, cx);
-            }))
-            .when(count > 1, |this| {
-                this.child(
-                    Button::new("tab-scroll-prev")
-                        .ghost()
-                        .xsmall()
-                        .compact()
-                        .icon(Icon::new(IconName::ChevronLeft))
-                        .tooltip("Previous tab (Ctrl+Shift+Tab)")
-                        .disabled(active_ix == 0)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let count = this.documents.len();
-                            if count > 1 {
-                                let prev = (this.active + count - 1) % count;
-                                this.activate(prev, window, cx);
-                            }
-                        })),
-                )
-            })
-            .child(
-                // Probe #16/#17: do NOT attach `.horizontal_scrollbar` here.
-                // That helper overlays an absolute inset_0 Scrollbar whose
-                // full-area hitbox can swallow right-clicks. Tab menus now
-                // open programmatically; overflow_x_scroll + chevrons remain.
-                div().relative().flex_1().min_w_0().h_full().child(
-                    h_flex()
-                        .id("tabs-scroll-area")
-                        .size_full()
-                        .items_center()
-                        .gap_1()
-                        // Tracked by the workspace's own handle, so the active
-                        // tab can be scrolled into view; its children are the
-                        // tabs alone, so a child index is a tab index.
-                        .overflow_x_scroll()
-                        .track_scroll(&tab_scroll)
-                        .children(self.documents.iter().enumerate().map(|(ix, doc_entity)| {
-                            let doc = doc_entity.read(cx);
-                            let doc_id = doc_entity.entity_id();
-                            let active = ix == active_ix;
-                            let dirty = doc.is_dirty();
-                            // The preview tab reads like a draft: the next file
-                            // clicked replaces it until it is edited or opened
-                            // for good, the way VS Code marks its preview.
-                            let is_preview = self.preview == Some(doc_id);
-                            let is_pinned = self.pinned.contains(&doc_id);
-                            let name = doc.name().to_string();
-                            // The tab carries its file's type icon, as in VS Code.
-                            let tab_icon = doc.path().map(|path| file_type_icon(path));
-                            let theme = cx.theme();
-                            let drag_label: SharedString = name.clone().into();
+        let bar =
+            h_flex()
+                .id("tabs")
+                .h(px(36.))
+                .flex_none()
+                .items_center()
+                .px_1p5()
+                .gap_1()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.tab_bar)
+                // While a tab drags, remember the bar's bounds, the invert
+                // key's state, and, on drop, land the tab at the insertion
+                // point the tabs reported.
+                .on_drag_move::<TabDrag>(cx.listener(
+                    |this, event: &DragMoveEvent<TabDrag>, _, cx| {
+                        this.tab_bar_bounds.set(Some(event.bounds));
+                        let copy = invert_key_held(&event.event.modifiers);
+                        if this.tab_drag_copy.get() != copy {
+                            this.tab_drag_copy.set(copy);
+                        }
+                        this.note_tab_drag_move(event, cx);
+                    },
+                ))
+                .on_drop(cx.listener(|this, _: &TabDrag, window, cx| {
+                    this.finish_tab_drop(window, cx);
+                }))
+                .when(count > 1, |this| {
+                    this.child(
+                        Button::new("tab-scroll-prev")
+                            .ghost()
+                            .xsmall()
+                            .compact()
+                            .icon(Icon::new(IconName::ChevronLeft))
+                            .tooltip("Previous tab (Ctrl+Shift+Tab)")
+                            .disabled(active_ix == 0)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let count = this.documents.len();
+                                if count > 1 {
+                                    let prev = (this.active + count - 1) % count;
+                                    this.activate(prev, window, cx);
+                                }
+                            })),
+                    )
+                })
+                .child(
+                    // Probe #16/#17: do NOT attach `.horizontal_scrollbar` here.
+                    // That helper overlays an absolute inset_0 Scrollbar whose
+                    // full-area hitbox can swallow right-clicks. Tab menus now
+                    // open programmatically; overflow_x_scroll + chevrons remain.
+                    div().relative().flex_1().min_w_0().h_full().child(
+                        h_flex()
+                            .id("tabs-scroll-area")
+                            .size_full()
+                            .items_center()
+                            .gap_1()
+                            // Tracked by the workspace's own handle, so the active
+                            // tab can be scrolled into view; its children are the
+                            // tabs alone, so a child index is a tab index.
+                            .overflow_x_scroll()
+                            .track_scroll(&tab_scroll)
+                            .children(
+                                self.documents
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(ix, _)| Some(*ix) != split_other)
+                                    .map(|(ix, doc_entity)| {
+                                        let doc = doc_entity.read(cx);
+                                        let doc_id = doc_entity.entity_id();
+                                        let active = ix == active_ix;
+                                        let dirty = doc.is_dirty();
+                                        // The preview tab reads like a draft: the next file
+                                        // clicked replaces it until it is edited or opened
+                                        // for good, the way VS Code marks its preview.
+                                        let is_preview = self.preview == Some(doc_id);
+                                        let is_pinned = self.pinned.contains(&doc_id);
+                                        let name = doc.name().to_string();
+                                        // The tab carries its file's type icon, as in VS Code.
+                                        let tab_icon = doc.path().map(|path| file_type_icon(path));
+                                        let theme = cx.theme();
+                                        let drag_label: SharedString = name.clone().into();
 
-                            h_flex()
+                                        h_flex()
                                 .id(("tab", ix))
                                 .group("tab")
                                 .relative()
@@ -7235,71 +7348,72 @@ impl Workspace {
                                         );
                                     }),
                                 )
-                        })),
-                ),
-            )
-            .when(count > 1, |this| {
-                this.child(
-                    Button::new("tab-scroll-next")
-                        .ghost()
-                        .xsmall()
-                        .compact()
-                        .icon(Icon::new(IconName::ChevronRight))
-                        .tooltip("Next tab (Ctrl+Tab)")
-                        .disabled(active_ix + 1 >= count)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let count = this.documents.len();
-                            if count > 1 {
-                                let next = (this.active + 1) % count;
-                                this.activate(next, window, cx);
-                            }
-                        })),
+                                    }),
+                            ),
+                    ),
                 )
-            })
-            .child(
-                Button::new("new-tab")
-                    .ghost()
-                    .xsmall()
-                    .compact()
-                    .icon(Icon::new(IconName::Plus))
-                    .tooltip("New document")
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(NewFile), cx)),
-            )
-            .when(count > 1, |this| {
-                let ws = workspace.clone();
-                this.child(
-                    Button::new("tab-overflow-menu")
+                .when(count > 1, |this| {
+                    this.child(
+                        Button::new("tab-scroll-next")
+                            .ghost()
+                            .xsmall()
+                            .compact()
+                            .icon(Icon::new(IconName::ChevronRight))
+                            .tooltip("Next tab (Ctrl+Tab)")
+                            .disabled(active_ix + 1 >= count)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let count = this.documents.len();
+                                if count > 1 {
+                                    let next = (this.active + 1) % count;
+                                    this.activate(next, window, cx);
+                                }
+                            })),
+                    )
+                })
+                .child(
+                    Button::new("new-tab")
                         .ghost()
                         .xsmall()
                         .compact()
-                        .icon(Icon::new(IconName::Ellipsis))
-                        .tooltip("Tab options")
-                        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-                            let ws_other = ws.clone();
-                            let ws_right = ws.clone();
-                            menu.item(PopupMenuItem::new("Close Other Tabs").on_click(
-                                move |_, window, cx| {
-                                    _ = ws_other.update(cx, |this, cx| {
-                                        let keep_id = this.active_document().entity_id();
-                                        this.close_other_tabs_by_id(keep_id, window, cx);
-                                    });
-                                },
-                            ))
-                            .item(
-                                PopupMenuItem::new("Close Tabs to the Right").on_click(
+                        .icon(Icon::new(IconName::Plus))
+                        .tooltip("New document")
+                        .on_click(|_, window, cx| window.dispatch_action(Box::new(NewFile), cx)),
+                )
+                .when(count > 1, |this| {
+                    let ws = workspace.clone();
+                    this.child(
+                        Button::new("tab-overflow-menu")
+                            .ghost()
+                            .xsmall()
+                            .compact()
+                            .icon(Icon::new(IconName::Ellipsis))
+                            .tooltip("Tab options")
+                            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                                let ws_other = ws.clone();
+                                let ws_right = ws.clone();
+                                menu.item(PopupMenuItem::new("Close Other Tabs").on_click(
                                     move |_, window, cx| {
-                                        _ = ws_right.update(cx, |this, cx| {
-                                            let active_id = this.active_document().entity_id();
-                                            this.close_tabs_to_the_right_by_id(
-                                                active_id, window, cx,
-                                            );
+                                        _ = ws_other.update(cx, |this, cx| {
+                                            let keep_id = this.active_document().entity_id();
+                                            this.close_other_tabs_by_id(keep_id, window, cx);
                                         });
                                     },
-                                ),
-                            )
-                        }),
-                )
-            });
+                                ))
+                                .item(
+                                    PopupMenuItem::new("Close Tabs to the Right").on_click(
+                                        move |_, window, cx| {
+                                            _ = ws_right.update(cx, |this, cx| {
+                                                let active_id = this.active_document().entity_id();
+                                                this.close_tabs_to_the_right_by_id(
+                                                    active_id, window, cx,
+                                                );
+                                            });
+                                        },
+                                    ),
+                                )
+                            }),
+                    )
+                });
 
         // Probe #17: paint the programmatic tab context menu above the strip.
         div()
@@ -8069,8 +8183,12 @@ impl Render for Workspace {
                 .child(
                     v_flex()
                         .size_full()
-                        .when(self.shows_tabs(cx), |this| this.child(self.render_tabs(cx)))
-                        .child(self.render_breadcrumbs(cx))
+                        // Side by side, each editor group heads its own
+                        // column (see `render_document_stack`).
+                        .when(!self.groups_side_by_side(), |this| {
+                            this.when(self.shows_tabs(cx), |this| this.child(self.render_tabs(cx)))
+                                .child(self.render_breadcrumbs(cx))
+                        })
                         .when(self.shows_welcome_cta(cx), |this| {
                             this.child(self.render_welcome_cta(cx))
                         })
@@ -8646,9 +8764,19 @@ impl Workspace {
                     )
                     .child(div().h(px(1.)).w_full().bg(cx.theme().border).flex_none())
                     .child(
-                        stack(other, "doc-stack-secondary")
-                            .h_full()
-                            .overflow_hidden(),
+                        v_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .overflow_hidden()
+                            .when(self.shows_tabs(cx), |pane| {
+                                pane.child(self.render_group_tab(other, cx))
+                            })
+                            .child(
+                                stack(other, "doc-stack-secondary")
+                                    .h_full()
+                                    .overflow_hidden(),
+                            ),
                     )
                     .into_any_element()
             } else {
@@ -8659,15 +8787,42 @@ impl Workspace {
                     .items_stretch()
                     .overflow_hidden()
                     .child(
-                        stack(active, "doc-stack-primary")
-                            .w_full()
-                            .overflow_hidden(),
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .when(self.shows_tabs(cx), |pane| pane.child(self.render_tabs(cx)))
+                            .child(self.render_breadcrumbs(cx))
+                            .child(
+                                stack(active, "doc-stack-primary")
+                                    .w_full()
+                                    .overflow_hidden(),
+                            ),
                     )
                     .child(div().w(px(1.)).h_full().bg(cx.theme().border).flex_none())
                     .child(
-                        stack(other, "doc-stack-secondary")
-                            .w_full()
-                            .overflow_hidden(),
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .when(self.shows_tabs(cx), |pane| {
+                                pane.child(self.render_group_tab(other, cx))
+                            })
+                            // Level with the first group's breadcrumbs.
+                            .child(
+                                div()
+                                    .h(px(22.))
+                                    .flex_none()
+                                    .border_b_1()
+                                    .border_color(cx.theme().border),
+                            )
+                            .child(
+                                stack(other, "doc-stack-secondary")
+                                    .w_full()
+                                    .overflow_hidden(),
+                            ),
                     )
                     .into_any_element()
             };
