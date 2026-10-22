@@ -18,7 +18,7 @@
 # full-screen checks. Set E2E_GPU=1 to keep Vulkan.
 #
 # Knobs: MALGEL_BIN, E2E_ARTIFACTS, E2E_DISPLAY_START (first Xvfb display to
-# try, default 99), TERM_SCENARIOS ("1 3 p2 2 5 4" subsets), TERM_LAG_LIMIT_MS
+# try, default 99), TERM_SCENARIOS ("1 3 p2 2 5 4 6" subsets), TERM_LAG_LIMIT_MS
 # (flood UI stall, default 250), P2_SECS / P2_CPU_LIMIT / P2_LAG_LIMIT_MS
 # (the `yes` flood: default 10s, <100% CPU, ui_lag max <250ms),
 # INT_SETTLE_LIMIT_MS (^C to the last changed frame, default 200),
@@ -592,6 +592,37 @@ if want 5; then
     record s5-shell-exit FAIL "shell $spid did not exit"
   fi
   shot s5-exit
+fi
+
+# ---- 6. tabs: New, then Split, keeps every session -------------------------------
+# VS Code: Split divides only the current tab; the tab New made before it and
+# every shell in it survive (an old bug: + then Split lost a session).
+if want 6; then
+  geo=$(xdotool getwindowgeometry "$WIN" | sed -n 's/.*Geometry: \([0-9]*\)x\([0-9]*\).*/\1 \2/p')
+  W=${geo% *}; H=${geo#* }
+  rm -f "$M"/s6-p*
+  palette "new terminal"; sleep 1.5
+  run "echo \$\$ > $M/s6-p1"
+  palette "new terminal"; sleep 1.5
+  run "echo \$\$ > $M/s6-p2"
+  palette "split terminal"; sleep 1.5
+  run "echo \$\$ > $M/s6-p3"
+  wait_for 5 test -s "$M/s6-p1" -a -s "$M/s6-p2" -a -s "$M/s6-p3"
+  p1=$(cat "$M/s6-p1" 2>/dev/null); p2=$(cat "$M/s6-p2" 2>/dev/null); p3=$(cat "$M/s6-p3" 2>/dev/null)
+  live=0
+  for p in $p1 $p2 $p3; do kill -0 "$p" 2>/dev/null && live=$((live + 1)); done
+  distinct=$(printf '%s\n' "$p1" "$p2" "$p3" | sort -u | grep -c .)
+  # The split's left pane is the second tab's shell, not the first tab's.
+  xdotool mousemove --window "$WIN" $((W / 4)) $((H - 150)) click 1; sleep 0.4
+  run "echo \$\$ > $M/s6-p2b"
+  wait_for 5 test -s "$M/s6-p2b"
+  p2b=$(cat "$M/s6-p2b" 2>/dev/null)
+  shot s6-tabs
+  if ((live == 3 && distinct == 3)) && [[ "$p2b" == "$p2" ]]; then
+    record s6-new-then-split PASS "3 live shells ($p1 / $p2 | $p3); left pane of the split is tab 2's shell"
+  else
+    record s6-new-then-split FAIL "shells '$p1' '$p2' '$p3' live=$live distinct=$distinct; left pane shell '$p2b' (want '$p2')"
+  fi
 fi
 
 alive && record app-alive PASS "rss=$(rss_mib)MiB" || record app-alive FAIL "app died"
