@@ -49,6 +49,53 @@ jobs:
             python3-pil xclip
       - run: scripts/e2e/gui_smoke.sh
 
+  # The integrated terminal under load (scripts/e2e/terminal_stress.sh):
+  # floods, Ctrl+C/D/Z, vim/less/top, split, resize, kill, shell exit. A job of
+  # its own so it neither slows nor shares a cache with `check`. Shared
+  # runners render in software and are noisier than a desktop, so the timing
+  # limits are looser than the script's defaults; the functional checks
+  # (signals delivered, programs exit, panes independent) are the same.
+  terminal-stress:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 \
+            xvfb xdotool imagemagick libgl1-mesa-dri libglx-mesa0 libegl1 libegl-mesa0 libgles2 libgbm1 \
+            fonts-dejavu-core vim less procps python3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: terminal-stress-release
+      - run: cargo build --release --locked
+      - name: Terminal stress
+        env:
+          E2E_ARTIFACTS: ${{ github.workspace }}/target/e2e-terminal
+          E2E_TIMEOUT: "1500"
+          TERM_LAG_LIMIT_MS: "500"
+          P2_CPU_LIMIT: "200"
+          P2_LAG_LIMIT_MS: "400"
+          INT_SETTLE_LIMIT_MS: "800"
+          KILL_LIMIT_MS: "500"
+        run: scripts/e2e/terminal_stress.sh
+      - name: Results
+        if: always()
+        run: |
+          f=target/e2e-terminal/results.tsv
+          [ -f "$f" ] && { echo '```' ; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terminal-stress
+          path: |
+            target/e2e-terminal/results.tsv
+            target/e2e-terminal/*.png
+            target/e2e-terminal/*.log
+          if-no-files-found: warn
+
   windows:
     runs-on: windows-latest
     env:
