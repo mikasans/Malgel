@@ -432,6 +432,26 @@ fn pulse_needs_repaint(generation: u64, shown: u64, window_active: bool) -> bool
     window_active && generation != shown
 }
 
+/// The tab Ctrl+Tab (`forward`) or Ctrl+Shift+Tab goes to from `active`,
+/// wrapping, and skipping `skip` — the second editor group's document.
+fn step_tab(active: usize, count: usize, skip: Option<usize>, forward: bool) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let mut ix = active;
+    for _ in 0..count {
+        ix = if forward {
+            (ix + 1) % count
+        } else {
+            (ix + count - 1) % count
+        };
+        if Some(ix) != skip {
+            return ix;
+        }
+    }
+    active
+}
+
 /// Where a reopened tab goes: where it was, or last when fewer tabs are open
 /// now than then.
 fn reopen_position(was: usize, open: usize) -> usize {
@@ -1428,9 +1448,18 @@ impl Workspace {
         // The active tab may have changed: a stale EditorOnly / PreviewOnly
         // role would hide its editor or its preview.
         self.sync_preview_pin_roles(cx);
-        // Collapse if both panes would show the same tab.
+        // Both groups would show the same tab: the first group shows its
+        // nearest other tab and the second group stays, as in VS Code;
+        // with nothing else to show, the split closes.
         if let Some(split) = self.editor_split {
             let other = split.other.min(self.documents.len().saturating_sub(1));
+            if other == self.active && self.documents.len() >= 2 {
+                let active = self.active;
+                self.active = (0..self.documents.len())
+                    .filter(|&ix| ix != other)
+                    .min_by_key(|&ix| ix.abs_diff(active))
+                    .unwrap_or(active);
+            }
             if other == self.active || self.documents.len() < 2 {
                 self.editor_split = None;
             } else {
@@ -1647,7 +1676,20 @@ impl Workspace {
         if self.documents.is_empty() {
             return;
         }
-        self.active = ix.min(self.documents.len() - 1);
+        let ix = ix.min(self.documents.len() - 1);
+        // The second editor group's document is shown there: going to it
+        // moves the keyboard into that group. Making it the first group's
+        // active tab left that group blank, with typing going into a view
+        // no caret was visible in.
+        if ix != self.active && self.split_other() == Some(ix) {
+            if focus {
+                let target = self.documents[ix].read(cx).editor().focus_handle(cx);
+                window.defer(cx, move |window, cx| target.focus(window, cx));
+            }
+            cx.notify();
+            return;
+        }
+        self.active = ix;
         if let Some(path) = self.documents[self.active].read(cx).path().cloned() {
             self.record_navigation(path);
         }
@@ -6981,6 +7023,24 @@ impl Workspace {
             )
     }
 
+    /// The second editor group's document, when the editor is split.
+    fn split_other(&self) -> Option<usize> {
+        self.editor_split
+            .map(|split| split.other.min(self.documents.len().saturating_sub(1)))
+            .filter(|&other| other != self.active)
+    }
+
+    /// Whether the keyboard is in the second editor group.
+    fn secondary_has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.split_other().is_some_and(|other| {
+            self.documents[other]
+                .read(cx)
+                .editor()
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        })
+    }
+
     /// Two editor groups side by side: each column has its own tab bar.
     fn groups_side_by_side(&self) -> bool {
         self.diff_session.is_none() && self.editor_split.is_some_and(|split| !split.vertical)
@@ -8341,13 +8401,22 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::split_editor_right))
             .on_action(cx.listener(Self::split_editor_down))
             .on_action(cx.listener(Self::close_editor_split))
+            // Ctrl+Tab / Ctrl+Shift+Tab cycle within the editor group that
+            // has the keyboard, as in VS Code; the second group holds one
+            // document, so there it has nothing to cycle.
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
-                let next = (this.active + 1) % this.documents.len();
+                if this.secondary_has_focus(window, cx) {
+                    return;
+                }
+                let next = step_tab(this.active, this.documents.len(), this.split_other(), true);
                 this.activate(next, window, cx);
             }))
             .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
-                let count = this.documents.len();
-                this.activate((this.active + count - 1) % count, window, cx);
+                if this.secondary_has_focus(window, cx) {
+                    return;
+                }
+                let prev = step_tab(this.active, this.documents.len(), this.split_other(), false);
+                this.activate(prev, window, cx);
             }))
             .on_action(cx.listener(|this, action: &ActivateTab, window, cx| {
                 this.activate(action.0, window, cx)
@@ -10517,6 +10586,20 @@ mod tests {
             search_summary(&found),
             "60000 results in 1 file \u{2014} showing 1 (searched 700 of 20000 files)"
         );
+    }
+
+    #[test]
+    fn ctrl_tab_cycles_within_the_group_and_skips_the_other_groups_tab() {
+        assert_eq!(step_tab(0, 3, None, true), 1);
+        assert_eq!(step_tab(2, 3, None, true), 0);
+        assert_eq!(step_tab(0, 3, None, false), 2);
+        // Group 2 holds tab 1: group 1 cycles 0 <-> 2.
+        assert_eq!(step_tab(0, 3, Some(1), true), 2);
+        assert_eq!(step_tab(2, 3, Some(1), true), 0);
+        assert_eq!(step_tab(0, 3, Some(1), false), 2);
+        // Only the other group's tab besides this one: stay.
+        assert_eq!(step_tab(0, 2, Some(1), true), 0);
+        assert_eq!(step_tab(0, 1, None, true), 0);
     }
 
     #[test]
