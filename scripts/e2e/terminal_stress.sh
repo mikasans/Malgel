@@ -580,13 +580,17 @@ if want 5; then
   spid=$(cat "$M/shellpid" 2>/dev/null)
   run "exit"
   if wait_for 5 bash -c "! kill -0 $spid 2>/dev/null"; then
+    # VS Code: the exited terminal closes (the last one hides the panel);
+    # no shell is restarted behind the user's back.
+    sleep 0.8
+    nsh=$(pgrep -P "$APP_PID" | wc -l)
     mark=$(fresh_marker s5-exit.done)
-    sleep 0.5
+    palette "new terminal"; sleep 1.5
     run "cd $M && touch $mark"
     if wait_for 8 test -e "$mark"; then
-      record s5-shell-exit PASS "exit handled; composer restarted a shell"
+      record s5-shell-exit PASS "exit closed the terminal ($nsh shells left); New Terminal starts a shell"
     else
-      record s5-shell-exit FAIL "after exit, composer did not start a new shell"
+      record s5-shell-exit FAIL "after exit, New Terminal did not start a shell"
     fi
   else
     record s5-shell-exit FAIL "shell $spid did not exit"

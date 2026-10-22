@@ -2576,7 +2576,7 @@ impl Workspace {
     ) {
         let sub = cx.subscribe_in(&term, window, {
             move |this, panel, event: &TerminalEvent, window, cx| match event {
-                TerminalEvent::CloseSession => {
+                TerminalEvent::CloseSession | TerminalEvent::Exited => {
                     let id = panel.entity_id();
                     this.close_terminal_by_id(id, window, cx);
                 }
@@ -2616,17 +2616,18 @@ impl Workspace {
         tabs
     }
 
-    /// Close the session with `id` (toolbar Kill). Last session stays with Restart.
+    /// Close the session with `id` (Kill, or its shell exited). Closing the
+    /// last one hides the panel; the next Ctrl+` starts a fresh shell (VS Code).
     fn close_terminal_by_id(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.terminals.iter().position(|t| t.entity_id() == id) else {
             return;
         };
-        if self.terminals.len() > 1 {
-            let tab = self.terminal_tabs.remove(ix);
-            self.terminals.remove(ix);
-            if ix < self.terminal_subscriptions.len() {
-                let _ = self.terminal_subscriptions.remove(ix);
-            }
+        let tab = self.terminal_tabs.remove(ix);
+        self.terminals.remove(ix);
+        if ix < self.terminal_subscriptions.len() {
+            let _ = self.terminal_subscriptions.remove(ix);
+        }
+        if !self.terminals.is_empty() {
             // Stay in the same tab when it has another pane (VS Code).
             self.terminal_active = (0..self.terminals.len())
                 .filter(|&i| self.terminal_tabs[i] == tab)
@@ -2637,8 +2638,10 @@ impl Workspace {
                     .update(cx, |term, cx| term.focus_input(window, cx));
             }
         } else {
-            // Last session: shell already stopped by the panel; keep Restart affordance.
-            self.terminals[ix].update(cx, |term, cx| term.focus_input(window, cx));
+            self.terminal_active = 0;
+            self.terminal_visible = false;
+            self.terminal_maximized = false;
+            self.focus_active(window, cx);
         }
         cx.notify();
     }
@@ -9203,6 +9206,18 @@ impl Workspace {
             .children(tabs.iter().enumerate().map(|(n, (tab, members))| {
                 let selected = Some(*tab) == active_tab;
                 let first = members[0];
+                // The folder each pane's shell started in (VS Code shows the
+                // cwd in the tab's hover).
+                let tip = members
+                    .iter()
+                    .map(|&ix| {
+                        self.terminals[ix]
+                            .read(cx)
+                            .cwd()
+                            .map_or_else(|| "Terminal".to_string(), |p| p.display().to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
                 let label = if members.len() > 1 {
                     format!("{} ({} panes)", n + 1, members.len())
                 } else {
@@ -9212,6 +9227,7 @@ impl Workspace {
                     .ghost()
                     .small()
                     .label(label)
+                    .tooltip(tip)
                     .selected(selected)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if this.terminals.len() > first {
@@ -9986,19 +10002,13 @@ impl Workspace {
 
         if self.terminal_visible && !focus_mode {
             if self.terminal_maximized {
-                let editor_h = rems(6.).to_pixels(rem);
-                v_resizable("center-with-terminal-max")
-                    .child(
-                        resizable_panel()
-                            .size(editor_h)
-                            .size_range(rems(4.).to_pixels(rem)..rems(16.).to_pixels(rem))
-                            .child(with_problems),
-                    )
-                    .child(
-                        resizable_panel()
-                            .size_range(rems(12.).to_pixels(rem)..Pixels::MAX)
-                            .child(self.render_terminal_area(cx)),
-                    )
+                // VS Code Maximize Panel: the panel takes the whole center;
+                // the editor area is hidden, not squeezed to a strip.
+                let _ = with_problems;
+                div()
+                    .id("center-with-terminal-max")
+                    .size_full()
+                    .child(self.render_terminal_area(cx))
                     .into_any_element()
             } else {
                 // VS Code opens the panel at about a third of the window; a

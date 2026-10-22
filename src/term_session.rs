@@ -561,23 +561,6 @@ impl PtySession {
             .collect()
     }
 
-    /// Everything in scrollback and on screen, soft-wrapped rows rejoined.
-    pub fn transcript(&self) -> String {
-        let term = self.ui_lock();
-        let grid = term.grid();
-        let top = grid.topmost_line().0;
-        let bottom = last_content_line(&term);
-        let mut out = String::new();
-        for line in top..=bottom {
-            let (text, wrapped) = row_text(&term, Line(line));
-            out.push_str(text.trim_end_matches(' '));
-            if !wrapped && line != bottom {
-                out.push('\n');
-            }
-        }
-        out
-    }
-
     /// Clear scrollback and screen, keeping the cursor's line at the top (VS
     /// Code's Clear keeps the prompt).
     pub fn clear(&self) {

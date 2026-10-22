@@ -38,9 +38,10 @@ use std::{
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EntityInputHandler as _,
     EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, Global, HighlightStyle, Hsla,
-    InteractiveElement as _, IntoElement, Keystroke, MouseButton, ParentElement as _, Pixels,
-    Render, ScrollDelta, ScrollStrategy, ScrollWheelEvent, SharedString, Size, Styled as _,
-    StyledText, UnderlineStyle, UniformListScrollHandle, WeakEntity, Window,
+    InteractiveElement as _, IntoElement, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement as _, Pixels, Point, Render, ScrollDelta, ScrollStrategy, ScrollWheelEvent,
+    SharedString, Size, Styled as _, StyledText, UnderlineStyle, UniformListScrollHandle,
+    WeakEntity, Window,
     assets::IconName,
     base::Disableable as _,
     canvas,
@@ -168,7 +169,14 @@ pub struct TerminalPanel {
     _pump: Option<gpui_kit::Task<()>>,
     /// Stick output viewport to the end while the user has not scrolled up.
     follow_tail: bool,
+    /// Output selection, anchor and head as (row, column) in view rows.
+    selection: Option<(Cell2, Cell2)>,
+    /// The left button went down in the output and has not come up yet.
+    selecting: bool,
 }
+
+/// A character cell position in view rows: (row, column).
+type Cell2 = (usize, usize);
 
 /// Events the workspace listens for (Kill → close session tab).
 pub enum TerminalEvent {
@@ -177,6 +185,9 @@ pub enum TerminalEvent {
     CloseSession,
     /// Toolbar Close (X): hide the panel, sessions keep running (VS Code).
     HidePanel,
+    /// The shell exited on its own (`exit`, Ctrl+D): VS Code closes the
+    /// terminal, and hides the panel when it was the last one.
+    Exited,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalPanel {}
@@ -238,7 +249,14 @@ impl TerminalPanel {
             settle_paint: None,
             _pump: None,
             follow_tail: true,
+            selection: None,
+            selecting: false,
         }
+    }
+
+    /// Folder new shells start in (shown in the tab's tooltip).
+    pub fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
     }
 
     fn shell_running(&self) -> bool {
@@ -303,6 +321,7 @@ impl TerminalPanel {
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.prelude.clear();
+        self.selection = None;
         if let Some(session) = &self.session {
             session.clear();
             self.view = session.view_info();
@@ -314,25 +333,65 @@ impl TerminalPanel {
         cx.notify();
     }
 
-    /// Full transcript for clipboard copy.
-    fn transcript(&self) -> String {
-        let mut out = String::new();
-        for line in &self.prelude {
-            out.push_str(line);
-            out.push('\n');
-        }
-        if let Some(session) = &self.session {
-            out.push_str(&session.transcript());
-        }
-        out
+    /// Ordered selection bounds, `None` when nothing (or an empty span) is
+    /// selected.
+    fn selection_span(&self) -> Option<(Cell2, Cell2)> {
+        let (a, b) = self.selection?;
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        (start != end).then_some((start, end))
     }
 
-    fn copy_all(&self, cx: &mut Context<Self>) {
-        let text = self.transcript();
-        if text.trim().is_empty() {
-            return;
+    /// The selected text: whole rows between the ends, trailing blanks
+    /// trimmed per row (VS Code).
+    fn selected_text(&self) -> Option<String> {
+        let ((r0, c0), (r1, c1)) = self.selection_span()?;
+        let rows = self.row_texts(r0..r1 + 1);
+        let mut out = String::new();
+        for (i, row) in rows.iter().enumerate() {
+            let ix = r0 + i;
+            let from = if ix == r0 { c0 } else { 0 };
+            let to = if ix == r1 { c1 } else { usize::MAX };
+            let piece: String = row
+                .text
+                .chars()
+                .skip(from)
+                .take(to.saturating_sub(from))
+                .collect();
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(piece.trim_end());
         }
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Copy the output selection; with none, the clipboard is left alone
+    /// (VS Code's Copy does nothing without a selection).
+    fn copy_selection(&self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Output cell under window position `pos` (column rounded to the
+    /// nearest boundary, so a drag selects the characters it passes).
+    fn cell_at(&self, pos: Point<Pixels>) -> Option<Cell2> {
+        let rows = self.total_rows();
+        if rows == 0 {
+            return None;
+        }
+        let state = self.scroll.0.borrow();
+        let bounds = state.base_handle.bounds();
+        let offset = state.base_handle.offset();
+        let (cell_w, line_h) = (f32::from(self.cell.0), f32::from(self.cell.1));
+        if cell_w <= 0. || line_h <= 0. {
+            return None;
+        }
+        let y = f32::from(pos.y - bounds.origin.y - offset.y);
+        let x = f32::from(pos.x - bounds.origin.x - offset.x);
+        let row = ((y / line_h).floor().max(0.) as usize).min(rows - 1);
+        let col = (x / cell_w).round().max(0.) as usize;
+        Some((row, col))
     }
 
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
@@ -427,7 +486,7 @@ impl TerminalPanel {
         let m = &keys.modifiers;
         if m.control && m.shift {
             match keys.key.as_str() {
-                "c" => self.copy_all(cx),
+                "c" => self.copy_selection(cx),
                 _ => self.paste_clipboard(cx),
             }
             return true;
@@ -561,13 +620,6 @@ impl TerminalPanel {
                 }
             }
         }));
-
-        let cwd_label = self
-            .cwd
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| ".".into());
-        self.append(&format!("— shell in {cwd_label}\n"), cx);
     }
 
     /// Grid that fits the output viewport painted last frame.
@@ -638,6 +690,7 @@ impl TerminalPanel {
             self.stop_shell();
             self.append("— shell exited\n", cx);
             let _ = window;
+            cx.emit(TerminalEvent::Exited);
         }
         if self.follow_tail {
             self.scroll_to_end();
@@ -797,6 +850,7 @@ fn xterm_rgb(ix: u8, ansi: &[u32; 16]) -> (u8, u8, u8) {
 fn row_highlights(
     row: StyledRow,
     cursor_col: Option<usize>,
+    selected: Option<(Range<usize>, Hsla)>,
     colors: &TermColors,
 ) -> (SharedString, Vec<(Range<usize>, HighlightStyle)>) {
     let StyledRow { mut text, runs } = row;
@@ -804,6 +858,13 @@ fn row_highlights(
         .iter()
         .map(|(range, style)| (range.clone(), colors.highlight(style)))
         .collect();
+    if let Some((cols, bg)) = selected {
+        let byte = |col: usize| text.char_indices().nth(col).map_or(text.len(), |(i, _)| i);
+        let (start, end) = (byte(cols.start), byte(cols.end));
+        if start < end {
+            highlights = overlay_background(highlights, start..end, bg);
+        }
+    }
     if let Some(col) = cursor_col {
         // Pad so the cursor sits at its column.
         let chars = text.chars().count();
@@ -850,6 +911,51 @@ fn row_highlights(
     (SharedString::from(text), highlights)
 }
 
+/// `highlights` (sorted, disjoint) with `bg` painted under `span`: runs
+/// inside it keep their colors, gaps get the background alone.
+fn overlay_background(
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    span: Range<usize>,
+    bg: Hsla,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let plain = HighlightStyle {
+        background_color: Some(bg),
+        ..Default::default()
+    };
+    let mut out = Vec::with_capacity(highlights.len() + 3);
+    let mut at = span.start;
+    for (range, style) in highlights {
+        if range.end <= span.start || range.start >= span.end {
+            out.push((range, style));
+            continue;
+        }
+        if range.start < span.start {
+            out.push((range.start..span.start, style));
+        }
+        let from = range.start.max(span.start);
+        let to = range.end.min(span.end);
+        if from > at {
+            out.push((at..from, plain));
+        }
+        out.push((
+            from..to,
+            HighlightStyle {
+                background_color: Some(bg),
+                ..style
+            },
+        ));
+        at = to;
+        if range.end > span.end {
+            out.push((span.end..range.end, style));
+        }
+    }
+    if at < span.end {
+        out.push((at..span.end, plain));
+    }
+    out.sort_by_key(|(r, _)| r.start);
+    out
+}
+
 fn cap_prelude(prelude: &mut Vec<SharedString>) {
     let excess = prelude.len().saturating_sub(MAX_PRELUDE_LINES);
     if excess > 0 {
@@ -865,6 +971,9 @@ impl Drop for TerminalPanel {
 impl Render for TerminalPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let shell_running = self.shell_running();
+        let has_selection = self.selection_span().is_some();
+        let selection = self.selection_span();
+        let selection_bg = cx.theme().selection;
         // Unique ids per session so split panes do not share hit-testing / focus.
         let eid = cx.entity_id().as_u64();
         // Cell metrics for PTY sizing (mono font advance × line height).
@@ -921,8 +1030,9 @@ impl Render for TerminalPanel {
                             .ghost()
                             .small()
                             .icon(Icon::new(IconName::Copy))
-                            .tooltip("Copy All Output (Ctrl+Shift+C)")
-                            .on_click(cx.listener(|this, _, _, cx| this.copy_all(cx))),
+                            .tooltip("Copy Selection (Ctrl+Shift+C)")
+                            .disabled(!has_selection)
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_selection(cx))),
                     )
                     .child(
                         Button::new(ElementId::NamedInteger("terminal-paste".into(), eid))
@@ -1035,13 +1145,41 @@ impl Render for TerminalPanel {
                     // resumes without hunting for it.
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             this.follow_tail = true;
+                            // Start a selection (a plain click clears it).
+                            this.selection = this.cell_at(event.position).map(|c| (c, c));
+                            this.selecting = true;
                             this.focus_input(window, cx);
                             // Otherwise the panel's own tracked focus takes the
                             // click after us (bubble phase) and typed text has
                             // no input to land in.
                             window.prevent_default();
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if !this.selecting || event.pressed_button != Some(MouseButton::Left) {
+                            return;
+                        }
+                        if let (Some((anchor, _)), Some(head)) =
+                            (this.selection, this.cell_at(event.position))
+                        {
+                            this.selection = Some((anchor, head));
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.selecting = false;
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.selecting = false;
                             cx.notify();
                         }),
                     )
@@ -1079,8 +1217,20 @@ impl Render for TerminalPanel {
                                             Some((cr, cc)) if cr == ix => Some(cc),
                                             _ => None,
                                         };
-                                        let (text, highlights) =
-                                            row_highlights(line, cursor_col, &colors);
+                                        let selected =
+                                            selection.and_then(|((r0, c0), (r1, c1))| {
+                                                (r0..=r1).contains(&ix).then(|| {
+                                                    let from = if ix == r0 { c0 } else { 0 };
+                                                    let to = if ix == r1 { c1 } else { usize::MAX };
+                                                    from..to
+                                                })
+                                            });
+                                        let (text, highlights) = row_highlights(
+                                            line,
+                                            cursor_col,
+                                            selected.map(|cols| (cols, selection_bg)),
+                                            &colors,
+                                        );
                                         div()
                                             .id(ElementId::NamedInteger(
                                                 SharedString::from(format!("term-line-{eid}")),
@@ -1196,6 +1346,23 @@ pub fn terminal_cwd(folder: Option<&Path>, doc_path: Option<&Path>) -> Option<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_background_keeps_run_colors() {
+        let red = HighlightStyle {
+            color: Some(gpui_kit::red()),
+            ..Default::default()
+        };
+        let bg = gpui_kit::blue();
+        // "ab" plain, "cd" red, "ef" plain; select "bcde".
+        let out = overlay_background(vec![(2..4, red)], 1..5, bg);
+        let ranges: Vec<_> = out.iter().map(|(r, _)| r.clone()).collect();
+        assert_eq!(ranges, vec![1..2, 2..4, 4..5]);
+        assert_eq!(out[1].1.color, red.color);
+        assert!(out.iter().all(|(_, s)| s.background_color == Some(bg)));
+        // Outside the span nothing changes.
+        assert_eq!(overlay_background(vec![(0..1, red)], 2..3, bg)[0].0, 0..1);
+    }
 
     #[test]
     fn terminal_cwd_prefers_folder() {
