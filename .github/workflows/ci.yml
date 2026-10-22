@@ -78,6 +78,7 @@ jobs:
           TERM_LAG_LIMIT_MS: "500"
           P2_CPU_LIMIT: "200"
           P2_LAG_LIMIT_MS: "400"
+          P2_PROMPT_LIMIT_MS: "500"
           INT_SETTLE_LIMIT_MS: "400"
           KILL_LIMIT_MS: "500"
         run: scripts/e2e/terminal_stress.sh

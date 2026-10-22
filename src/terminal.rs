@@ -85,6 +85,9 @@ const SETTLE_QUIET: Duration = Duration::from_millis(500);
 /// Bytes per tick below which output counts as interactive (echo, prompt)
 /// and is painted at once.
 const ECHO_BYTES: u64 = 4096;
+/// Shortest gap between two paints of small output (echoes): key repeat or
+/// fast typing then costs ~30 frames a second, not one per character.
+const ECHO_FRAME: Duration = Duration::from_millis(33);
 
 /// Every live panel, for the keystroke interceptor.
 #[derive(Default)]
@@ -541,6 +544,21 @@ impl TerminalPanel {
             !m.control && !m.alt && (keys.key == "space" || keys.key.chars().count() == 1);
         if printable {
             let input_focused = self.input.read(cx).focus_handle(cx).is_focused(window);
+            // On Linux an IME consumes the keys it composes before they get
+            // here, so a plain key with its text goes straight to the shell:
+            // no composer edit, change event and clear per keystroke — three
+            // UI updates (and frames) fewer for every key typed.
+            let direct = cfg!(target_os = "linux")
+                && !pending
+                && keys
+                    .key_char
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty());
+            if input_focused && direct {
+                session.write(keys.key_char.as_deref().unwrap_or_default().as_bytes());
+                self.follow_tail = true;
+                return true;
+            }
             if input_focused {
                 return false;
             }
@@ -654,6 +672,10 @@ impl TerminalPanel {
             let fast = self
                 .fast_paint_until
                 .is_some_and(|until| Instant::now() < until);
+            if !streaming && !fast && self.last_paint.elapsed() < ECHO_FRAME {
+                // Fast typing: one paint per ECHO_FRAME for all the echoes.
+                return true;
+            }
             if streaming && !fast && self.last_paint.elapsed() < frame {
                 // Leave the dirty flag set; paint on a later tick.
                 return true;
@@ -695,6 +717,7 @@ impl TerminalPanel {
         if self.follow_tail {
             self.scroll_to_end();
         }
+        crate::perf::note_term_paint();
         cx.notify();
         !exited
     }

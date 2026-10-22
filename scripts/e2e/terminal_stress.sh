@@ -19,7 +19,7 @@
 #
 # Knobs: MALGEL_BIN, E2E_ARTIFACTS, E2E_DISPLAY_START (first Xvfb display to
 # try, default 99), TERM_SCENARIOS ("1 3 p2 2 5 4 6" subsets), TERM_LAG_LIMIT_MS
-# (flood UI stall, default 250), P2_SECS / P2_CPU_LIMIT / P2_LAG_LIMIT_MS
+# (flood UI stall, default 250), P2_SECS / P2_CPU_LIMIT / P2_LAG_LIMIT_MS / P2_PROMPT_LIMIT_MS
 # (the `yes` flood: default 10s, <100% CPU, ui_lag max <250ms),
 # INT_SETTLE_LIMIT_MS (^C to the last changed frame, default 200),
 # TERM_RETRY (0: no second run of failed scenario groups),
@@ -409,6 +409,9 @@ cpu_ticks() { awk '{print $14 + $15}' "/proc/$APP_PID/stat"; }
 crop() { import -window root -crop 700x160+450+30 "$ART_DIR/$1.png" 2>/dev/null; }
 P2_SECS="${P2_SECS:-10}"
 if want p2; then
+  # Every prompt touches p2.prompt: ^C->prompt is when the shell is back,
+  # not when a command typed afterwards (≈0.5s of xdotool typing) finished.
+  run "PROMPT_COMMAND='touch $M/p2.prompt'"; sleep 0.3
   lm=$(log_mark); r0=$(rss_mib); PEAK=$r0
   run "yes $TAG"; sleep 1
   c0=$(cpu_ticks); t0=$(now_ms)
@@ -430,15 +433,21 @@ if want p2; then
   # Back into the terminal: click its output (focus returns to the input).
   geo=$(xdotool getwindowgeometry "$WIN" | sed -n 's/.*Geometry: \([0-9]*\)x\([0-9]*\).*/\1 \2/p')
   xdotool mousemove --window "$WIN" $((${geo% *} / 2)) $((${geo#* } - 120)) click 1; sleep 0.3
+  rm -f "$M/p2.prompt"
   ti=$(now_ms); key ctrl+c
   wait_for 3 gone "[y]es $TAG"
   gone=$(pgrep -f "yes $TAG" >/dev/null && echo n || echo y); tg=$(now_ms)
-  mark=$(fresh_marker p2.done); run "touch $mark"; wait_for 5 test -e "$mark"; tm=$(now_ms)
+  wait_for 5 test -e "$M/p2.prompt"; tm=$(now_ms)
+  sleep 1
+  settle=$(tail -n +"$((lm + 1))" "$APP_LOG" | sed -n 's/.*term_interrupt_settle \([0-9]*\)ms.*/\1/p' | tail -1)
+  run "unset PROMPT_COMMAND"
+  mark=$(fresh_marker p2.done); run "touch $mark"; wait_for 5 test -e "$mark"
   lag=$(lag_since "$lm"); p95=$(lag_p95_since "$lm")
   status=PASS
   [[ $gone == y && $opened == yes ]] || status=FAIL
   ((cpu >= ${P2_CPU_LIMIT:-100} || lag >= ${P2_LAG_LIMIT_MS:-250})) && status=FAIL
-  record "p2-yes-${P2_SECS}s" "$status" "cpu=${cpu}% rss=${r0}->${PEAK}MiB (plateau ${plateau}) ctrl+p=$([[ $opened == yes ]] && echo "$((tp1 - tp))ms" || echo never) ^C->yes-gone=$((tg - ti))ms ^C->prompt=$((tm - ti))ms ui_lag_p95=${p95}ms ui_lag_max=${lag}ms"
+  ((tm - ti > ${P2_PROMPT_LIMIT_MS:-250})) && status=FAIL
+  record "p2-yes-${P2_SECS}s" "$status" "cpu=${cpu}% rss=${r0}->${PEAK}MiB (plateau ${plateau}) ctrl+p=$([[ $opened == yes ]] && echo "$((tp1 - tp))ms" || echo never) ^C->yes-gone=$((tg - ti))ms ^C->prompt=$((tm - ti))ms ^C->screen-settled=${settle:-?}ms ui_lag_p95=${p95}ms ui_lag_max=${lag}ms"
   [[ $gone == y ]] || { pkill -f "yes $TAG"; recover; }
 fi
 

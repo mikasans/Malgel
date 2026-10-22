@@ -152,10 +152,11 @@ pub fn start_ui_lag_probe(cx: &mut gpui_kit::App) {
             if window_start.elapsed() >= Duration::from_secs(1) {
                 let lock_us = TERM_LOCK_WAIT_MAX_US.swap(0, Ordering::Relaxed);
                 eprintln!(
-                    "malgel-perf: ui_lag max={:.1}ms over50={over_50} ticks={ticks} frames={} \
+                    "malgel-perf: ui_lag max={:.1}ms over50={over_50} ticks={ticks} frames={} term_paints={} \
                      term_lock_wait={:.1}ms (at +{:.1}ms) rss={}",
                     max_lag.as_secs_f64() * 1000.0,
                     FRAMES.swap(0, Ordering::Relaxed),
+                    TERM_PAINTS.swap(0, Ordering::Relaxed),
                     lock_us as f64 / 1000.0,
                     since_ms(),
                     rss_label()
@@ -193,6 +194,14 @@ pub fn release_free_memory() {
 
 // Workspace renders since the last ui_lag line.
 static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// Terminal paints (new output shown) since the last ui_lag line.
+static TERM_PAINTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn note_term_paint() {
+    if ENABLED.load(Ordering::Relaxed) {
+        TERM_PAINTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// `MALGEL_PERF_INJECT_SLEEP_MS=N` (only with `MALGEL_PERF=1`): stall every
 /// workspace frame by N ms. A deliberate regression, so the perf gate
