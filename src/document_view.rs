@@ -3294,7 +3294,10 @@ impl DocumentView {
     /// The info bar over a large file, the way VS Code tells why tokenization
     /// and folding are off; it does not block anything.
     fn render_large_file_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let megabytes = self.editor.read(cx).text().len() as f64 / (1024. * 1024.);
+        let megabytes = large_file_megabytes(
+            self.disk.map(|stamp| stamp.len),
+            self.editor.read(cx).text().len(),
+        );
         let state = if self.reduced {
             LargeFileState::Reduced
         } else if self.analysis_task.is_some() {
@@ -4112,6 +4115,17 @@ enum LargeFileState {
     Enabled,
 }
 
+/// The size the large-file bar names: the file's on disk (what a file
+/// manager shows; GBK is smaller and UTF-16 larger than the UTF-8 text in
+/// memory), the text's own for an unsaved document or an unknown stamp.
+fn large_file_megabytes(disk_len: Option<u64>, text_len: usize) -> f64 {
+    let bytes = match disk_len {
+        Some(len) if len != DiskStamp::UNKNOWN.len => len,
+        _ => text_len as u64,
+    };
+    bytes as f64 / (1024. * 1024.)
+}
+
 /// What the large-file info bar says. It never promises highlighting or
 /// spell checking: those stay off for a large file.
 fn large_file_message(megabytes: f64, state: LargeFileState) -> String {
@@ -4613,6 +4627,17 @@ mod tests {
         // Plain text keeps the (empty) column so its gutter gap matches.
         assert!(shows_folding(false));
         assert!(!shows_folding(true));
+    }
+
+    #[test]
+    fn the_large_file_bar_names_the_size_on_disk() {
+        use super::large_file_megabytes;
+        let mib = 1024 * 1024;
+        // A GBK file: 6 MiB on disk, 9 MiB of UTF-8 in memory.
+        assert_eq!(large_file_megabytes(Some(6 * mib), 9 * mib as usize), 6.);
+        // Unsaved, or the stamp is unknown: the text's own size.
+        assert_eq!(large_file_megabytes(None, 9 * mib as usize), 9.);
+        assert_eq!(large_file_megabytes(Some(u64::MAX), 9 * mib as usize), 9.);
     }
 
     #[test]
