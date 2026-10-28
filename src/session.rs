@@ -221,6 +221,96 @@ pub fn orphaned_recoveries(known: &HashSet<String>) -> Vec<(String, Recovery)> {
     found
 }
 
+/// Limits on the recovery folder, applied at startup.
+pub struct RecoveryLimits {
+    /// Unreferenced recovery files older than this are deleted.
+    pub max_age: std::time::Duration,
+    /// At most this many recovery files are kept…
+    pub max_files: usize,
+    /// …taking at most this many bytes together.
+    pub max_bytes: u64,
+}
+
+impl RecoveryLimits {
+    pub const DEFAULT: RecoveryLimits = RecoveryLimits {
+        max_age: std::time::Duration::from_secs(90 * 24 * 3600),
+        max_files: 100,
+        max_bytes: 512 * 1024 * 1024,
+    };
+}
+
+/// Clean the recovery folder: half-written `.partial` files and anything
+/// that is not a recovery go first, then unreferenced recoveries past
+/// `max_age`, then the oldest unreferenced ones until the count and size
+/// fit. Recoveries the last session refers to (`keep`) are never deleted.
+/// Returns the ids removed.
+pub fn prune_recoveries(
+    dir: &Path,
+    keep: &HashSet<String>,
+    limits: &RecoveryLimits,
+    now: SystemTime,
+) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    // (modified, id, bytes, path) of recoveries that may go.
+    let mut candidates = Vec::new();
+    let mut kept_files = 0usize;
+    let mut kept_bytes = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(now);
+        let age = now.duration_since(modified).unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let is_recovery = path.extension().is_some_and(|e| e == "json");
+        if !is_recovery {
+            // A write cut short (`.partial`) is useless once it is not
+            // being written any more.
+            if age > std::time::Duration::from_secs(3600) {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+        if keep.contains(&stem) {
+            kept_files += 1;
+            kept_bytes += meta.len();
+            continue;
+        }
+        if age > limits.max_age {
+            if std::fs::remove_file(&path).is_ok() {
+                removed.push(stem);
+            }
+            continue;
+        }
+        candidates.push((modified, stem, meta.len(), path));
+    }
+    // Newest first; drop from the end (oldest) while over the limits.
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+    let mut files = kept_files + candidates.len();
+    let mut bytes = kept_bytes + candidates.iter().map(|c| c.2).sum::<u64>();
+    while (files > limits.max_files || bytes > limits.max_bytes)
+        && let Some((_, id, len, path)) = candidates.pop()
+    {
+        if std::fs::remove_file(&path).is_ok() {
+            removed.push(id);
+        }
+        files -= 1;
+        bytes -= len;
+    }
+    removed
+}
+
 /// Modification time and length of a file, to notice changes made by other
 /// programs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +389,65 @@ mod tests {
         let old: Recovery =
             serde_json::from_str(r#"{"path":null,"text":"t","crlf":false}"#).unwrap();
         assert_eq!(old.base_hash, None);
+    }
+
+    #[test]
+    fn recovery_folder_is_capped_by_age_count_and_size() {
+        let dir = std::env::temp_dir().join(format!("malgel-prune-{}", new_recovery_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = |text: &str| Recovery {
+            path: None,
+            text: text.into(),
+            crlf: false,
+            base_hash: None,
+        };
+        for i in 0..6 {
+            write_recovery_in(&dir, &format!("r{i}"), &rec(&"x".repeat(100))).unwrap();
+            // Distinct mtimes, r0 oldest.
+            let t = SystemTime::now() - std::time::Duration::from_secs(600 - i * 60);
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join(format!("r{i}.json")))
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        }
+        std::fs::write(dir.join("r9.partial"), "half").unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("r9.partial"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let keep = HashSet::from(["r0".to_string()]);
+        let now = SystemTime::now();
+        // Age: older than 8 minutes goes (r0 is kept: the session uses it).
+        let limits = RecoveryLimits {
+            max_age: std::time::Duration::from_secs(8 * 60),
+            max_files: 100,
+            max_bytes: u64::MAX,
+        };
+        let mut gone = prune_recoveries(&dir, &keep, &limits, now);
+        gone.sort();
+        assert_eq!(gone, ["r1", "r2"]);
+        assert!(!dir.join("r9.partial").exists());
+        assert!(dir.join("r0.json").exists());
+        // Count: 4 left (r0, r3, r4, r5), cap 3 → the oldest unkept (r3).
+        let limits = RecoveryLimits {
+            max_files: 3,
+            ..limits
+        };
+        assert_eq!(prune_recoveries(&dir, &keep, &limits, now), ["r3"]);
+        // Size: room for two files → r4 goes, r5 (newest) and r0 stay.
+        let one = std::fs::metadata(dir.join("r5.json")).unwrap().len();
+        let limits = RecoveryLimits {
+            max_bytes: one * 2,
+            ..limits
+        };
+        assert_eq!(prune_recoveries(&dir, &keep, &limits, now), ["r4"]);
+        assert!(dir.join("r0.json").exists() && dir.join("r5.json").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

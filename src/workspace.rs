@@ -1158,6 +1158,19 @@ impl Workspace {
                 .iter()
                 .filter_map(|entry| entry.recovery.clone()),
         );
+        // Keep the recovery folder bounded: stale half-writes, very old
+        // and excess unreferenced recoveries go (the session's never do).
+        if let Some(dir) = session::recovery_dir() {
+            let removed = session::prune_recoveries(
+                &dir,
+                &referenced,
+                &session::RecoveryLimits::DEFAULT,
+                std::time::SystemTime::now(),
+            );
+            if !removed.is_empty() {
+                log::warn!("removed {} stale recovery file(s)", removed.len());
+            }
+        }
         let mut orphans = session::orphaned_recoveries(&referenced);
 
         for (ix, entry) in previous.documents.iter().enumerate() {
