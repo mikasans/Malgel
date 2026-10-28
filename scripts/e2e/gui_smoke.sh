@@ -576,8 +576,14 @@ sleep 0.5
 xdotool type --delay 2 "$(printf 'x%.0s' $(seq 1 300))"
 shot 11b-long-name-typed
 xdotool key --clearmodifiers Return
-sleep 0.8
-shot 11c-long-name-refused
+# The toast lands when the refused rename returns; on a slow runner that
+# is after any fixed sleep, so wait for it (checked again below).
+SAVED_SETTLE=$SETTLE SETTLE=0.3
+for _ in $(seq 1 20); do
+  shot 11c-long-name-refused
+  [[ "$(region_differ 11-after-rename 11c-long-name-refused 520x200+1080+800)" -gt 300 ]] && break
+done
+SETTLE=$SAVED_SETTLE
 [[ -f "$WS/renamed.md" ]] && grep -q 'SMOKE' "$WS/renamed.md" \
   || fail "renaming to a 300-byte name lost the file: $(ls -A "$WS")"
 [[ "$(ls -A "$WS" | sort)" == "$before_files" ]] || fail "a refused rename changed the folder: $(ls -A "$WS")"
