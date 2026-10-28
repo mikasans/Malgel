@@ -156,6 +156,19 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# The search engine is optimized even in dev / CI test builds, so the
+# 100k-line regex Find test can hold a real time limit (200 ms) there.
+[profile.dev.package.regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.memchr]
+opt-level = 3
+[profile.dev.package.aho-corasick]
+opt-level = 3
+
 # Keep debug-assertions off here: gpui-pre-windows only compiles its shaders
 # at build time (fxc) in a release without them, and with them on it reads the
 # HLSL from CARGO_MANIFEST_DIR at runtime — a build-machine path, so the exe

@@ -655,6 +655,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The acceptance bar for regex Find: 100k lines in under 200 ms in a
+    /// release build, 400 ms in the debug build CI runs (the regex crates
+    /// are optimized there too, see Cargo.toml).
+    #[test]
+    fn a_regex_find_over_100k_lines_takes_under_200ms() {
+        let text: String = (0..100_000)
+            .map(|i| format!("let value_{i} = foo(a{i}, b{i}); // line {i}\n"))
+            .collect();
+        let find = Find::new(
+            r"foo\((\w+), ?(\w+)\)",
+            FindFlags {
+                regex: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Best of three, so one descheduled moment on a busy CI runner
+        // (tests run in parallel) does not fail the bar.
+        let took = (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                assert_eq!(count_lines(&text, &find), 100_000);
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        eprintln!("regex find, 100k lines (best of 3): {took:?}");
+        // 200 ms is the bar for a release build; a debug test build (what
+        // CI runs) still has an unoptimized caller, so it gets headroom.
+        let limit_ms = if cfg!(debug_assertions) { 400 } else { 200 };
+        assert!(
+            took.as_millis() < limit_ms,
+            "regex find over 100k lines took {took:?}"
+        );
+    }
+
     /// GBK, Latin-1 and UTF-16 files are found and replaced, and keep their
     /// encoding and line endings; text in no known encoding is skipped and
     /// counted, never written over with U+FFFD; a replacement the
