@@ -10402,8 +10402,10 @@ impl Workspace {
                 // VS Code opens the panel at about a third of the window; a
                 // fixed 12rem left ~4 rows of output. Drag the divider to
                 // resize (up to 80% of the window); the height is kept.
-                let min_h = rems(6.).to_pixels(rem);
-                let max_h = (viewport_h * 0.8).max(rems(28.).to_pixels(rem));
+                // The range follows the window: when it shrinks, the panel
+                // gives way so the editor keeps its minimum and the status
+                // bar stays on screen.
+                let (min_h, max_h) = terminal_panel_range(viewport_h, rem);
                 let term_h = AppSettings::get(cx)
                     .terminal_panel_height
                     .map(px)
@@ -10680,6 +10682,17 @@ fn push_closed(closed: &mut Vec<(PathBuf, usize)>, path: PathBuf, ix: usize) {
 
 /// The status bar's encoding menu: Reopen with Encoding and Save with
 /// Encoding, each listing [`Encoding::CHOICES`](crate::document::Encoding).
+/// The terminal panel's height range in a window `viewport_h` tall: at
+/// least 6 rem, at most 80% of the window and never so tall that the
+/// editor above it drops under its 12 rem or the title and status bars
+/// (about 5 rem) are pushed off.
+fn terminal_panel_range(viewport_h: Pixels, rem: Pixels) -> (Pixels, Pixels) {
+    let min_h = rem * 6.;
+    let room = viewport_h - rem * (12. + 5.);
+    let max_h = (viewport_h * 0.8).min(room).max(min_h);
+    (min_h, max_h)
+}
+
 /// Save with Encoding refused: which character, where, and in which file.
 fn unmappable_message(
     unmappable: crate::document::Unmappable,
@@ -10743,6 +10756,23 @@ fn encoding_menu(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_terminal_panel_gives_way_when_the_window_shrinks() {
+        use gpui_kit::px;
+        let rem = px(16.);
+        // A 1000 px window: 80% is the limit.
+        assert_eq!(
+            super::terminal_panel_range(px(1000.), rem),
+            (px(96.), px(728.))
+        );
+        // 560 px: the editor keeps 12 rem and the bars 5 rem.
+        let (min, max) = super::terminal_panel_range(px(560.), rem);
+        assert_eq!(max, px(560. - 17. * 16.));
+        assert!(max + px(17. * 16.) <= px(560.) && min == px(96.));
+        // Tiny: never below the minimum.
+        assert_eq!(super::terminal_panel_range(px(200.), rem).1, px(96.));
+    }
+
     #[test]
     fn the_unmappable_toast_names_the_character_and_line() {
         use crate::document::{Encoding, first_unmappable};
