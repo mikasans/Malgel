@@ -28,6 +28,7 @@ mod links;
 mod logfile;
 mod lru;
 mod math;
+mod math_delims;
 mod menus;
 mod paths;
 mod pdf;

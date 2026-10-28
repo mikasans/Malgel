@@ -98,6 +98,7 @@ actions!(
         ToggleAutoSave,
         FormatDocument,
         TrimTrailingWhitespace,
+        ConvertBracketMath,
         ShowExplorerView,
         ShowSearchView,
         NewFileInTree,

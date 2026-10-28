@@ -174,6 +174,9 @@ pub struct Analysis {
     pub blocks: BlockIndex,
     pub outline: Vec<Heading>,
     pub content_hash: u64,
+    /// `\[ \]` or `\( \)` math outside code (not looked for past
+    /// `FULL_PARSE_LIMIT`).
+    pub bracket_math: bool,
 }
 
 /// Past this size the source is not parsed as Markdown: a full mdast walk
@@ -194,6 +197,7 @@ impl Analysis {
                 blocks: BlockIndex::new(Vec::new(), stats.lines),
                 outline: scan_atx_headings(source),
                 content_hash: content_hash(source),
+                bracket_math: false,
             };
         }
 
@@ -222,6 +226,7 @@ impl Analysis {
             blocks: BlockIndex::new(starts, stats.lines),
             outline,
             content_hash: content_hash(source),
+            bracket_math: crate::math_delims::has_bracket_math(source),
         }
     }
 }
@@ -335,6 +340,7 @@ impl Analysis {
             blocks: BlockIndex::new(Vec::new(), stats.lines),
             outline: scanner.outline,
             content_hash: hasher.finish(),
+            bracket_math: false,
         }
     }
 }

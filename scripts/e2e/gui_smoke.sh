@@ -688,6 +688,72 @@ shot 20-line-ending
 wait_for 5 grep -q $'\r' "$WS/renamed.md" \
   || fail "the EOL toggle did not save the file with CRLF"
 pass "changing the line ending saves the file with CRLF"
+# 11c. Convert \[ \] / \( \) math to $$ / $: the palette command rewrites
+#      the math in one undoable edit, the preview then draws it (the
+#      \boxed frame appears), and one Ctrl+Z brings the original back.
+#      Nothing is saved until Ctrl+S.
+printf '# Brackets\n\nInline \\(\\mathcal G\\) here.\n\n\\[\n\\boxed{x^2+y^2}\n\\]\n' >"$WS/notes/brackets.md"
+BRACKETS_ORIG="$(cat "$WS/notes/brackets.md")"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'brackets.md'
+xdotool key --clearmodifiers Return
+wait_for 15 xdotool search --name '^brackets\.md' >/dev/null \
+  || fail "Quick Open did not open brackets.md"
+# The \boxed frame in the preview pane: two equal faint horizontal rules,
+# one above the other (bar and pane borders span the whole pane width).
+boxed_frame() { # boxed_frame <shot>: exit 0 when the preview shows a box
+  python3 - "$ART_DIR/$1.png" <<'PY'
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("L")
+w, h = im.size
+x0, x1, y0, y1 = int(w * 0.60), int(w * 0.90), int(h * 0.25), int(h * 0.85)
+px = im.load()
+bg = px[x1 - 4, y1 - 4]
+rules = []
+for y in range(y0, y1):
+    run = 0
+    for x in range(x0, x1 + 1):
+        if x < x1 and abs(px[x, y] - bg) > 10:
+            run += 1
+        else:
+            if 40 <= run < (x1 - x0) * 0.8:
+                rules.append((y, x - run, run))
+            run = 0
+found = any(abs(a[1] - b[1]) <= 2 and abs(a[2] - b[2]) <= 2 and 10 <= b[0] - a[0] <= 120
+            for a in rules for b in rules)
+sys.exit(0 if found else 1)
+PY
+}
+shot 20a-brackets-open
+! boxed_frame 20a-brackets-open || fail "the preview drew a box before the math was converted"
+xdotool key --clearmodifiers ctrl+shift+p
+sleep 0.5
+xdotool type --delay 30 'Convert'
+sleep 0.4
+xdotool key --clearmodifiers Return
+sleep 0.5
+for _ in $(seq 1 10); do
+  shot 20b-brackets-converted
+  boxed_frame 20b-brackets-converted && break
+done
+boxed_frame 20b-brackets-converted || fail "after Convert the preview did not draw the \\boxed math"
+[[ "$(cat "$WS/notes/brackets.md")" == "$BRACKETS_ORIG" ]] || fail "Convert saved the file by itself"
+# Compare when called (not once, when wait_for's arguments are expanded).
+file_is() { [[ "$(cat "$1")" == "$2" ]]; }
+xdotool key --clearmodifiers ctrl+s
+EXPECT_DOLLARS="$(printf '# Brackets\n\nInline $\\mathcal G$ here.\n\n$$\n\\boxed{x^2+y^2}\n$$\n')"
+wait_for 5 file_is "$WS/notes/brackets.md" "$EXPECT_DOLLARS" \
+  || fail "Convert wrote: $(head -c 200 "$WS/notes/brackets.md")"
+xdotool key --clearmodifiers ctrl+z
+sleep 0.4
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 file_is "$WS/notes/brackets.md" "$BRACKETS_ORIG" \
+  || fail "one Ctrl+Z did not restore the original math: $(head -c 200 "$WS/notes/brackets.md")"
+shot 20c-brackets-undone
+pass "Convert \\[ \\] / \\( \\) math to \$\$ / \$: the preview draws it, one Ctrl+Z restores the original"
+
 # 12. The PDF viewer: open the fixture and switch its page thumbnails on and
 #     off with the "PDF page thumbnails" command.
 xdotool key --clearmodifiers ctrl+p

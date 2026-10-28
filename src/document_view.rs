@@ -164,6 +164,8 @@ pub struct DocumentView {
     reduced: bool,
     /// The large-file info bar was closed for this tab.
     bar_dismissed: bool,
+    /// The "convert \[ \( math" hint was closed for this document.
+    math_bar_dismissed: bool,
     /// Heavy-render consent: under budget / waiting for inline confirm / skipped.
     render_gate: crate::render_budget::RenderConsent,
     /// Last estimate shown on the render-budget banner (for the message).
@@ -329,6 +331,7 @@ impl DocumentView {
             large: false,
             reduced: false,
             bar_dismissed: false,
+            math_bar_dismissed: false,
             render_gate: crate::render_budget::RenderConsent::Allowed,
             render_estimate: None,
             render_confirmed: false,
@@ -597,6 +600,7 @@ impl DocumentView {
             large: false,
             reduced: false,
             bar_dismissed: false,
+            math_bar_dismissed: false,
             render_gate: crate::render_budget::RenderConsent::Allowed,
             render_estimate: None,
             render_confirmed: false,
@@ -668,6 +672,7 @@ impl DocumentView {
             large: false,
             reduced: false,
             bar_dismissed: false,
+            math_bar_dismissed: false,
             render_gate: crate::render_budget::RenderConsent::Allowed,
             render_estimate: None,
             render_confirmed: false,
@@ -2618,6 +2623,30 @@ impl DocumentView {
         );
     }
 
+    /// `\[ \]` / `\( \)` math to `$$` / `$` as one undoable edit, in the
+    /// selection when there is one. The document is not saved.
+    pub fn convert_bracket_math(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).value().to_string();
+        let selection = self.editor.read(cx).selected_range();
+        match crate::math_delims::convert_edit(&text, selection.clone()) {
+            Some(edit) => {
+                self.apply(edit, window, cx);
+                if Self::shows_editor(cx) {
+                    self.editor
+                        .update(cx, |editor, cx| editor.focus(window, cx));
+                }
+            }
+            None => cx.emit(DocumentEvent::Notify(
+                if selection.is_empty() {
+                    "No \\[ \\] or \\( \\) math to convert."
+                } else {
+                    "No \\[ \\] or \\( \\) math in the selection."
+                }
+                .into(),
+            )),
+        }
+    }
+
     pub fn tidy_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).value().to_string();
         let selection = self.editor.read(cx).selected_range();
@@ -3249,6 +3278,51 @@ impl DocumentView {
             )
     }
 
+    /// Offered when the document has `\[ \]` or `\( \)` math, which
+    /// the preview does not render: one click converts it to dollars.
+    fn render_math_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("bracket-math-bar")
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .text_sm()
+            .text_color(cx.theme().foreground)
+            .child(gpui_kit::component::Icon::new(
+                gpui_kit::component::IconName::Info,
+            ))
+            .child(div().flex_1().min_w_0().truncate().child(
+                "This document writes math as \\[ \\] and \\( \\); the preview renders $$ and $.",
+            ))
+            .child(
+                Button::new("convert-bracket-math")
+                    .small()
+                    .flex_none()
+                    .label("Convert to $$ / $")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.convert_bracket_math(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("dismiss-math-bar")
+                    .ghost()
+                    .flex_none()
+                    .icon(gpui_kit::assets::IconName::X)
+                    .tooltip("Dismiss")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.math_bar_dismissed = true;
+                        cx.notify();
+                    })),
+            )
+    }
+
     fn render_editor(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let document = cx.weak_entity();
         let settings = AppSettings::get(cx);
@@ -3786,13 +3860,17 @@ impl Render for DocumentView {
                 | crate::render_budget::RenderConsent::Skipped
         );
         let show_large = self.large && !self.bar_dismissed;
-        if !show_budget && !show_large {
+        let show_math = self.analysis.bracket_math
+            && !self.math_bar_dismissed
+            && self.highlight_language() == "markdown";
+        if !show_budget && !show_large && !show_math {
             return body;
         }
         v_flex()
             .size_full()
             .min_w_0()
             .when(show_budget, |this| this.child(self.render_budget_bar(cx)))
+            .when(show_math, |this| this.child(self.render_math_bar(cx)))
             .when(show_large, |this| {
                 this.child(self.render_large_file_bar(cx))
             })

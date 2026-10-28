@@ -454,6 +454,11 @@ pub fn groups() -> Vec<CommandGroupSpec> {
                 IconName::Eraser,
                 TrimTrailingWhitespace,
             ),
+            cmd(
+                "Convert \\[ \\] / \\( \\) math to $$ / $",
+                IconName::Wand,
+                ConvertBracketMath,
+            ),
             cmd("Bold", IconName::Bold, Bold),
             cmd("Italic", IconName::Italic, Italic),
             cmd("Strikethrough", IconName::Strikethrough, Strikethrough),

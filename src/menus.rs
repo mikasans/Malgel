@@ -200,6 +200,10 @@ pub fn build(cx: &App) -> Vec<Menu> {
             vec![
                 MenuItem::action("Format Document", FormatDocument),
                 MenuItem::action("Trim Trailing Whitespace", TrimTrailingWhitespace),
+                MenuItem::action(
+                    "Convert \\[ \\] / \\( \\) Math to $$ / $",
+                    ConvertBracketMath,
+                ),
             ],
         ),
         MenuItem::action("Bold", Bold),

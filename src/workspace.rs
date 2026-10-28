@@ -4462,6 +4462,22 @@ impl Workspace {
         });
     }
 
+    /// `\[ \]` / `\( \)` math to `$$` / `$`, in the selection if there is
+    /// one: one undoable edit, not saved.
+    fn convert_bracket_math(
+        &mut self,
+        _: &ConvertBracketMath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let doc = self.active_document().clone();
+        if doc.read(cx).is_media() {
+            window.push_notification(Notification::info("No math to convert in this view."), cx);
+            return;
+        }
+        doc.update(cx, |doc, cx| doc.convert_bracket_math(window, cx));
+    }
+
     fn show_explorer_view(
         &mut self,
         _: &ShowExplorerView,
@@ -8669,6 +8685,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_auto_save))
             .on_action(cx.listener(Self::format_document))
             .on_action(cx.listener(Self::trim_trailing_whitespace))
+            .on_action(cx.listener(Self::convert_bracket_math))
             .on_action(cx.listener(Self::show_explorer_view))
             .on_action(cx.listener(Self::show_search_view))
             .on_action(cx.listener(Self::toggle_appearance))
