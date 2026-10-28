@@ -9461,7 +9461,7 @@ impl Workspace {
         // move when a tab is added (a second click on + must hit +).
         let session_bar = h_flex()
             .id("terminal-sessions")
-            .h(px(28.))
+            .h(px(32.))
             .flex_none()
             .px_2()
             .gap_1()
@@ -9511,6 +9511,26 @@ impl Workspace {
                         cx.notify();
                     }))
             }));
+        // One header row, as in VS Code: the session tabs, then the active
+        // session's actions on the right.
+        let session_bar = match self.terminals.get(active).cloned() {
+            Some(term) => {
+                let stopped = !term.read(cx).shell_running();
+                let actions = term.update(cx, |term, cx| term.header_actions(cx));
+                session_bar
+                    .when(stopped, |bar| {
+                        bar.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("shell stopped"),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(actions)
+            }
+            None => session_bar,
+        };
 
         let panes = self.active_terminal_tab();
         let body = if panes.len() > 1 {

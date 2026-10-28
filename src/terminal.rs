@@ -277,7 +277,7 @@ impl TerminalPanel {
         self.cwd.as_deref()
     }
 
-    fn shell_running(&self) -> bool {
+    pub fn shell_running(&self) -> bool {
         self.session.is_some()
     }
 
@@ -1219,6 +1219,142 @@ impl Drop for TerminalPanel {
         self.stop_shell();
     }
 }
+/// A context-menu item with its shortcut shown on the right, muted.
+fn menu_item_with_hint(label: &'static str, keys: &'static str) -> PopupMenuItem {
+    PopupMenuItem::element(move |_, cx| {
+        h_flex()
+            .w_full()
+            .gap_4()
+            .justify_between()
+            .child(label)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(keys),
+            )
+    })
+}
+
+impl TerminalPanel {
+    /// The panel's actions — Copy, Paste, Clear (Restart) | New, Split,
+    /// Kill, Maximize, Close — for the one header row the workspace draws
+    /// beside the session tabs, as VS Code does. They act on this session.
+    pub fn header_actions(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let shell_running = self.shell_running();
+        let has_selection = self.selection_span().is_some();
+        let eid = cx.entity_id().as_u64();
+        h_flex()
+            .id(ElementId::NamedInteger("terminal-actions".into(), eid))
+            .flex_none()
+            .gap_1()
+            .items_center()
+            .child(
+                Button::new(ElementId::NamedInteger("terminal-copy".into(), eid))
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::Copy))
+                    .tooltip("Copy Selection (Ctrl+Shift+C)")
+                    .disabled(!has_selection)
+                    .on_click(cx.listener(|this, _, _, cx| this.copy_selection(cx))),
+            )
+            .child(
+                Button::new(ElementId::NamedInteger("terminal-paste".into(), eid))
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::Clipboard))
+                    .tooltip("Paste (Ctrl+Shift+V)")
+                    .disabled(!shell_running)
+                    .on_click(cx.listener(|this, _, _, cx| this.paste_clipboard(cx))),
+            )
+            .child(
+                Button::new(ElementId::NamedInteger("terminal-clear".into(), eid))
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::Eraser))
+                    .tooltip("Clear")
+                    .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
+            )
+            .when(!shell_running, |this| {
+                this.child(
+                    Button::new(ElementId::NamedInteger("terminal-restart".into(), eid))
+                        .ghost()
+                        .small()
+                        .icon(Icon::new(IconName::RefreshCw))
+                        .label("Restart")
+                        .tooltip("Start a new shell in this session")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.restart(window, cx);
+                        })),
+                )
+            })
+            .child(div().w(px(1.)).h(px(16.)).bg(cx.theme().border))
+            // VS Code's panel actions: New, Split, Kill, Maximize, Close.
+            .child(
+                Button::new(ElementId::NamedInteger("terminal-new".into(), eid))
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::Plus))
+                    .tooltip("New Terminal (Ctrl+Shift+`)")
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(crate::actions::NewTerminal), cx)
+                    }),
+            )
+            .child(
+                Button::new(ElementId::NamedInteger("terminal-split".into(), eid))
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::Columns2))
+                    .tooltip("Split Terminal (Ctrl+Shift+5)")
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(crate::actions::SplitTerminal), cx)
+                    }),
+            )
+            .child(
+                Button::new(ElementId::NamedInteger("terminal-kill".into(), eid))
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::Trash))
+                    .tooltip("Kill Terminal")
+                    .disabled(!shell_running)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.stop_shell();
+                        this.append("— shell stopped\n", cx);
+                        this.focus_input(window, cx);
+                        // Workspace closes the tab when another session remains.
+                        cx.emit(TerminalEvent::CloseSession);
+                    })),
+            )
+            .child(
+                Button::new(ElementId::NamedInteger("terminal-maximize".into(), eid))
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(if self.maximized {
+                        IconName::Minimize2
+                    } else {
+                        IconName::Maximize2
+                    }))
+                    .tooltip(if self.maximized {
+                        "Restore Panel Size"
+                    } else {
+                        "Maximize Panel Size"
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(crate::actions::ToggleMaximizedPanel), cx)
+                    }),
+            )
+            .child(
+                Button::new(ElementId::NamedInteger("terminal-close".into(), eid))
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::X))
+                    .tooltip("Close Panel (Ctrl+`)")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(TerminalEvent::HidePanel))),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for TerminalPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let shell_running = self.shell_running();
@@ -1273,132 +1409,6 @@ impl Render for TerminalPanel {
                 }),
             )
             .on_action(cx.listener(|this, _: &crate::actions::TerminalClear, _, cx| this.clear(cx)))
-            .child(
-                h_flex()
-                    .id(ElementId::NamedInteger("terminal-header".into(), eid))
-                    .h(px(36.))
-                    .px_2()
-                    .gap_3()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .font_weight(gpui_kit::FontWeight::MEDIUM)
-                            .child(if shell_running {
-                                "Terminal"
-                            } else {
-                                "Terminal (shell stopped)"
-                            }),
-                    )
-                    .child(
-                        Button::new(ElementId::NamedInteger("terminal-copy".into(), eid))
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Copy))
-                            .tooltip("Copy Selection (Ctrl+Shift+C)")
-                            .disabled(!has_selection)
-                            .on_click(cx.listener(|this, _, _, cx| this.copy_selection(cx))),
-                    )
-                    .child(
-                        Button::new(ElementId::NamedInteger("terminal-paste".into(), eid))
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Clipboard))
-                            .tooltip("Paste (Ctrl+Shift+V)")
-                            .disabled(!shell_running)
-                            .on_click(cx.listener(|this, _, _, cx| this.paste_clipboard(cx))),
-                    )
-                    .child(
-                        Button::new(ElementId::NamedInteger("terminal-clear".into(), eid))
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Eraser))
-                            .tooltip("Clear")
-                            .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
-                    )
-                    .when(!shell_running, |this| {
-                        this.child(
-                            Button::new(ElementId::NamedInteger("terminal-restart".into(), eid))
-                                .ghost()
-                                .small()
-                                .icon(Icon::new(IconName::RefreshCw))
-                                .label("Restart")
-                                .tooltip("Start a new shell in this session")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.restart(window, cx);
-                                })),
-                        )
-                    })
-                    .child(div().w(px(1.)).h(px(16.)).bg(cx.theme().border))
-                    // VS Code's panel actions: New, Split, Kill, Maximize, Close.
-                    .child(
-                        Button::new(ElementId::NamedInteger("terminal-new".into(), eid))
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Plus))
-                            .tooltip("New Terminal (Ctrl+Shift+`)")
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(crate::actions::NewTerminal), cx)
-                            }),
-                    )
-                    .child(
-                        Button::new(ElementId::NamedInteger("terminal-split".into(), eid))
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Columns2))
-                            .tooltip("Split Terminal (Ctrl+Shift+5)")
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(crate::actions::SplitTerminal), cx)
-                            }),
-                    )
-                    .child(
-                        Button::new(ElementId::NamedInteger("terminal-kill".into(), eid))
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Trash))
-                            .tooltip("Kill Terminal")
-                            .disabled(!shell_running)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.stop_shell();
-                                this.append("— shell stopped\n", cx);
-                                this.focus_input(window, cx);
-                                // Workspace closes the tab when another session remains.
-                                cx.emit(TerminalEvent::CloseSession);
-                            })),
-                    )
-                    .child(
-                        Button::new(ElementId::NamedInteger("terminal-maximize".into(), eid))
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(if self.maximized {
-                                IconName::Minimize2
-                            } else {
-                                IconName::Maximize2
-                            }))
-                            .tooltip(if self.maximized {
-                                "Restore Panel Size"
-                            } else {
-                                "Maximize Panel Size"
-                            })
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(crate::actions::ToggleMaximizedPanel),
-                                    cx,
-                                )
-                            }),
-                    )
-                    .child(
-                        Button::new(ElementId::NamedInteger("terminal-close".into(), eid))
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::X))
-                            .tooltip("Close Panel (Ctrl+`)")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(TerminalEvent::HidePanel))),
-                    ),
-            )
             .child(
                 div()
                     .id(ElementId::NamedInteger("terminal-output".into(), eid))
@@ -1536,13 +1546,16 @@ impl Render for TerminalPanel {
                     // selection), Paste, Select All, Clear. Ctrl+C stays ^C.
                     .context_menu(move |menu, _, _| {
                         menu.action_context(menu_focus.clone())
+                            // The shortcuts are handled by the panel's key
+                            // handler, not the keymap, so the hints are drawn
+                            // here rather than looked up.
                             .item(
-                                PopupMenuItem::new("Copy")
+                                menu_item_with_hint("Copy", "Ctrl+Shift+C")
                                     .disabled(!has_selection)
                                     .action(Box::new(crate::actions::TerminalCopy)),
                             )
                             .item(
-                                PopupMenuItem::new("Paste")
+                                menu_item_with_hint("Paste", "Ctrl+Shift+V")
                                     .disabled(!shell_running)
                                     .action(Box::new(crate::actions::TerminalPaste)),
                             )
