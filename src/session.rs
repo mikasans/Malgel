@@ -82,6 +82,11 @@ pub struct Recovery {
     /// the recovered text must not silently replace it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_hash: Option<u64>,
+    /// How the file is encoded, so a GBK or BOM document is saved back the
+    /// same way. `None` in recoveries written before it was recorded: the
+    /// file's own encoding is used then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<crate::document::Encoding>,
 }
 
 /// Whether restoring `recovery` over the file now on disk (whose text
@@ -175,11 +180,15 @@ fn recovery_json<'a>(
     chunks: impl IntoIterator<Item = &'a str>,
 ) -> std::io::Result<()> {
     let path_json = serde_json::to_string(&recovery.path).map_err(std::io::Error::other)?;
-    write!(
-        out,
-        "{{\"path\":{path_json},\"crlf\":{},\"text\":\"",
-        recovery.crlf
-    )?;
+    write!(out, "{{\"path\":{path_json},\"crlf\":{},", recovery.crlf)?;
+    if let Some(base) = recovery.base_hash {
+        write!(out, "\"base_hash\":{base},")?;
+    }
+    if let Some(encoding) = recovery.encoding {
+        let encoding = serde_json::to_string(&encoding).map_err(std::io::Error::other)?;
+        write!(out, "\"encoding\":{encoding},")?;
+    }
+    write!(out, "\"text\":\"")?;
     for chunk in chunks {
         let quoted = serde_json::to_string(chunk).map_err(std::io::Error::other)?;
         out.write_all(&quoted.as_bytes()[1..quoted.len() - 1])?;
@@ -189,7 +198,10 @@ fn recovery_json<'a>(
 
 pub fn read_recovery(id: &str) -> Option<Recovery> {
     let json = std::fs::read_to_string(recovery_path(id)?).ok()?;
-    serde_json::from_str(&json).ok()
+    serde_json::from_str::<Recovery>(&json)
+        .ok()
+        // An Untitled document left empty has nothing to bring back.
+        .filter(|recovery| recovery.path.is_some() || !recovery.text.is_empty())
 }
 
 pub fn remove_recovery(id: &str) {
@@ -348,6 +360,7 @@ mod tests {
             text: String::new(),
             crlf: true,
             base_hash: None,
+            encoding: None,
         };
         let mut out = Vec::new();
         let chunks = ["line \"one\"\n", "\ttab \\ ", "标题\u{1}"];
@@ -365,6 +378,7 @@ mod tests {
             text: "recovered".into(),
             crlf: false,
             base_hash: base,
+            encoding: None,
         };
         assert!(recovery_conflicts(&rec(Some(1)), Some(2)), "disk moved on");
         assert!(
@@ -400,6 +414,7 @@ mod tests {
             text: text.into(),
             crlf: false,
             base_hash: None,
+            encoding: None,
         };
         for i in 0..6 {
             write_recovery_in(&dir, &format!("r{i}"), &rec(&"x".repeat(100))).unwrap();
@@ -483,6 +498,7 @@ mod tests {
             text: "unsaved".into(),
             crlf: false,
             base_hash: Some(7),
+            encoding: Some(crate::document::Encoding::Gbk),
         };
         write_recovery(&id, &recovery).unwrap();
         assert_eq!(read_recovery(&id), Some(recovery.clone()));

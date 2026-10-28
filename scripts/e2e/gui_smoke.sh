@@ -2005,6 +2005,40 @@ pass "Keep Recovered, then Ctrl+S asks Overwrite? (Enter cancels; Overwrite writ
 kill "$APP_PID" 2>/dev/null || true
 APP_PID=""
 
+# 23c. A GBK file restored after a crash is saved as GBK again, not UTF-8.
+printf '第一行\n' | iconv -t gbk >"$WS/notes/crash-gbk.txt"
+MALGEL_CRASH_TEST=1 env -u DBUS_SESSION_BUS_ADDRESS "$BIN" --new-instance "$WS" "$WS/notes/crash-gbk.txt" \
+  >"$ART_DIR/app-crash3.log" 2>&1 &
+APP_PID=$!
+wait_window "$ART_DIR/app-crash3.log"
+xdotool key --clearmodifiers ctrl+End
+xdotool type --delay 30 'GBK77'
+sleep 0.3
+xdotool key --clearmodifiers ctrl+shift+p
+sleep 0.5
+xdotool type --delay 30 'Developer: Crash'
+sleep 0.4
+xdotool key --clearmodifiers Return
+for _ in $(seq 1 50); do kill -0 "$APP_PID" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$APP_PID" 2>/dev/null && fail "the GBK Developer: Crash did not bring the app down"
+APP_PID=""
+env -u DBUS_SESSION_BUS_ADDRESS "$BIN" --new-instance "$WS" >"$ART_DIR/app-restart3.log" 2>&1 &
+APP_PID=$!
+wait_window "$ART_DIR/app-restart3.log"
+xdotool key --clearmodifiers ctrl+shift+p
+sleep 0.5
+xdotool type --delay 30 'Save All'
+sleep 0.4
+xdotool key --clearmodifiers Return
+GBK_EXPECTED="$(printf '第一行\nGBK77' | iconv -t gbk | od -An -tx1 | tr -d ' \n')"
+gbk_crash_saved() { [[ "$(od -An -tx1 "$WS/notes/crash-gbk.txt" | tr -d ' \n')" == "$GBK_EXPECTED" ]]; }
+wait_for 5 gbk_crash_saved \
+  || fail "the recovered GBK file was saved as: $(od -An -tx1 "$WS/notes/crash-gbk.txt" | head -2)"
+shot 51g-crash-gbk-saved
+pass "a GBK file recovered after a crash is saved as GBK"
+kill "$APP_PID" 2>/dev/null || true
+APP_PID=""
+
 echo
 echo "PASS — artifacts in $ART_DIR"
 ls -1 "$ART_DIR"/*.png

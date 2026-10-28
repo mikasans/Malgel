@@ -38,6 +38,7 @@ struct Entry {
     path: Option<PathBuf>,
     base_hash: Option<u64>,
     crlf: bool,
+    encoding: crate::document::Encoding,
     text: Snapshot,
 }
 
@@ -54,6 +55,7 @@ impl Registry {
         path: Option<PathBuf>,
         base_hash: Option<u64>,
         crlf: bool,
+        encoding: crate::document::Encoding,
         text: Snapshot,
     ) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
@@ -63,6 +65,7 @@ impl Registry {
                 path,
                 base_hash,
                 crlf,
+                encoding,
                 text,
             },
         );
@@ -89,11 +92,18 @@ impl Registry {
         };
         let mut written = 0;
         for (id, entry) in entries {
+            // An Untitled document left empty has nothing to rescue.
+            if entry.path.is_none()
+                && matches!(&entry.text, Snapshot::Text(text) if text.is_empty())
+            {
+                continue;
+            }
             let recovery = Recovery {
                 path: entry.path,
                 text: String::new(),
                 crlf: entry.crlf,
                 base_hash: entry.base_hash,
+                encoding: Some(entry.encoding),
             };
             let ok = match &entry.text {
                 Snapshot::Text(text) => session::write_recovery_in(
@@ -126,9 +136,10 @@ pub fn note_unsaved(
     path: Option<PathBuf>,
     base_hash: Option<u64>,
     crlf: bool,
+    encoding: crate::document::Encoding,
     text: Snapshot,
 ) {
-    registry().note(id, path, base_hash, crlf, text);
+    registry().note(id, path, base_hash, crlf, encoding, text);
 }
 
 /// The document was saved, reverted or closed: nothing to rescue.
@@ -220,6 +231,7 @@ mod tests {
             Some(PathBuf::from("/tmp/a.md")),
             Some(99),
             false,
+            crate::document::Encoding::Gbk,
             Snapshot::Text("typed but not saved".into()),
         );
         let big: String = (0..5_000).map(|i| format!("line {i}\n")).collect();
@@ -228,6 +240,7 @@ mod tests {
             None,
             None,
             true,
+            crate::document::Encoding::Utf8Bom,
             Snapshot::Rope(Rope::from(big.as_str())),
         );
         reg.note(
@@ -235,6 +248,7 @@ mod tests {
             None,
             None,
             false,
+            crate::document::Encoding::Utf8,
             Snapshot::Text("saved later".into()),
         );
         reg.forget("c-3");
@@ -247,11 +261,77 @@ mod tests {
         let b = read(&dir, "b-2");
         assert_eq!(b.text, big);
         assert!(b.crlf);
+        assert_eq!(b.encoding, Some(crate::document::Encoding::Utf8Bom));
         assert!(!dir.join("c-3.json").exists());
         // A later edit replaces the snapshot.
-        reg.note("a-1", None, None, false, Snapshot::Text("newer".into()));
+        reg.note(
+            "a-1",
+            None,
+            None,
+            false,
+            crate::document::Encoding::Utf8,
+            Snapshot::Text("newer".into()),
+        );
         reg.flush_into(&dir);
         assert_eq!(read(&dir, "a-1").text, "newer");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// GBK and UTF-8-with-BOM documents rescued by the panic hook come back
+    /// with their encoding, so Ctrl+S writes the same kind of bytes; an
+    /// Untitled document left empty is not rescued at all.
+    #[test]
+    fn recovered_documents_keep_their_encoding_byte_for_byte() {
+        use crate::document::{Encoding, LineEnding, decode, encode};
+        let dir = temp_dir("encoding");
+        let reg = Registry::default();
+        let gbk = encode("第一行\n", LineEnding::Lf, Encoding::Gbk).unwrap();
+        let bom = encode("héllo\n", LineEnding::Lf, Encoding::Utf8Bom).unwrap();
+        for (id, bytes, edit) in [("g-1", &gbk, "第二行"), ("u-2", &bom, "wörld")] {
+            let loaded = decode(bytes.clone()).unwrap();
+            let edited = format!("{}{edit}\n", loaded.text);
+            reg.note(
+                id,
+                Some(PathBuf::from(format!("/tmp/{id}.txt"))),
+                None,
+                false,
+                loaded.encoding,
+                Snapshot::Text(edited.into()),
+            );
+        }
+        reg.note(
+            "e-3",
+            None,
+            None,
+            false,
+            Encoding::Utf8,
+            Snapshot::Text("".into()),
+        );
+        assert_eq!(reg.flush_into(&dir), 2, "the empty Untitled is skipped");
+        assert!(!dir.join("e-3.json").exists());
+        for (id, expected) in [
+            (
+                "g-1",
+                encode("第一行\n第二行\n", LineEnding::Lf, Encoding::Gbk).unwrap(),
+            ),
+            (
+                "u-2",
+                encode("héllo\nwörld\n", LineEnding::Lf, Encoding::Utf8Bom).unwrap(),
+            ),
+        ] {
+            let recovery = read(&dir, id);
+            let saved = encode(&recovery.text, LineEnding::Lf, recovery.encoding.unwrap()).unwrap();
+            assert_eq!(saved, expected, "{id}");
+        }
+        assert_eq!(
+            &encode("x", LineEnding::Lf, Encoding::Utf8Bom).unwrap()[..3],
+            b"\xEF\xBB\xBF"
+        );
+        // A recovery written before the encoding was recorded reads as None,
+        // so restoring falls back to the file's own encoding.
+        let old: Recovery =
+            serde_json::from_str(r#"{"path":null,"text":"t","crlf":false}"#).unwrap();
+        assert_eq!(old.encoding, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -260,7 +340,14 @@ mod tests {
         // The panic hook may run while this thread holds the lock.
         let dir = temp_dir("held");
         let reg = Registry::default();
-        reg.note("x-1", None, None, false, Snapshot::Text("t".into()));
+        reg.note(
+            "x-1",
+            None,
+            None,
+            false,
+            crate::document::Encoding::Utf8,
+            Snapshot::Text("t".into()),
+        );
         let guard = reg.entries.lock().unwrap();
         assert_eq!(reg.flush_into(&dir), 0);
         drop(guard);

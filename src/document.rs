@@ -43,7 +43,7 @@ impl LineEnding {
 }
 
 /// How a text file is encoded on disk; saved back the same way.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Encoding {
     #[default]
     Utf8,

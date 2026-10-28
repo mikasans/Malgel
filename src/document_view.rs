@@ -1183,6 +1183,11 @@ impl DocumentView {
         self.saved_line_ending = saved
             .as_ref()
             .map_or(LineEnding::Lf, |saved| saved.line_ending);
+        // Saved back as it was read: GBK stays GBK, a BOM stays.
+        self.encoding = recovery
+            .encoding
+            .or(saved.as_ref().map(|saved| saved.encoding))
+            .unwrap_or_default();
         self.saved_hash = saved.map_or(content_hash(""), |saved| content_hash(&saved.text));
         if conflict {
             // The file changed on disk after the crash. Keep the base the
@@ -2233,6 +2238,7 @@ impl DocumentView {
             self.path.clone(),
             self.recovery_base(),
             self.line_ending == LineEnding::CrLf,
+            self.encoding,
             text,
         );
     }
@@ -2263,6 +2269,7 @@ impl DocumentView {
                             },
                             crlf: this.line_ending == LineEnding::CrLf,
                             base_hash: this.recovery_base(),
+                            encoding: Some(this.encoding),
                         },
                         this.large.then(|| this.editor.read(cx).text().clone()),
                     )
