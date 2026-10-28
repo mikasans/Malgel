@@ -584,6 +584,22 @@ impl PtySession {
         }
     }
 
+    /// The name of the job in the terminal's foreground (the shell when it
+    /// waits at the prompt, `vim` while vim runs), as tabs show it.
+    pub fn foreground_name(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            let leader = self.master.as_ref()?.process_group_leader()?;
+            let comm = std::fs::read_to_string(format!("/proc/{leader}/comm")).ok()?;
+            let name = comm.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     pub fn mode(&self) -> TermMode {
         *self.ui_lock().mode()
     }
@@ -1493,6 +1509,20 @@ mod tests {
 
     fn screen_text(session: &PtySession) -> String {
         session.snapshot(10_000).lines.join("\n")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_foreground_job_names_the_terminal() {
+        let s = PtySession::spawn(sh("sleep 0.5; exec sleep 5"), GridSize::DEFAULT).unwrap();
+        assert!(wait_until(Duration::from_secs(10), || s
+            .foreground_name()
+            .as_deref()
+            == Some("sh")));
+        assert!(wait_until(Duration::from_secs(10), || s
+            .foreground_name()
+            .as_deref()
+            == Some("sleep")));
     }
 
     #[test]

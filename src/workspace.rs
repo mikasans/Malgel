@@ -2722,6 +2722,7 @@ impl Workspace {
                     let id = panel.entity_id();
                     this.close_terminal_by_id(id, window, cx);
                 }
+                TerminalEvent::TitleChanged => cx.notify(),
                 TerminalEvent::HidePanel => {
                     this.terminal_visible = false;
                     this.terminal_maximized = false;
@@ -9586,11 +9587,11 @@ impl Workspace {
                     })
                     .collect::<Vec<_>>()
                     .join(" | ");
-                let label = if members.len() > 1 {
-                    format!("{} ({} panes)", n + 1, members.len())
-                } else {
-                    format!("{}", n + 1)
-                };
+                let label = crate::terminal::tab_label(
+                    n + 1,
+                    members.len(),
+                    self.terminals[first].read(cx).process_name(),
+                );
                 Button::new(("term-session", *tab))
                     .ghost()
                     .small()

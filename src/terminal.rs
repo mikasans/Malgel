@@ -194,6 +194,9 @@ pub struct TerminalPanel {
     cell: (Pixels, Pixels),
     rem: Pixels,
     last_paint: Instant,
+    /// The foreground job's name for the tab label, and when it was read.
+    process_name: Option<String>,
+    name_polled: Instant,
     bytes_at_paint: u64,
     /// When the current flood (painting throttled) began.
     flood_since: Option<Instant>,
@@ -244,6 +247,24 @@ pub enum TerminalEvent {
     /// The shell exited on its own (`exit`, Ctrl+D): VS Code closes the
     /// terminal, and hides the panel when it was the last one.
     Exited,
+    /// The foreground job changed (the tab label names it).
+    TitleChanged,
+}
+
+/// How often the tab label checks which job runs in the foreground.
+const NAME_POLL: Duration = Duration::from_millis(500);
+
+/// A terminal tab's label: its number, then the foreground job.
+pub fn tab_label(n: usize, panes: usize, name: Option<&str>) -> String {
+    let mut label = format!("{n}");
+    if let Some(name) = name {
+        label.push_str(": ");
+        label.push_str(name);
+    }
+    if panes > 1 {
+        label.push_str(&format!(" ({panes} panes)"));
+    }
+    label
 }
 
 impl EventEmitter<TerminalEvent> for TerminalPanel {}
@@ -306,6 +327,8 @@ impl TerminalPanel {
             cell: (px(8.), px(18.)),
             rem: px(16.),
             last_paint: Instant::now(),
+            process_name: None,
+            name_polled: Instant::now() - NAME_POLL,
             bytes_at_paint: 0,
             flood_since: None,
             fast_paint_until: None,
@@ -325,6 +348,12 @@ impl TerminalPanel {
     /// Folder new shells start in (shown in the tab's tooltip).
     pub fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
+    }
+
+    /// The foreground job's name while the shell runs (tab label).
+    pub fn process_name(&self) -> Option<&str> {
+        self.session.as_ref()?;
+        self.process_name.as_deref()
     }
 
     pub fn shell_running(&self) -> bool {
@@ -981,6 +1010,14 @@ impl TerminalPanel {
             session.set_scrollback(scrollback);
         }
         let exited = session.poll_exited();
+        if !exited && self.name_polled.elapsed() >= NAME_POLL {
+            self.name_polled = Instant::now();
+            let name = session.foreground_name();
+            if name != self.process_name {
+                self.process_name = name;
+                cx.emit(TerminalEvent::TitleChanged);
+            }
+        }
         if !exited {
             let bytes = session.bytes_read();
             let streaming = bytes.saturating_sub(self.bytes_at_paint) > ECHO_BYTES;
@@ -2060,6 +2097,13 @@ mod tests {
 
     fn ks(s: &str) -> Keystroke {
         Keystroke::parse(s).unwrap()
+    }
+
+    #[test]
+    fn tabs_are_labelled_with_the_foreground_job() {
+        assert_eq!(tab_label(1, 1, None), "1");
+        assert_eq!(tab_label(2, 1, Some("bash")), "2: bash");
+        assert_eq!(tab_label(3, 2, Some("vim")), "3: vim (2 panes)");
     }
 
     #[test]
