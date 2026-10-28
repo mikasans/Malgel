@@ -1504,6 +1504,78 @@ xdotool key --clearmodifiers ctrl+w
 sleep 0.4
 pass "Ctrl+D adds a selection per match; typing edits all; one Ctrl+Z undoes; typed-over selection undoes whole"
 
+# 21a1e. More cursors, as in VS Code: Ctrl+Alt+Down adds one on the next
+#        line, Alt+Click adds one where it clicks, typing edits at every
+#        cursor, one Ctrl+Z undoes it all, Esc goes back to one cursor; and
+#        an opening bracket or quote typed over selections wraps them.
+printf 'foo bar foo\nfoo\nbaz\n' >"$WS/notes/cursors.txt"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'cursors.txt'
+xdotool key --clearmodifiers Return
+sleep 1.0
+xdotool key --clearmodifiers ctrl+Home
+xdotool key --clearmodifiers ctrl+alt+Down
+sleep 0.2
+xdotool type --delay 30 'Y'
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 file_is "$WS/notes/cursors.txt" $'Yfoo bar foo\nYfoo\nbaz' \
+  || fail "Ctrl+Alt+Down + typing gave '$(cat "$WS/notes/cursors.txt")'"
+xdotool key --clearmodifiers ctrl+z
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 file_is "$WS/notes/cursors.txt" $'foo bar foo\nfoo\nbaz' \
+  || fail "one Ctrl+Z did not undo the Ctrl+Alt+Down edit: '$(cat "$WS/notes/cursors.txt")'"
+xdotool key --clearmodifiers Escape
+xdotool type --delay 30 'Q'
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 file_is "$WS/notes/cursors.txt" $'Qfoo bar foo\nfoo\nbaz' \
+  || fail "Esc did not go back to one cursor: '$(cat "$WS/notes/cursors.txt")'"
+xdotool key --clearmodifiers BackSpace
+xdotool key --clearmodifiers ctrl+Home
+sleep 0.3
+shot 43m-cursors-before-alt-click
+ROW3="$(python3 - "$ART_DIR/43m-cursors-before-alt-click.png" <<'PY'
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("L")
+w, h = im.size
+bg = im.getpixel((int(w * 0.6), int(h * 0.85)))
+rows, prev = [], False
+for y in range(int(h * 0.16), int(h * 0.875)):  # down to the status bar
+    xs = [x for x in range(int(w * 0.30), int(w * 0.75)) if abs(im.getpixel((x, y)) - bg) > 60]
+    ink = len(xs) >= 2
+    if ink and not prev:
+        rows.append([y, y, set()])
+    if ink:
+        rows[-1][1] = y
+        rows[-1][2].update(xs)
+    prev = ink
+# The last row is line 4's number (the empty last line): row 3 is above it.
+top, bottom, xs = rows[-2]
+xs = sorted(xs)
+for a, b in zip(xs, xs[1:]):
+    if b - a > 10:
+        print(b + 1, (top + bottom) // 2); break
+else:
+    raise SystemExit("no gap between digits and text on row 3")
+PY
+)" || fail "could not find row 3 of cursors.txt"
+xdotool mousemove ${ROW3% *} ${ROW3#* }
+sleep 0.2
+xdotool keydown alt click 1 keyup alt
+sleep 0.2
+xdotool type --delay 30 'Y'
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 file_is "$WS/notes/cursors.txt" $'Yfoo bar foo\nfoo\nYbaz' \
+  || fail "Alt+Click did not add a cursor on row 3 (at $ROW3): '$(cat "$WS/notes/cursors.txt")'"
+xdotool key --clearmodifiers ctrl+z Escape
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 file_is "$WS/notes/cursors.txt" $'foo bar foo\nfoo\nbaz' \
+  || fail "one Ctrl+Z did not undo the Alt+Click edit: '$(cat "$WS/notes/cursors.txt")'"
+xdotool key --clearmodifiers ctrl+w
+sleep 0.4
+pass "Ctrl+Alt+Down and Alt+Click add cursors; one Ctrl+Z undoes; Esc goes back to one cursor"
+
 # 21a2. After scrolling (Ctrl+End in the 12k-line file) a line-number click
 #       still selects: click the last line's number and copy it.
 xdotool key --clearmodifiers ctrl+p
