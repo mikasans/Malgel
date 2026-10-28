@@ -22,5 +22,23 @@
   },
   "idle_cpu_pct": {
     "max": 5
+  },
+  "oneline_type_p95_ms": {
+    "max": 300,
+    "_why": "10 MB JSON on one line, soft wrap on (VS Code stays usable here). p95 of 30 keys after 2 warm-up keys. Box ~80 ms, leader's box ~165 ms, a small file ~65 ms on the same software renderer; CI runs ~1.5x slower than the box"
+  },
+  "oneline_arrow_p95_ms": {
+    "max": 300
+  },
+  "oneline_wrap_toggle_ms": {
+    "max": 1000
+  },
+  "oneline_rss_peak_mib": {
+    "max": 600
+  },
+  "oneline_jump_max_ms": {
+    "max": 400,
+    "blocking": false,
+    "_why": "Ctrl+Home/End across the 10 MB line; box ~90 ms"
   }
 }

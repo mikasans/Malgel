@@ -341,6 +341,92 @@ def perf_mark_ms(logfile, pattern):
     return float(m.group(1)) if m else None
 
 
+def oneline_scene(args, x, tmp, art, metrics, notes):
+    """A 10 MB JSON file on one line, soft wrap on: keys, the wrap toggle
+    and memory. VS Code stays usable here; whole-line work per frame used to
+    cost seconds per key."""
+    ws = tmp / "oneline"
+    ws.mkdir(parents=True, exist_ok=True)
+    path = ws / "oneline.json"
+    if not path.exists():
+        item = '{"id":%d,"name":"item-%d","tags":["a","b","c"],"v":%d.5}'
+        parts, size, i = [], 1, 0
+        while size < 10_000_000:
+            parts.append(item % (i, i, i))
+            size += len(parts[-1]) + 1
+            i += 1
+        path.write_text("[" + ",".join(parts) + "]")
+    display = os.environ["DISPLAY"]
+    applog = art / "oneline-app.log"
+    blank = x.frame()
+    t_launch = now_ms()
+    app = subprocess.Popen(
+        [args.bin, "--new-instance", str(ws), str(path)],
+        stdout=open(applog, "w"), stderr=subprocess.STDOUT, start_new_session=True,
+    )
+    try:
+        if wait_change(x, blank, 20000, poll=0.005)[0] is None:
+            notes.append("oneline: no frame within 20s")
+            return
+        settled = wait_settle(x, 700, 30000)
+        metrics["oneline_open_ms"] = (settled - t_launch) if settled else None
+        geo = window_geometry(display)
+        if not geo:
+            notes.append("oneline: window not found")
+            return
+        wid, wx, wy, ww, wh = geo
+        region = (max(wx, 0), max(wy, 0), min(ww, x.width - wx), max(min(wh, x.height - wy) - 32, 32))
+        env = dict(os.environ, DISPLAY=display)
+        subprocess.run(["xdotool", "windowfocus", "--sync", wid], env=env, capture_output=True)
+        time.sleep(0.5)
+
+        def chords(keys):
+            samples = []
+            for k in keys:
+                time.sleep(0.15)
+                base = x.frame(region)
+                t0 = now_ms()
+                x.chord(k)
+                t1, _ = wait_change(x, base, 3000, region=region)
+                samples.append((t1 or now_ms()) - t0)
+            return samples
+
+        # 32 samples each, the first two dropped as warm-up: with 10, the
+        # p95 was the second-worst key and the gate flaked.
+        arrows = chords(["Down", "Right", "Right", "Down", "Left", "Down", "Up", "Right"] * 4)[2:]
+        typed = chords(list("onelinetypingintoaverylonglinexy"))[2:]
+        jumps = chords(["ctrl+End", "ctrl+Home", "ctrl+End", "ctrl+Home"])
+        shot(art, "4-oneline-keys")
+        log(f"oneline samples: arrows {[round(v) for v in arrows]} typed {[round(v) for v in typed]} jumps {[round(v) for v in jumps]}")
+        metrics["oneline_arrow_p95_ms"] = percentile(arrows, 95)
+        metrics["oneline_type_p95_ms"] = percentile(typed, 95)
+        metrics["oneline_jump_max_ms"] = max(jumps)
+        toggles = []
+        for _ in range(2):
+            time.sleep(0.3)
+            t0 = now_ms()
+            x.chord("alt+z")
+            done = wait_settle(x, 400, 10000, region=region)
+            toggles.append((done or now_ms()) - t0)
+        metrics["oneline_wrap_toggle_ms"] = max(toggles)
+        shot(art, "4-oneline")
+        hwm = proc_status(app.pid, "VmHWM")
+        metrics["oneline_rss_peak_mib"] = hwm / 1024.0 if hwm else None
+        log(f"oneline: open {metrics['oneline_open_ms']} arrows p95 {metrics['oneline_arrow_p95_ms']:.0f} "
+            f"type p95 {metrics['oneline_type_p95_ms']:.0f} jumps max {max(jumps):.0f} "
+            f"wrap toggle {max(toggles):.0f} rss {metrics['oneline_rss_peak_mib']}")
+        if app.poll() is not None:
+            notes.append(f"oneline: app exited early with {app.returncode}")
+    finally:
+        if app.poll() is None:
+            app.terminate()
+            try:
+                app.wait(5)
+            except subprocess.TimeoutExpired:
+                app.kill()
+                app.wait()
+
+
 def run(args):
     tmp = Path(args.tmp)
     art = Path(args.art or tmp)
@@ -522,6 +608,8 @@ def run(args):
             except subprocess.TimeoutExpired:
                 app.kill()
                 app.wait()
+    if not args.skip_oneline:
+        oneline_scene(args, x, tmp, art, metrics, notes)
     metrics = {k: (round(v, 1) if isinstance(v, float) else v) for k, v in metrics.items()}
     out = {"metrics": metrics, "notes": notes}
     Path(args.out).write_text(json.dumps(out, indent=2))
@@ -609,6 +697,12 @@ def main():
     r.add_argument("--idle-seconds", type=float, default=5.0)
     r.add_argument("--focused-settle-seconds", type=float, default=11.0)
     r.add_argument("--ctrl-c-timeout-ms", type=float, default=3000.0)
+    r.add_argument("--skip-oneline", action="store_true")
+    o = sub.add_parser("oneline", help="only the 10 MB one-line scene")
+    o.add_argument("--bin", required=True)
+    o.add_argument("--tmp", required=True)
+    o.add_argument("--art")
+    o.add_argument("--out", required=True)
     g = sub.add_parser("gate")
     g.add_argument("--thresholds", required=True)
     g.add_argument("--out", required=True)
@@ -620,6 +714,15 @@ def main():
     args = p.parse_args()
     if args.cmd == "run":
         run(args)
+        return 0
+    if args.cmd == "oneline":
+        tmp = Path(args.tmp)
+        art = Path(args.art or tmp)
+        art.mkdir(parents=True, exist_ok=True)
+        metrics, notes = {}, []
+        oneline_scene(args, X(os.environ["DISPLAY"]), tmp, art, metrics, notes)
+        metrics = {k: (round(v, 1) if isinstance(v, float) else v) for k, v in metrics.items()}
+        Path(args.out).write_text(json.dumps({"metrics": metrics, "notes": notes}, indent=2))
         return 0
     if args.cmd == "gate":
         return gate(args)

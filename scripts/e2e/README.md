@@ -112,6 +112,7 @@ numbers and screenshots.
 | `idle_cpu_focused_pct` | the same with the window focused and idle: from 11 s after the last key, once the caret has stopped blinking (10 s timeout, as GTK) |
 | `idle_cpu_focused_blink_pct` | focused, 2.5–7.5 s after the last key, caret still blinking; reported, not gated |
 | `rss_peak_mib`, `rss_final_mib` | VmHWM / VmRSS at the end |
+| `oneline_*` | a second launch on a 10 MB JSON file that is one line, soft wrap on: `arrow_p95` / `type_p95` (key → changed frame, 30 keys each after 2 warm-up keys), `jump_max` (Ctrl+Home/End), `wrap_toggle` (Alt+Z → screen still for 400 ms), `rss_peak_mib`, `open_ms`. `perf_probe.py oneline` runs only this scene; `run --skip-oneline` leaves it out |
 
 `perf_thresholds.json` holds the budget. A median over a blocking `max`
 exits 1; `"blocking": false` only warns (`PERF_STRICT=1` makes it block).

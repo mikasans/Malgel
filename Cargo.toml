@@ -182,4 +182,4 @@ strip = "debuginfo"
 # Pinned to a commit on the fork's malgel-0.7.0 branch.
 # Remove when upstream ships the same.
 [patch.crates-io]
-gpui-base = { git = "https://github.com/mikasans/gpui-kit", rev = "2c750c221761788dc849aa6c065230afc2bde7de" }
+gpui-base = { git = "https://github.com/mikasans/gpui-kit", rev = "f2c520c58feb58563cf6851fd8a197ee29d7f939" }
