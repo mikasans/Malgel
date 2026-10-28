@@ -729,6 +729,10 @@ pub struct Workspace {
     search_find: Entity<InputState>,
     /// Replace field in the Search activity sidebar.
     search_replace: Entity<InputState>,
+    /// The Search view's Aa / ab / .* toggles.
+    search_flags: search::FindFlags,
+    /// Why the Find text cannot be searched: an invalid regex.
+    search_error: Option<String>,
     /// The Search view's results (Ctrl+Shift+F lands here).
     sidebar_search: SidebarSearch,
     /// The rows of its results tree, rebuilt when the results or a
@@ -1006,6 +1010,8 @@ impl Workspace {
             activity_view: ActivityView::Explorer,
             search_find,
             search_replace,
+            search_flags: search::FindFlags::default(),
+            search_error: None,
             sidebar_search: SidebarSearch::Idle,
             sidebar_rows: Vec::new(),
             sidebar_collapsed: HashSet::new(),
@@ -4083,6 +4089,37 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The Find text compiled under the Search view's toggles; `None`, with
+    /// the error shown under the field, when it is not a valid regex.
+    fn search_matcher(&mut self, find: &str, cx: &mut Context<Self>) -> Option<search::Find> {
+        let built = search::Find::new(find, self.search_flags);
+        let error = built.as_ref().err().cloned();
+        if error != self.search_error {
+            self.search_error = error;
+            cx.notify();
+        }
+        built.ok()
+    }
+
+    /// Alt+C / Alt+W / Alt+R or a click on Aa / ab / .*: flip the toggle and
+    /// search again if there are results to bring up to date.
+    fn toggle_search_flag(
+        &mut self,
+        flip: impl FnOnce(&mut search::FindFlags),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        flip(&mut self.search_flags);
+        let find = self.search_find.read(cx).value().to_string();
+        let shown = !matches!(self.sidebar_search, SidebarSearch::Idle);
+        if shown && !find.is_empty() {
+            self.sidebar_run_find(window, cx);
+        } else {
+            self.search_matcher(&find, cx);
+        }
+        cx.notify();
+    }
+
     /// Enter / Shift+Enter in the Find field: search when the text is new,
     /// otherwise show the next (or previous) hit.
     fn search_find_enter(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -4188,7 +4225,9 @@ impl Workspace {
         let show_hidden = AppSettings::get(cx).show_hidden_entries;
         let opened = self.file_tree.read(cx).expanded_folders();
         let walk_root = root;
-        let wanted = find.clone();
+        let Ok(wanted) = search::Find::new(&find, self.search_flags) else {
+            return;
+        };
         // Every file in the folder, and every occurrence in them: what the
         // dialog counts is what Replace All then changes.
         let listing = cx.background_executor().spawn(async move {
@@ -4305,7 +4344,10 @@ impl Workspace {
             occurrences: n,
             written,
             skipped,
-        } = search::replace_in_files(files, find, replace);
+        } = match search::Find::new(find, self.search_flags) {
+            Ok(find) => search::replace_in_files(files, &find, replace),
+            Err(_) => search::Replaced::default(),
+        };
         crate::perf::release_free_memory();
         self.reload_replaced_files(&written, window, cx);
         let skipped = match skipped {
@@ -9759,8 +9801,55 @@ impl Workspace {
             )
     }
 
+    /// Aa / ab / .* inside the Search view's Find field, as in VS Code.
+    fn search_toggles(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let flags = self.search_flags;
+        let toggle = |id: &'static str, label: &'static str, on: bool, tip: &'static str| {
+            Button::new(id)
+                .label(label)
+                .xsmall()
+                .compact()
+                .text()
+                .selected(on)
+                .toggled(on)
+                .tooltip(tip)
+        };
+        h_flex()
+            .gap_0p5()
+            .child(
+                toggle("search-case", "Aa", flags.match_case, "Match Case (Alt+C)").on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.toggle_search_flag(|f| f.match_case = !f.match_case, window, cx)
+                    }),
+                ),
+            )
+            .child(
+                toggle(
+                    "search-word",
+                    "ab",
+                    flags.whole_word,
+                    "Match Whole Word (Alt+W)",
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_search_flag(|f| f.whole_word = !f.whole_word, window, cx)
+                })),
+            )
+            .child(
+                toggle(
+                    "search-regex",
+                    ".*",
+                    flags.regex,
+                    "Use Regular Expression (Alt+R)",
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_search_flag(|f| f.regex = !f.regex, window, cx)
+                })),
+            )
+    }
+
     /// Search activity: Find + Replace fields and results (probe #11).
     fn render_search_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let toggles = self.search_toggles(cx);
         let theme = cx.theme();
         let workspace = cx.weak_entity();
         v_flex()
@@ -9776,8 +9865,22 @@ impl Workspace {
                         this.focus_active(window, cx);
                         cx.stop_propagation();
                     }
-                    // Ctrl+Alt+Enter: Replace All, VS Code's key for it.
+                    // Alt+C / Alt+W / Alt+R: the Aa / ab / .* toggles.
                     let m = &keys.modifiers;
+                    if m.alt && !m.control && !m.shift && !m.platform {
+                        let flip: Option<fn(&mut search::FindFlags)> = match keys.key.as_str() {
+                            "c" => Some(|f| f.match_case = !f.match_case),
+                            "w" => Some(|f| f.whole_word = !f.whole_word),
+                            "r" => Some(|f| f.regex = !f.regex),
+                            _ => None,
+                        };
+                        if let Some(flip) = flip {
+                            this.toggle_search_flag(flip, window, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
+                    // Ctrl+Alt+Enter: Replace All, VS Code's key for it.
                     if keys.key == "enter" && m.control && m.alt && !m.shift && !m.platform {
                         this.sidebar_run_replace(true, window, cx);
                         cx.stop_propagation();
@@ -9808,7 +9911,22 @@ impl Workspace {
                             .text_color(theme.muted_foreground)
                             .child("Find"),
                     )
-                    .child(Input::new(&self.search_find))
+                    .child(
+                        Input::new(&self.search_find)
+                            .when(self.search_error.is_some(), |input| {
+                                input.border_color(theme.danger)
+                            })
+                            .suffix(toggles),
+                    )
+                    .when_some(self.search_error.clone(), |this, error| {
+                        this.child(
+                            div()
+                                .id("search-error")
+                                .text_xs()
+                                .text_color(theme.danger)
+                                .child(format!("Invalid regular expression: {error}")),
+                        )
+                    })
                     .child(
                         div()
                             .text_xs()
@@ -10057,6 +10175,9 @@ impl Workspace {
             window.push_notification(Notification::info("Open a folder to search its files."), cx);
             return;
         };
+        let Some(matcher) = self.search_matcher(&find, cx) else {
+            return;
+        };
         self.last_find = find.clone();
         if let SidebarSearch::Searching { cancel, .. } = &self.sidebar_search {
             cancel.store(true, Ordering::Relaxed);
@@ -10072,7 +10193,7 @@ impl Workspace {
         cx.notify();
         let show_hidden = AppSettings::get(cx).show_hidden_entries;
         let opened = self.file_tree.read(cx).expanded_folders();
-        let wanted = find.clone();
+        let wanted = matcher;
         let walk_root = root.clone();
         let stop = cancel.clone();
         // The whole folder, in a fixed order; only the hit count is capped.
@@ -10084,7 +10205,7 @@ impl Workspace {
                 quick_open::files_under(&walk_root, show_hidden, &opened, quick_open::MAX_FILES);
             let found = search::search_folder_files(
                 &files,
-                &wanted,
+                wanted,
                 search::MAX_HITS,
                 search::MAX_HITS_PER_FILE,
                 &stop,
@@ -10126,6 +10247,9 @@ impl Workspace {
         let replace = self.search_replace.read(cx).value().to_string();
         if find.is_empty() {
             window.push_notification(Notification::info("Enter text to find."), cx);
+            return;
+        }
+        if self.search_matcher(&find, cx).is_none() {
             return;
         }
         self.last_find = find.clone();

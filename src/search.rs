@@ -6,7 +6,8 @@
 //! cannot be read is passed over, the way VS Code leaves unreadable files out
 //! of its results.
 
-use std::path::PathBuf;
+use gpui_kit::base::input::{SearchOptions, SearchQuery};
+use std::{ops::Range, path::PathBuf};
 
 /// The most hits one search hands the window, as VS Code's
 /// `search.maxResults` does. Only the hit count is capped — never the files
@@ -64,57 +65,131 @@ pub fn match_bytes(text: &str, query: &str) -> Option<std::ops::Range<usize>> {
     Some(from..from + len)
 }
 
-/// Where `query` starts in `line` (in characters), under the smart-case rule.
-fn line_match(line: &str, query: &str, sensitive: bool) -> Option<usize> {
-    if sensitive {
-        // `str::find` counts bytes; the column counts characters.
-        line.find(query).map(|bytes| line[..bytes].chars().count())
-    } else {
-        find_ignoring_case(line, query)
+/// The Search view's toggles, as VS Code's: Match Case (Aa), Match Whole
+/// Word (ab) and Use Regular Expression (.*).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FindFlags {
+    pub match_case: bool,
+    pub whole_word: bool,
+    pub regex: bool,
+}
+
+/// A compiled Find in Files query: the editor's own matcher
+/// ([`SearchQuery`], so both find the same text), with the smart-case rule
+/// on top when Match Case is off and the query is not a regex.
+#[derive(Clone, Debug, Default)]
+pub struct Find {
+    query: Option<SearchQuery>,
+}
+
+impl Find {
+    /// `Err` with the parser's message when `text` is not a valid regex.
+    pub fn new(text: &str, flags: FindFlags) -> Result<Self, String> {
+        let options = SearchOptions {
+            case_sensitive: flags.match_case || (!flags.regex && case_sensitive(text)),
+            whole_word: flags.whole_word,
+            regex: flags.regex,
+        };
+        Ok(Self {
+            query: SearchQuery::new(text, options)?,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.query.is_none()
+    }
+
+    /// Every match in `text`, as byte ranges.
+    fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Range<usize>> + 'a {
+        self.query
+            .iter()
+            .flat_map(move |query| query.find_iter(text))
+    }
+
+    /// The first match per line, as `(line index, line start, match start)`.
+    fn line_starts<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = (usize, usize, usize)> + 'a {
+        let (mut line, mut line_start, mut scanned) = (0usize, 0usize, 0usize);
+        let mut last_line = None;
+        self.matches(text).filter_map(move |m| {
+            let seg = &text[scanned..m.start];
+            if let Some(nl) = seg.rfind('\n') {
+                line += newlines(seg);
+                line_start = scanned + nl + 1;
+            }
+            scanned = m.start;
+            if last_line == Some(line) {
+                return None;
+            }
+            last_line = Some(line);
+            Some((line, line_start, m.start))
+        })
     }
 }
 
+/// A literal query with smart case: what a typed query means with every
+/// toggle off.
+impl From<&str> for Find {
+    fn from(text: &str) -> Self {
+        Find::new(text, FindFlags::default()).unwrap_or_default()
+    }
+}
+
+impl From<&String> for Find {
+    fn from(text: &String) -> Self {
+        text.as_str().into()
+    }
+}
+
+impl From<&Find> for Find {
+    fn from(find: &Find) -> Self {
+        find.clone()
+    }
+}
+
+fn newlines(s: &str) -> usize {
+    s.bytes().filter(|&b| b == b'\n').count()
+}
+
 /// Every line of `text` that holds `query`, as `(line, column, text)`, at most
-/// `limit` of them.
-pub fn search_text(text: &str, query: &str, limit: usize) -> Vec<(usize, usize, String)> {
-    let mut hits = Vec::new();
-    if query.is_empty() || limit == 0 {
-        return hits;
+/// `limit` of them. A match may run over several lines (a regex with `\n`):
+/// the hit is the line it starts on.
+pub fn search_text(
+    text: &str,
+    query: impl Into<Find>,
+    limit: usize,
+) -> Vec<(usize, usize, String)> {
+    let find = query.into();
+    if limit == 0 {
+        return Vec::new();
     }
-    let sensitive = case_sensitive(query);
-    for (ix, line) in text.lines().enumerate() {
-        if hits.len() >= limit {
-            break;
-        }
-        if let Some(column) = line_match(line, query, sensitive) {
-            hits.push((ix + 1, column + 1, line.trim().to_string()));
-        }
-    }
-    hits
+    find.line_starts(text)
+        .take(limit)
+        .map(|(line, line_start, start)| {
+            let line_end = text[line_start..]
+                .find('\n')
+                .map_or(text.len(), |n| line_start + n);
+            let column = text[line_start..start].chars().count();
+            (
+                line + 1,
+                column + 1,
+                text[line_start..line_end].trim().to_string(),
+            )
+        })
+        .collect()
 }
 
 /// How many lines of `text` hold `query` — what [`search_text`] would list
 /// with no limit, without building the rows.
-pub fn count_lines(text: &str, query: &str) -> usize {
-    if query.is_empty() {
-        return 0;
-    }
-    let sensitive = case_sensitive(query);
-    if !sensitive && query.is_ascii() && text.is_ascii() {
-        let query = query.to_ascii_lowercase();
-        return text
-            .lines()
-            .filter(|line| line.to_ascii_lowercase().contains(&query))
-            .count();
-    }
-    text.lines()
-        .filter(|line| line_match(line, query, sensitive).is_some())
-        .count()
+pub fn count_lines(text: &str, query: impl Into<Find>) -> usize {
+    query.into().line_starts(text).count()
 }
 
 /// Search `files` in the order given, at most `limit` hits in total.
 #[cfg(test)]
-pub fn search_files(files: &[PathBuf], query: &str, limit: usize) -> Vec<Hit> {
+pub fn search_files(files: &[PathBuf], query: impl Into<Find>, limit: usize) -> Vec<Hit> {
     search_folder_files(
         files,
         query,
@@ -153,11 +228,12 @@ pub struct FolderSearch {
 /// `limit` are kept as rows, and at most `per_file` from any one file.
 pub fn search_folder_files(
     files: &[PathBuf],
-    query: &str,
+    query: impl Into<Find>,
     limit: usize,
     per_file: usize,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> FolderSearch {
+    let query = query.into();
     let mut out = FolderSearch {
         files_total: files.len(),
         ..FolderSearch::default()
@@ -173,7 +249,7 @@ pub fn search_folder_files(
         let Some(text) = read_text(path) else {
             continue;
         };
-        let count = count_lines(&text, query);
+        let count = count_lines(&text, &query);
         if count == 0 {
             continue;
         }
@@ -183,16 +259,14 @@ pub fn search_folder_files(
         let room = limit.saturating_sub(out.hits.len()).min(per_file);
         if room > 0 {
             out.hits
-                .extend(
-                    search_text(&text, query, room)
-                        .into_iter()
-                        .map(|(line, column, text)| Hit {
-                            path: path.clone(),
-                            line,
-                            column,
-                            text,
-                        }),
-                );
+                .extend(search_text(&text, &query, room).into_iter().map(
+                    |(line, column, text)| Hit {
+                        path: path.clone(),
+                        line,
+                        column,
+                        text,
+                    },
+                ));
         }
     }
     out.limited = out.hits.len() < out.total_hits;
@@ -236,13 +310,14 @@ fn read_loaded(path: &std::path::Path) -> Result<crate::document::LoadedText, Un
 /// How many occurrences of `find` the files hold, and in how many files,
 /// with the same smart-case rule Replace uses. Uncapped: this is what a
 /// Replace All is about to change.
-pub fn count_in_files(files: &[PathBuf], find: &str) -> (usize, usize) {
+pub fn count_in_files(files: &[PathBuf], find: impl Into<Find>) -> (usize, usize) {
+    let find = find.into();
     let (mut occurrences, mut matched) = (0, 0);
     for path in files {
         let Some(text) = read_text(path) else {
             continue;
         };
-        let n = count_in_text(&text, find);
+        let n = count_in_text(&text, &find);
         if n > 0 {
             occurrences += n;
             matched += 1;
@@ -251,55 +326,27 @@ pub fn count_in_files(files: &[PathBuf], find: &str) -> (usize, usize) {
     (occurrences, matched)
 }
 
-fn count_in_text(text: &str, find: &str) -> usize {
-    if find.is_empty() {
-        return 0;
-    }
-    if case_sensitive(find) {
-        return text.matches(find).count();
-    }
-    // Cheap pre-check before the character-wise walk.
-    if find.is_ascii() && text.is_ascii() {
-        return text
-            .to_ascii_lowercase()
-            .matches(&find.to_ascii_lowercase())
-            .count();
-    }
-    replace_in_text(text, find, "").1
+fn count_in_text(text: &str, find: &Find) -> usize {
+    find.matches(text).count()
 }
 
-/// Replace every occurrence of `find` in `text` with `replace`, using the same
-/// smart-case rule as [`search_text`]. Returns `(new_text, replacements)`.
-pub fn replace_in_text(text: &str, find: &str, replace: &str) -> (String, usize) {
-    if find.is_empty() {
+/// Replace every match of `find` in `text` with `replace` (with a regex,
+/// `$1`, `${name}`, `$&` and `\n` expand, as in the editor's Replace).
+/// Returns `(new_text, replacements)`.
+pub fn replace_in_text(text: &str, find: impl Into<Find>, replace: &str) -> (String, usize) {
+    let find = find.into();
+    let Some(query) = find.query.as_ref() else {
         return (text.to_string(), 0);
-    }
-    let sensitive = case_sensitive(find);
-    if sensitive {
-        let count = text.matches(find).count();
-        return (text.replace(find, replace), count);
-    }
-    // Case-insensitive: walk character-wise so columns stay coherent.
-    let needle: Vec<char> = find.chars().collect();
-    let hay: Vec<char> = text.chars().collect();
+    };
     let mut out = String::with_capacity(text.len());
-    let mut count = 0;
-    let mut i = 0;
-    while i < hay.len() {
-        if i + needle.len() <= hay.len()
-            && hay[i..i + needle.len()]
-                .iter()
-                .zip(&needle)
-                .all(|(a, b)| a.to_lowercase().eq(b.to_lowercase()))
-        {
-            out.push_str(replace);
-            count += 1;
-            i += needle.len();
-        } else {
-            out.push(hay[i]);
-            i += 1;
-        }
+    let (mut count, mut last) = (0, 0);
+    for range in query.find_iter(text) {
+        out.push_str(&text[last..range.start]);
+        out.push_str(&query.replacement(text, range.clone(), replace));
+        last = range.end;
+        count += 1;
     }
+    out.push_str(&text[last..]);
     (out, count)
 }
 
@@ -315,7 +362,8 @@ pub struct Replaced {
 
 /// Apply [`replace_in_text`] to each file that reads as text, writing it
 /// back atomically in its own encoding and line ending.
-pub fn replace_in_files(files: &[PathBuf], find: &str, replace: &str) -> Replaced {
+pub fn replace_in_files(files: &[PathBuf], find: impl Into<Find>, replace: &str) -> Replaced {
+    let find = find.into();
     let mut out = Replaced::default();
     for path in files {
         let loaded = match read_loaded(path) {
@@ -326,10 +374,10 @@ pub fn replace_in_files(files: &[PathBuf], find: &str, replace: &str) -> Replace
             }
             Err(Unreadable::NotText) => continue,
         };
-        if count_in_text(&loaded.text, find) == 0 {
+        if count_in_text(&loaded.text, &find) == 0 {
             continue;
         }
-        let (next, n) = replace_in_text(&loaded.text, find, replace);
+        let (next, n) = replace_in_text(&loaded.text, &find, replace);
         if n == 0 {
             continue;
         }
@@ -525,6 +573,86 @@ mod tests {
         let (out, n) = replace_in_text("Foo foo FOO", "Foo", "Bar");
         assert_eq!(n, 1);
         assert_eq!(out, "Bar foo FOO");
+    }
+
+    #[test]
+    fn regex_whole_word_and_match_case_share_the_editor_matcher() {
+        let regex = FindFlags {
+            regex: true,
+            ..Default::default()
+        };
+        let find = Find::new(r"foo\((\w+), ?(\w+)\)", regex).unwrap();
+        let text = "a = foo(x, y);\nb = foo(cc,dd);\nfoo()\n";
+        assert_eq!(
+            search_text(text, &find, 10),
+            [
+                (1, 5, "a = foo(x, y);".to_string()),
+                (2, 5, "b = foo(cc,dd);".to_string())
+            ]
+        );
+        let (out, n) = replace_in_text(text, &find, "bar($2, $1)");
+        assert_eq!(n, 2);
+        assert_eq!(out, "a = bar(y, x);\nb = bar(dd, cc);\nfoo()\n");
+        // Whole word, and Match Case over smart case.
+        let word = FindFlags {
+            whole_word: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            count_lines("food\nfoo.\nFoo\n", Find::new("foo", word).unwrap()),
+            2
+        );
+        let case = FindFlags {
+            match_case: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            count_lines("food\nFoo\n", Find::new("foo", case).unwrap()),
+            1
+        );
+        // A match over two lines is a hit on the line it starts.
+        let two = Find::new(r"one\ntwo", regex).unwrap();
+        assert_eq!(
+            search_text("zero\none\ntwo\n", &two, 10),
+            [(2, 1, "one".to_string())]
+        );
+        // Two matches on one line are one hit row, two occurrences.
+        let a = Find::from("a");
+        assert_eq!(
+            (count_lines("a a\nb\na", &a), count_in_text("a a\nb\na", &a)),
+            (2, 3)
+        );
+        // An invalid regex is an error to show, never a panic.
+        assert!(Find::new("(", regex).is_err());
+        assert!(Find::new("(", FindFlags::default()).is_ok());
+    }
+
+    #[test]
+    fn regex_replace_in_files_keeps_the_encoding() {
+        use crate::document::{Encoding, LineEnding, encode};
+        let dir = scratch("regex-files");
+        let gbk = dir.join("gbk.txt");
+        std::fs::write(
+            &gbk,
+            encode("调用 foo(甲, 乙)\n", LineEnding::CrLf, Encoding::Gbk).unwrap(),
+        )
+        .unwrap();
+        let find = Find::new(
+            r"foo\((\w+), ?(\w+)\)",
+            FindFlags {
+                regex: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(count_in_files(std::slice::from_ref(&gbk), &find), (1, 1));
+        let replaced = replace_in_files(std::slice::from_ref(&gbk), &find, "bar($2, $1)");
+        assert_eq!(replaced.written, vec![gbk.clone()]);
+        assert_eq!(
+            std::fs::read(&gbk).unwrap(),
+            encode("调用 bar(乙, 甲)\n", LineEnding::CrLf, Encoding::Gbk).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// GBK, Latin-1 and UTF-16 files are found and replaced, and keep their
