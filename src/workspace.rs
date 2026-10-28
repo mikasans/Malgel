@@ -72,6 +72,10 @@ use crate::{
     title_menu_bar::TitleMenuBar,
 };
 
+/// Width kept free on each side of the centred title: the menu bar (File
+/// … Help) on the left, the layout buttons on the right; in rems, as
+/// they scale with the UI font size.
+const TITLE_SIDE_RESERVE_REMS: f32 = 17.;
 /// Shown when Malgel starts for the first time.
 const WELCOME: &str = include_str!("welcome.md");
 /// How often open files and the file sidebar are checked for changes made
@@ -7153,15 +7157,22 @@ impl Workspace {
                 // Document name centered like a native title bar. Path copy is
                 // a small explicit control (not the whole strip) so ordinary
                 // clicks do not spam Copied toasts (round-4).
+                // Centred over the whole bar, but kept clear of the menu on
+                // the left and the buttons on the right (the same on both
+                // sides, so it stays centred): a long name truncates instead
+                // of drawing over them.
                 h_flex()
                     .id("title-bar-path")
                     .absolute()
                     .inset_0()
+                    .px(rems(TITLE_SIDE_RESERVE_REMS))
+                    .overflow_hidden()
                     .justify_center()
                     .gap_1p5()
                     .text_sm()
                     .child(
                         div()
+                            .min_w_0()
                             .font_weight(FontWeight::MEDIUM)
                             .truncate()
                             .child(doc.name()),
@@ -7169,6 +7180,7 @@ impl Workspace {
                     .when(doc.is_dirty(), |this| {
                         this.child(
                             div()
+                                .flex_none()
                                 .text_color(cx.theme().muted_foreground)
                                 .child("— Edited"),
                         )
