@@ -77,7 +77,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: terminal-stress-release
+          # One cache for both release jobs: they build the same binary, so a
+          # change to Cargo.lock or the release profile rebuilds it cold once,
+          # not once per job.
+          shared-key: linux-release
       - run: cargo build --release --locked
       - name: Terminal stress
         env:
@@ -121,7 +124,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: perf-release
+          # One cache for both release jobs: they build the same binary, so a
+          # change to Cargo.lock or the release profile rebuilds it cold once,
+          # not once per job.
+          shared-key: linux-release
       - run: cargo build --release --locked
       - run: scripts/e2e/perf_scenes.sh
       - uses: actions/upload-artifact@v4
