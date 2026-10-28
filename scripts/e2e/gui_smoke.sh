@@ -1377,6 +1377,33 @@ xdotool key --clearmodifiers alt+r
 xdotool type --delay 30 'foo\((\w+), ?(\w+)\)'
 sleep 0.5
 shot 43i-find-regex
+# The .* toggle shows it is on (VS Code: tinted fill, accent border): the
+# same field with the regex off differs there by >= 3:1 on its border.
+xdotool key --clearmodifiers alt+r
+sleep 0.5
+shot 43i2-find-regex-off
+xdotool key --clearmodifiers alt+r
+sleep 0.5
+TOGGLE_PX="$(python3 - "$ART_DIR/43i-find-regex.png" "$ART_DIR/43i2-find-regex-off.png" <<'PY'
+import sys
+from PIL import Image
+box = (1030, 200, 1150, 236)  # the Aa / ab / .* toggles at the end of the Find field
+on, off = (Image.open(p).convert("RGB").crop(box) for p in sys.argv[1:3])
+def lum(c):
+    ch = [v / 255 for v in c]
+    ch = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in ch]
+    return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
+n = 0
+for a, b in zip(on.getdata(), off.getdata()):
+    la, lb = lum(a), lum(b)
+    if (max(la, lb) + 0.05) / (min(la, lb) + 0.05) >= 3:
+        n += 1
+print(n)
+PY
+)"
+[[ "${TOGGLE_PX:-0}" -ge 40 ]] \
+  || fail "the .* toggle looks the same on and off ($TOGGLE_PX pixels >= 3:1, want >= 40)"
+pass "Find: the .* toggle's on state shows (${TOGGLE_PX} border pixels >= 3:1 against off)"
 xdotool key --clearmodifiers Tab
 xdotool key --clearmodifiers ctrl+a
 xdotool type --delay 30 'bar($2, $1)'

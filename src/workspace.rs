@@ -9805,14 +9805,19 @@ impl Workspace {
     fn search_toggles(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let flags = self.search_flags;
         let toggle = |id: &'static str, label: &'static str, on: bool, tip: &'static str| {
-            Button::new(id)
-                .label(label)
-                .xsmall()
-                .compact()
-                .text()
-                .selected(on)
-                .toggled(on)
-                .tooltip(tip)
+            // The editor Find's look: tinted fill and accent border when on.
+            gpui_kit::component::input::option_toggle_style(
+                Button::new(id)
+                    .label(label)
+                    .xsmall()
+                    .compact()
+                    .text()
+                    .selected(on)
+                    .toggled(on)
+                    .tooltip(tip),
+                on,
+                cx,
+            )
         };
         h_flex()
             .gap_0p5()

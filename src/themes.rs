@@ -307,3 +307,47 @@ mod dark_tuning_tests {
         assert!(contrast(super::DARK_SELECTION, super::DARK_ACTIVE_LINE) > 1.5);
     }
 }
+
+#[cfg(test)]
+mod option_toggle_tests {
+    use super::*;
+
+    fn luminance(c: gpui_kit::Hsla) -> f32 {
+        let c = c.to_rgb();
+        let ch = |v: f32| {
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b)
+    }
+
+    fn contrast(a: gpui_kit::Hsla, b: gpui_kit::Hsla) -> f32 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// The Find toggles (Aa / ab / .*) mark "on" with a 1px border in the
+    /// theme's primary color; off, that border is transparent. In the default
+    /// light and dark themes the border must read at >= 3:1 on the panel.
+    #[gpui_kit::test]
+    fn find_toggle_on_border_reads_in_light_and_dark(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(Settings::default(), cx);
+            for appearance in [Appearance::Light, Appearance::Dark] {
+                let settings = Settings {
+                    appearance,
+                    ..Settings::default()
+                };
+                cx.set_global(AppSettings(settings));
+                apply(None, cx);
+                let theme = Theme::global(cx);
+                let ratio = contrast(theme.primary, theme.background);
+                assert!(ratio >= 3.0, "{appearance:?}: on border {ratio:.2}:1");
+            }
+        });
+    }
+}
