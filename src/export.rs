@@ -559,6 +559,14 @@ mod tests {
     }
 
     #[test]
+    fn a_boxed_formula_frame_follows_the_page_text_colour() {
+        let html = to_html("$$\n\\boxed{x+1}\n$$\n", "t");
+        assert!(html.contains("stroke=\"currentColor\""), "{html}");
+        assert!(!html.contains("stroke=\"#000000\""), "{html}");
+        assert!(!html.contains(MATH_SENTINEL_COLOR));
+    }
+
+    #[test]
     fn renders_alerts_and_math() {
         let html = to_html(
             "Intro\n> [!WARNING]\n> Mind $x^2$ here.\n\nInline $a+b$ and $5 or $10.\n\n$$\n\\frac{1}{2}\n$$\n\n- item\n  > [!NOTE]\n  > nested\n",

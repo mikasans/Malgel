@@ -702,11 +702,12 @@ wait_for 15 xdotool search --name '^brackets\.md' >/dev/null \
   || fail "Quick Open did not open brackets.md"
 # The \boxed frame in the preview pane: two equal faint horizontal rules,
 # one above the other (bar and pane borders span the whole pane width).
-boxed_frame() { # boxed_frame <shot>: exit 0 when the preview shows a box
-  python3 - "$ART_DIR/$1.png" <<'PY'
+boxed_frame() { # boxed_frame <shot> [contrast]: exit 0 when the preview shows a box
+  python3 - "$ART_DIR/$1.png" "${2:-10}" <<'PY'
 from PIL import Image
 import sys
 im = Image.open(sys.argv[1]).convert("L")
+contrast = int(sys.argv[2])
 w, h = im.size
 x0, x1, y0, y1 = int(w * 0.60), int(w * 0.90), int(h * 0.25), int(h * 0.85)
 px = im.load()
@@ -715,7 +716,7 @@ rules = []
 for y in range(y0, y1):
     run = 0
     for x in range(x0, x1 + 1):
-        if x < x1 and abs(px[x, y] - bg) > 10:
+        if x < x1 and abs(px[x, y] - bg) > contrast:
             run += 1
         else:
             if 40 <= run < (x1 - x0) * 0.8:
@@ -739,6 +740,29 @@ for _ in $(seq 1 10); do
   boxed_frame 20b-brackets-converted && break
 done
 boxed_frame 20b-brackets-converted || fail "after Convert the preview did not draw the \\boxed math"
+# The frame is drawn in the text colour, so it stands out in both themes
+# (it was black: invisible on dark, a faint half pixel on light).
+boxed_frame 20b-brackets-converted 60 || fail "the \\boxed frame is too faint in the first theme"
+palette_run() { # palette_run <query>
+  xdotool key --clearmodifiers ctrl+shift+p
+  sleep 0.5
+  xdotool type --delay 30 "$1"
+  sleep 0.4
+  xdotool key --clearmodifiers Return
+  sleep 1.0
+}
+palette_run 'Toggle light and dark'
+for _ in $(seq 1 10); do
+  shot 20b2-brackets-other-theme
+  boxed_frame 20b2-brackets-other-theme 60 && break
+done
+boxed_frame 20b2-brackets-other-theme 60 || fail "the \\boxed frame is too faint after switching theme"
+palette_run 'Toggle light and dark'
+# Back in the editor (its empty last line) for the undo below.
+read -r bwx bwy <<<"$(xdotool getwindowgeometry "$WIN" |
+  awk '/Position/ { gsub(",", " "); print $2, $3 }')"
+xdotool mousemove $((bwx + 540)) $((bwy + 310)) click 1
+sleep 0.4
 [[ "$(cat "$WS/notes/brackets.md")" == "$BRACKETS_ORIG" ]] || fail "Convert saved the file by itself"
 # Compare when called (not once, when wait_for's arguments are expanded).
 file_is() { [[ "$(cat "$1")" == "$2" ]]; }

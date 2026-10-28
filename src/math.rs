@@ -41,7 +41,9 @@ pub struct MathPng {
 /// Render the LaTeX formula `tex` at `font_size` pixels in `color`
 /// (`#rrggbbaa`). Returns a message suitable for the user on failure.
 pub fn render(tex: &str, style: MathStyle, font_size: f32, color: &str) -> Result<MathSvg, String> {
-    let page = layout(tex, style, font_size, color)?;
+    // One point is one logical pixel on screen: a 1pt frame never thins
+    // out to a half-pixel smear.
+    let page = layout(tex, style, font_size, color, 1.)?;
     let size = page.frame.size();
     Ok(MathSvg {
         svg: typst_svg::svg(&page, &typst_svg::SvgOptions::default()),
@@ -60,7 +62,8 @@ pub fn render_png(
     color: &str,
     pixels_per_point: f32,
 ) -> Result<MathPng, String> {
-    let page = layout(tex, style, font_size, color)?;
+    let stroke = (1. / pixels_per_point).max(0.5);
+    let page = layout(tex, style, font_size, color, stroke)?;
     let size = page.frame.size();
     let png = typst_world::rasterize(&page, pixels_per_point)?;
     Ok(MathPng {
@@ -278,13 +281,34 @@ pub fn checked_typst(tex: &str, style: MathStyle) -> Result<String, String> {
     Ok(math)
 }
 
-fn layout(tex: &str, style: MathStyle, font_size: f32, color: &str) -> Result<Page, String> {
+fn layout(
+    tex: &str,
+    style: MathStyle,
+    font_size: f32,
+    color: &str,
+    stroke_pt: f32,
+) -> Result<Page, String> {
     // Formulas are laid out as they are typed: a compiler panic on one
     // costs that formula, never the preview thread.
     crate::crash::isolate("math layout", || {
-        typeset(&equation(&to_typst(tex)?, style), font_size, color)
+        let math = framed_in(&to_typst(tex)?, color, stroke_pt);
+        typeset(&equation(&math, style), font_size, color)
     })
     .unwrap_or_else(|| Err("Couldn’t lay out the formula.".into()))
+}
+
+/// `\boxed` frames drawn in the formula's own colour, `stroke_pt` wide:
+/// the converter's bare `stroke: 0.5pt` is black, which vanishes on a dark
+/// theme and is a faint half-pixel on a light one. Only on screen and in
+/// HTML; the PDF keeps LaTeX's thin black rule.
+fn framed_in(math: &str, color: &str, stroke_pt: f32) -> String {
+    // A stroke straddles the box's edge, and the page ends at that edge: a
+    // negative outset of half the width keeps all of it on the page.
+    let half = stroke_pt / 2.;
+    math.replace(
+        "#box(stroke: 0.5pt,",
+        &format!("#box(stroke: {stroke_pt}pt + rgb(\"{color}\"), outset: -{half}pt,"),
+    )
 }
 
 fn typeset(body: &str, font_size: f32, color: &str) -> Result<Page, String> {
@@ -473,6 +497,34 @@ mod tests {
         for (tex, typst) in cases {
             assert_eq!(to_typst(tex).unwrap(), typst, "{tex}");
         }
+    }
+
+    #[test]
+    fn a_boxed_frame_is_drawn_in_the_formula_colour() {
+        // Light text on a dark theme: the frame's edge pixels carry it.
+        let png = render_png(r"\boxed{x+1}", MathStyle::Display, 16., "#e6e6e6ff", 2.).unwrap();
+        let image = image::load_from_memory(&png.png).unwrap().to_rgba8();
+        let (w, h) = image.dimensions();
+        let lit = |x: u32, y: u32| {
+            let p = image.get_pixel(x, y);
+            p[3] > 200 && p[0] > 150 && p[1] > 150 && p[2] > 150
+        };
+        let row = h / 2;
+        let left = (0..w / 4).any(|x| lit(x, row));
+        let right = (w - w / 4..w).any(|x| lit(x, row));
+        let top = (0..h / 4).any(|y| lit(w / 2, y));
+        assert!(left && right && top, "frame edges missing ({w}x{h})");
+        // The SVG carries the colour on the frame too (HTML export swaps it
+        // for currentColor), at least one point wide.
+        let svg = render(r"\boxed{x}", MathStyle::Display, 16., "#123456ff")
+            .unwrap()
+            .svg;
+        assert!(svg.contains("#123456"), "{svg}");
+        assert!(!svg.contains("stroke=\"#000000\""), "{svg}");
+        assert_eq!(
+            framed_in("#box(stroke: 0.5pt, inset: 3pt, $x$)", "#fff", 1.),
+            "#box(stroke: 1pt + rgb(\"#fff\"), outset: -0.5pt, inset: 3pt, $x$)"
+        );
     }
 
     #[test]
