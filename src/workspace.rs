@@ -8180,6 +8180,7 @@ impl Workspace {
                     // Encoding picker (VS Code): always shown, UTF-8 too.
                     .child({
                         let ws_enc = workspace.clone();
+                        let current = doc.encoding();
                         Button::new("status-encoding")
                             .ghost()
                             .xsmall()
@@ -8187,7 +8188,7 @@ impl Workspace {
                             .label(doc.encoding().label())
                             .tooltip("Select Encoding")
                             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
-                                encoding_menu(menu, ws_enc.clone(), window, cx)
+                                encoding_menu(menu, ws_enc.clone(), current, window, cx)
                             })
                     })
                     // EOL picker: LF / CRLF (VS Code-like).
@@ -10679,35 +10680,49 @@ fn push_closed(closed: &mut Vec<(PathBuf, usize)>, path: PathBuf, ix: usize) {
 
 /// The status bar's encoding menu: Reopen with Encoding and Save with
 /// Encoding, each listing [`Encoding::CHOICES`](crate::document::Encoding).
+/// The encoding menu's rows: every choice, with the document's current
+/// encoding checked (VS Code marks it the same way).
+fn encoding_entries(
+    current: crate::document::Encoding,
+) -> impl Iterator<Item = (crate::document::Encoding, bool)> {
+    crate::document::Encoding::CHOICES
+        .into_iter()
+        .map(move |encoding| (encoding, encoding == current))
+}
+
 fn encoding_menu(
     menu: PopupMenu,
     workspace: gpui_kit::WeakEntity<Workspace>,
+    current: crate::document::Encoding,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
-    use crate::document::Encoding;
     let reopen = workspace.clone();
     menu.submenu("Reopen with Encoding", window, cx, move |mut menu, _, _| {
-        for encoding in Encoding::CHOICES {
+        for (encoding, checked) in encoding_entries(current) {
             let ws = reopen.clone();
-            menu = menu.item(PopupMenuItem::new(encoding.label()).on_click(
-                move |_, window, cx| {
-                    _ = ws.update(cx, |this, cx| {
-                        this.reopen_with_encoding(encoding, window, cx)
-                    });
-                },
-            ));
+            menu = menu.item(
+                PopupMenuItem::new(encoding.label())
+                    .checked(checked)
+                    .on_click(move |_, window, cx| {
+                        _ = ws.update(cx, |this, cx| {
+                            this.reopen_with_encoding(encoding, window, cx)
+                        });
+                    }),
+            );
         }
         menu
     })
     .submenu("Save with Encoding", window, cx, move |mut menu, _, _| {
-        for encoding in Encoding::CHOICES {
+        for (encoding, checked) in encoding_entries(current) {
             let ws = workspace.clone();
-            menu = menu.item(PopupMenuItem::new(encoding.label()).on_click(
-                move |_, window, cx| {
-                    _ = ws.update(cx, |this, cx| this.save_with_encoding(encoding, window, cx));
-                },
-            ));
+            menu = menu.item(
+                PopupMenuItem::new(encoding.label())
+                    .checked(checked)
+                    .on_click(move |_, window, cx| {
+                        _ = ws.update(cx, |this, cx| this.save_with_encoding(encoding, window, cx));
+                    }),
+            );
         }
         menu
     })
@@ -10715,6 +10730,22 @@ fn encoding_menu(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_encoding_menu_checks_only_the_current_encoding() {
+        use crate::document::Encoding;
+        for current in Encoding::CHOICES {
+            let checked: Vec<_> = super::encoding_entries(current)
+                .filter(|(_, checked)| *checked)
+                .map(|(encoding, _)| encoding)
+                .collect();
+            assert_eq!(checked, vec![current], "{}", current.label());
+            assert_eq!(
+                super::encoding_entries(current).count(),
+                Encoding::CHOICES.len()
+            );
+        }
+    }
+
     #[test]
     fn a_file_dialog_that_cannot_open_is_an_error_not_a_cancel() {
         use super::file_dialog_outcome;
