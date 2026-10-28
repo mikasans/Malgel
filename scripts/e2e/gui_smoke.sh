@@ -1761,6 +1761,55 @@ pass "terminal: drag / double / triple click 5990 rows into the scrollback copy 
 xdotool key --clearmodifiers ctrl+grave
 sleep 0.5
 
+# 21f1. Keyboard scrollback (VS Code): Shift+PgUp pages back, Ctrl+Shift+Up
+#       steps a line, Shift+Home goes to the oldest line kept and Shift+End
+#       back to the newest. None of it reaches the program: `cat` writes
+#       whatever bytes arrive to a file, which must stay empty.
+rm -f "$WS/pty-bytes"
+xdotool key --clearmodifiers ctrl+grave
+sleep 1.0
+xdotool type --delay 20 "clear; seq 1 30000; cat > '$WS/pty-bytes'"
+xdotool key --clearmodifiers Return
+wait_for 10 test -e "$WS/pty-bytes" || fail "the scrollback probe did not start"
+sleep 2.0
+shot 49g3-scroll-tail
+xdotool key --clearmodifiers shift+Prior
+# A short panel pages only a few rows, and a loaded box repaints late: poll.
+shot_differs() { # shot_differs <name> <against> <pixels>: shoot until it changes
+  local saved=$SETTLE i
+  SETTLE=0.3
+  for ((i = 0; i < 20; i++)); do
+    shot "$1"
+    [[ "$(pixels_differ "$2" "$1")" -gt "$3" ]] && break
+  done
+  SETTLE=$saved
+  [[ "$(pixels_differ "$2" "$1")" -gt "$3" ]]
+}
+shot_differs 49g4-scroll-page-up 49g3-scroll-tail 600 \
+  || fail "Shift+PgUp did not page the terminal back"
+xdotool key --clearmodifiers ctrl+shift+Up
+shot_differs 49g5-scroll-line-up 49g4-scroll-page-up 300 \
+  || fail "Ctrl+Shift+Up did not step the terminal back a line"
+xdotool key --clearmodifiers shift+Home
+shot_differs 49g6-scroll-top 49g5-scroll-line-up 1000 \
+  || fail "Shift+Home did not go to the top of the scrollback"
+# At the oldest line kept, paging further back changes nothing.
+xdotool key --clearmodifiers shift+Prior
+shot 49g6b-scroll-top-again
+[[ "$(pixels_differ 49g6-scroll-top 49g6b-scroll-top-again)" -lt 300 ]] \
+  || fail "Shift+Home did not stop at the oldest line kept"
+xdotool key --clearmodifiers shift+End
+shot 49g7-scroll-bottom
+[[ "$(pixels_differ 49g3-scroll-tail 49g7-scroll-bottom)" -lt 2000 ]] \
+  || fail "Shift+End did not come back to the newest output"
+xdotool key --clearmodifiers ctrl+d
+sleep 0.5
+[[ ! -s "$WS/pty-bytes" ]] \
+  || fail "scrollback keys reached the program: $(od -An -c "$WS/pty-bytes" | head -2)"
+pass "terminal: Shift+PgUp / Ctrl+Shift+Up / Shift+Home / Shift+End scroll; no bytes reach the program"
+xdotool key --clearmodifiers ctrl+grave
+sleep 0.5
+
 # 21g. Settings: every switch is drawn inside the card (the default dialog
 #      width clipped them all), and filtering does not move the card.
 xdotool key --clearmodifiers ctrl+comma

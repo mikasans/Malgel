@@ -123,6 +123,36 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// A keyboard scrollback move (VS Code's terminal bindings).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollKey {
+    /// Pages up (negative) or down.
+    Page(i32),
+    /// Lines up (negative) or down.
+    Line(i32),
+    Top,
+    Bottom,
+}
+
+/// Shift+PgUp/PgDn page, Ctrl+Shift+Up/Down step a line, Shift+Home/End go
+/// to the top / bottom of the scrollback. Only outside the alternate
+/// screen: a full-screen program gets these keys itself.
+fn scrollback_key(keys: &Keystroke) -> Option<ScrollKey> {
+    let m = &keys.modifiers;
+    if m.alt || m.platform || m.function || !m.shift {
+        return None;
+    }
+    match (m.control, keys.key.as_str()) {
+        (false, "pageup") => Some(ScrollKey::Page(-1)),
+        (false, "pagedown") => Some(ScrollKey::Page(1)),
+        (false, "home") => Some(ScrollKey::Top),
+        (false, "end") => Some(ScrollKey::Bottom),
+        (true, "up") => Some(ScrollKey::Line(-1)),
+        (true, "down") => Some(ScrollKey::Line(1)),
+        _ => None,
+    }
+}
+
 /// App shortcuts that must keep working while the terminal has focus.
 fn is_app_chord(keys: &Keystroke) -> bool {
     let m = &keys.modifiers;
@@ -327,6 +357,32 @@ impl TerminalPanel {
         } else {
             self.prelude.len() + self.view.line_count
         }
+    }
+
+    /// Move the transcript for a scrollback key; nothing reaches the PTY.
+    fn scroll_by_key(&mut self, scroll: ScrollKey, cx: &mut Context<Self>) {
+        let rows = self.total_rows();
+        let line_h = f32::from(self.cell.1);
+        if rows == 0 || line_h <= 0. {
+            return;
+        }
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let view_h = f32::from(handle.bounds().size.height);
+        let max = (rows as f32 * line_h - view_h).max(0.);
+        let offset = handle.offset();
+        let top = -f32::from(offset.y);
+        let page = ((view_h / line_h).floor() - 1.).max(1.) * line_h;
+        let next = match scroll {
+            ScrollKey::Page(n) => top + n as f32 * page,
+            ScrollKey::Line(n) => top + n as f32 * line_h,
+            ScrollKey::Top => 0.,
+            ScrollKey::Bottom => max,
+        }
+        .clamp(0., max);
+        handle.set_offset(gpui_kit::point(offset.x, px(-next)));
+        // At the bottom the view follows new output again (as the wheel does).
+        self.follow_tail = next >= max - 0.5;
+        cx.notify();
     }
 
     /// Keep the viewport on the newest output (VS Code follow-tail).
@@ -629,7 +685,16 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.session.is_none() || is_app_chord(keys) {
+        if self.session.is_none() {
+            return false;
+        }
+        if !self.view.alt_screen
+            && let Some(scroll) = scrollback_key(keys)
+        {
+            self.scroll_by_key(scroll, cx);
+            return true;
+        }
+        if is_app_chord(keys) {
             return false;
         }
         let m = &keys.modifiers;
@@ -1733,6 +1798,39 @@ mod tests {
 
     fn ks(s: &str) -> Keystroke {
         Keystroke::parse(s).unwrap()
+    }
+
+    #[test]
+    fn scrollback_keys_match_vs_code() {
+        assert_eq!(
+            scrollback_key(&ks("shift-pageup")),
+            Some(ScrollKey::Page(-1))
+        );
+        assert_eq!(
+            scrollback_key(&ks("shift-pagedown")),
+            Some(ScrollKey::Page(1))
+        );
+        assert_eq!(
+            scrollback_key(&ks("ctrl-shift-up")),
+            Some(ScrollKey::Line(-1))
+        );
+        assert_eq!(
+            scrollback_key(&ks("ctrl-shift-down")),
+            Some(ScrollKey::Line(1))
+        );
+        assert_eq!(scrollback_key(&ks("shift-home")), Some(ScrollKey::Top));
+        assert_eq!(scrollback_key(&ks("shift-end")), Some(ScrollKey::Bottom));
+        for key in [
+            "pageup",
+            "up",
+            "home",
+            "ctrl-up",
+            "alt-shift-pageup",
+            "shift-up",
+            "ctrl-shift-c",
+        ] {
+            assert_eq!(scrollback_key(&ks(key)), None, "{key}");
+        }
     }
 
     #[test]
