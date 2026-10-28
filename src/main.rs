@@ -26,6 +26,7 @@ mod image_view;
 mod images;
 mod links;
 mod logfile;
+mod lru;
 mod math;
 mod menus;
 mod paths;

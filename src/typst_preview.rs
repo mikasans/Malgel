@@ -25,6 +25,7 @@
 //! compilation read are recorded, and those are exactly the paths the
 //! workspace watches.
 
+use crate::lru::SizedLru;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -47,6 +48,14 @@ use crate::{session::DiskStamp, typst_world};
 /// are small; the cap keeps a document pointing at something large from
 /// pulling it all into memory.
 const MAX_NAMED_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// Named files (images, includes) whose bytes are kept between compiles,
+/// least recently read dropped first.
+const FILE_CACHE_ENTRIES: usize = 256;
+const FILE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+fn new_file_cache() -> SizedLru<PathBuf, CachedFile> {
+    SizedLru::new(FILE_CACHE_ENTRIES, FILE_CACHE_BYTES)
+}
 
 #[cfg(test)]
 /// What a Typst document compiles from and to: the source file, the other
@@ -150,7 +159,7 @@ fn compile_in(
         root: source.parent().map(Path::to_path_buf).unwrap_or_default(),
         source: Source::new(file_id_for(source), text),
         read: Mutex::new(Vec::new()),
-        file_cache: Mutex::new(HashMap::new()),
+        file_cache: Mutex::new(new_file_cache()),
         packages,
         package_roots: Mutex::new(HashMap::new()),
     };
@@ -197,7 +206,7 @@ pub(crate) struct DocumentWorld {
     /// Bytes of named files (images, includes), keyed by resolved path +
     /// `(len, mtime)`. Survives `set_text` so warm edits do not re-read the
     /// same PNG on every keystroke.
-    file_cache: Mutex<HashMap<PathBuf, CachedFile>>,
+    file_cache: Mutex<SizedLru<PathBuf, CachedFile>>,
     /// The folders a package can be found in, in the order they are tried.
     packages: Vec<PathBuf>,
     /// The folder each imported package was found in. `None` records a
@@ -220,7 +229,7 @@ impl DocumentWorld {
             root: path.parent().map(Path::to_path_buf).unwrap_or_default(),
             source: Source::new(file_id_for(path), text),
             read: Mutex::new(Vec::new()),
-            file_cache: Mutex::new(HashMap::new()),
+            file_cache: Mutex::new(new_file_cache()),
             packages: package_folders(),
             package_roots: Mutex::new(HashMap::new()),
         }
@@ -358,7 +367,7 @@ impl World for DocumentWorld {
         }
         let stamp = (metadata.len(), metadata.modified().ok());
         {
-            let cache = self
+            let mut cache = self
                 .file_cache
                 .lock()
                 .expect("a compile reads files on one thread");
@@ -412,6 +421,7 @@ impl World for DocumentWorld {
                     stamp,
                     bytes: typed.clone(),
                 },
+                typed.len(),
             );
         self.read
             .lock()

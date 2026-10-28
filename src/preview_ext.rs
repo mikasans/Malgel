@@ -1,6 +1,7 @@
 //! Preview extensions beyond CommonMark and GFM: GitHub alerts, math and
 //! Mermaid diagrams.
 
+use crate::lru::SizedLru;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -726,7 +727,7 @@ type MathKey = (String, MathStyle, u32, u32);
 /// lay out again once a formula is ready.
 #[derive(Clone)]
 struct MathCache {
-    entries: Arc<Mutex<HashMap<MathKey, MathEntry>>>,
+    entries: Arc<Mutex<SizedLru<MathKey, MathEntry>>>,
     preview: WeakEntity<TextViewState>,
 }
 
@@ -736,8 +737,20 @@ pub(crate) const INLINE_MATH_SCALE: f32 = 1.15;
 /// Display formulas are set a little larger again, as in print.
 pub(crate) const DISPLAY_MATH_SCALE: f32 = 1.3;
 
-/// Formulas kept before the cache starts over.
+/// Formulas kept, least recently used dropped first, by count and by the
+/// rendered SVGs' bytes.
 const MATH_CACHE_LIMIT: usize = 512;
+const MATH_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+impl MathEntry {
+    fn bytes(&self) -> usize {
+        match self {
+            MathEntry::Pending => 0,
+            MathEntry::Ready(math) => math.image.bytes().len(),
+            MathEntry::Failed(error) => error.len(),
+        }
+    }
+}
 
 enum Lookup {
     Ready(Arc<PreparedMath>),
@@ -748,7 +761,10 @@ enum Lookup {
 impl MathCache {
     fn new(preview: &gpui_kit::Entity<TextViewState>) -> Self {
         Self {
-            entries: Arc::default(),
+            entries: Arc::new(Mutex::new(SizedLru::new(
+                MATH_CACHE_LIMIT,
+                MATH_CACHE_BYTES,
+            ))),
             preview: preview.downgrade(),
         }
     }
@@ -769,10 +785,7 @@ impl MathCache {
             Some(MathEntry::Failed(error)) => return Lookup::Failed(error.clone()),
             None => {}
         }
-        if entries.len() >= MATH_CACHE_LIMIT {
-            entries.retain(|_, entry| matches!(entry, MathEntry::Pending));
-        }
-        entries.insert(key.clone(), MathEntry::Pending);
+        entries.insert(key.clone(), MathEntry::Pending, 0);
         drop(entries);
 
         let color = format!("#{:08x}", u32::from(rgba));
@@ -798,11 +811,12 @@ impl MathCache {
                 }
                 Err(error) => MathEntry::Failed(error.into()),
             };
+            let size = entry.bytes();
             cache
                 .entries
                 .lock()
                 .expect("math cache poisoned")
-                .insert(key, entry);
+                .insert(key, entry, size);
             _ = cache
                 .preview
                 .update(cx, |preview, cx| preview.invalidate_inline_layout(cx));
@@ -980,8 +994,20 @@ enum DiagramLookup {
     Failed(SharedString),
 }
 
-/// Diagrams kept before the cache starts over.
+/// Diagrams kept, least recently used dropped first, by count and by the
+/// rendered SVGs' bytes.
 const DIAGRAM_CACHE_LIMIT: usize = 128;
+const DIAGRAM_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+impl DiagramEntry {
+    fn bytes(&self) -> usize {
+        match self {
+            DiagramEntry::Pending => 0,
+            DiagramEntry::Ready(diagram) => diagram.image.bytes().len(),
+            DiagramEntry::Failed(error) => error.len(),
+        }
+    }
+}
 /// Diagrams are laid out for this text size and scaled with the preview's.
 const DIAGRAM_FONT_SIZE: f32 = 16.;
 
@@ -989,14 +1015,17 @@ const DIAGRAM_FONT_SIZE: f32 = 16.;
 /// on a background thread like formulas.
 #[derive(Clone)]
 struct DiagramCache {
-    entries: Arc<Mutex<HashMap<(u64, u64), DiagramEntry>>>,
+    entries: Arc<Mutex<SizedLru<(u64, u64), DiagramEntry>>>,
     preview: WeakEntity<TextViewState>,
 }
 
 impl DiagramCache {
     fn new(preview: &gpui_kit::Entity<TextViewState>) -> Self {
         Self {
-            entries: Arc::default(),
+            entries: Arc::new(Mutex::new(SizedLru::new(
+                DIAGRAM_CACHE_LIMIT,
+                DIAGRAM_CACHE_BYTES,
+            ))),
             preview: preview.downgrade(),
         }
     }
@@ -1010,10 +1039,7 @@ impl DiagramCache {
             Some(DiagramEntry::Failed(error)) => return DiagramLookup::Failed(error.clone()),
             None => {}
         }
-        if entries.len() >= DIAGRAM_CACHE_LIMIT {
-            entries.retain(|_, entry| matches!(entry, DiagramEntry::Pending));
-        }
-        entries.insert(key, DiagramEntry::Pending);
+        entries.insert(key, DiagramEntry::Pending, 0);
         drop(entries);
 
         let source = source.to_string();
@@ -1034,11 +1060,12 @@ impl DiagramCache {
                 })),
                 Err(error) => DiagramEntry::Failed(error.into()),
             };
+            let size = entry.bytes();
             cache
                 .entries
                 .lock()
                 .expect("diagram cache poisoned")
-                .insert(key, entry);
+                .insert(key, entry, size);
             _ = cache
                 .preview
                 .update(cx, |preview, cx| preview.invalidate_inline_layout(cx));
