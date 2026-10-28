@@ -1477,7 +1477,11 @@ mod tests {
     fn writes_never_block_when_child_ignores_stdin() {
         // The child never reads: the tty input queue fills. A blocking write
         // on the UI thread used to hang the app here.
-        let mut s = PtySession::spawn(sh("sleep 30"), GridSize::DEFAULT).unwrap();
+        let mut s = PtySession::spawn(sh("echo ready; exec sleep 30"), GridSize::DEFAULT).unwrap();
+        // A ^C sent before the child owns the terminal is lost (CI saw the
+        // sleep outlive the 10 s wait): start once it is running.
+        assert!(wait_until(Duration::from_secs(10), || screen_text(&s)
+            .contains("ready")));
         let big = vec![b'x'; 1 << 20];
         let t = Instant::now();
         for _ in 0..4 {
