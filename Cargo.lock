@@ -2841,7 +2841,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.7.0"
-source = "git+https://github.com/mikasans/gpui-kit?rev=3e1779c4c75861bc1dd180d40b193cc6d86060b2#3e1779c4c75861bc1dd180d40b193cc6d86060b2"
+source = "git+https://github.com/mikasans/gpui-kit?rev=1fcc73b4dfa0e4cc3972a74b868366ceb6a0c74c#1fcc73b4dfa0e4cc3972a74b868366ceb6a0c74c"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2880,7 +2880,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.7.0"
-source = "git+https://github.com/mikasans/gpui-kit?rev=3e1779c4c75861bc1dd180d40b193cc6d86060b2#3e1779c4c75861bc1dd180d40b193cc6d86060b2"
+source = "git+https://github.com/mikasans/gpui-kit?rev=1fcc73b4dfa0e4cc3972a74b868366ceb6a0c74c#1fcc73b4dfa0e4cc3972a74b868366ceb6a0c74c"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2953,7 +2953,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.7.0"
-source = "git+https://github.com/mikasans/gpui-kit?rev=3e1779c4c75861bc1dd180d40b193cc6d86060b2#3e1779c4c75861bc1dd180d40b193cc6d86060b2"
+source = "git+https://github.com/mikasans/gpui-kit?rev=1fcc73b4dfa0e4cc3972a74b868366ceb6a0c74c#1fcc73b4dfa0e4cc3972a74b868366ceb6a0c74c"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2978,7 +2978,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit-assets"
 version = "0.7.0"
-source = "git+https://github.com/mikasans/gpui-kit?rev=3e1779c4c75861bc1dd180d40b193cc6d86060b2#3e1779c4c75861bc1dd180d40b193cc6d86060b2"
+source = "git+https://github.com/mikasans/gpui-kit?rev=1fcc73b4dfa0e4cc3972a74b868366ceb6a0c74c#1fcc73b4dfa0e4cc3972a74b868366ceb6a0c74c"
 dependencies = [
  "anyhow",
  "gpui-pre",
@@ -8262,8 +8262,8 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d204abcbdf8e88729306a8d0ca01a79d8a49969fe1f84696909d6dbc4321c1a"
 dependencies = [
- "foldhash 0.2.0",
- "hashbrown 0.17.1",
+ "foldhash 0.1.5",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
