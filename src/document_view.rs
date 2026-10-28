@@ -3296,6 +3296,7 @@ impl DocumentView {
         h_flex()
             .id("large-file-bar")
             .w_full()
+            .min_w_0()
             .flex_none()
             .items_center()
             .gap_2()
@@ -3310,18 +3311,37 @@ impl DocumentView {
                 gpui_kit::component::Icon::new(gpui_kit::component::IconName::Info)
                     .text_color(cx.theme().primary),
             )
-            .child(div().flex_1().child(large_file_message(megabytes, state)))
+            // The message gives way (ellipsis, full text in the tooltip)
+            // so the button always shows whole.
+            .child({
+                let message = large_file_message(megabytes, state);
+                div()
+                    .id("large-file-message")
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .tooltip({
+                        let message = message.clone();
+                        move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(message.clone())
+                                .build(window, cx)
+                        }
+                    })
+                    .child(message)
+            })
             .when(self.reduced, |bar| {
                 bar.child(
                     Button::new("enable-large-file-features")
                         .label("Turn on preview and outline")
                         .ghost()
+                        .flex_none()
                         .on_click(cx.listener(|this, _, _, cx| this.enable_anyway(cx))),
                 )
             })
             .child(
                 Button::new("dismiss-large-file-bar")
                     .ghost()
+                    .flex_none()
                     .icon(gpui_kit::assets::IconName::X)
                     .tooltip("Dismiss")
                     .on_click(cx.listener(|this, _, _, cx| {
