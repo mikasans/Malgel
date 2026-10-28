@@ -629,6 +629,10 @@ impl TerminalPanel {
         let (whole, rest) = wheel_steps(self.wheel_rows + rows);
         self.wheel_rows = rest;
         if wants_mouse(mode) {
+            let whole = mouse_wheel_reports(event.delta, whole);
+            if matches!(event.delta, ScrollDelta::Lines(_)) {
+                self.wheel_rows = 0.;
+            }
             let action = if whole > 0 {
                 MouseAction::WheelUp
             } else {
@@ -1130,6 +1134,19 @@ impl TerminalPanel {
             self.prelude.len()
         };
         Some((row + offset, col))
+    }
+}
+
+/// Mouse wheel reports for one wheel event when the program reads the
+/// mouse: a mouse wheel notch is one report, as in xterm and VS Code, even
+/// when the toolkit counts it as several lines; touchpad pixels keep their
+/// accumulated whole rows (`whole`). Positive: up.
+fn mouse_wheel_reports(delta: ScrollDelta, whole: i32) -> i32 {
+    match delta {
+        ScrollDelta::Lines(lines) if lines.y > 0. => 1,
+        ScrollDelta::Lines(lines) if lines.y < 0. => -1,
+        ScrollDelta::Lines(_) => 0,
+        ScrollDelta::Pixels(_) => whole,
     }
 }
 
@@ -2317,6 +2334,17 @@ mod tests {
         // Grey on grey goes to whichever end gets further.
         let mid = rgb_hsla(0x77, 0x77, 0x77);
         assert!(ratio_of(ensure_contrast(mid, mid, 4.5), mid) >= 4.5);
+    }
+
+    #[test]
+    fn one_wheel_notch_is_one_mouse_report() {
+        let lines = |y: f32| ScrollDelta::Lines(gpui_kit::point(0., y));
+        assert_eq!(mouse_wheel_reports(lines(3.), 3), 1);
+        assert_eq!(mouse_wheel_reports(lines(-3.), -3), -1);
+        assert_eq!(mouse_wheel_reports(lines(0.4), 0), 1);
+        assert_eq!(mouse_wheel_reports(lines(0.), 0), 0);
+        let pixels = ScrollDelta::Pixels(gpui_kit::point(px(0.), px(40.)));
+        assert_eq!(mouse_wheel_reports(pixels, 2), 2);
     }
 
     #[test]

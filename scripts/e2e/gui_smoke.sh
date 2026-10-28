@@ -1986,6 +1986,9 @@ MOUSE="$(od -An -c "$WS/mouse-bytes" | tr -d ' \n')"
 for want in '033[<0;' '033[<64;' '033[<2;'; do
   [[ "$MOUSE" == *"$want"* ]] || fail "mouse reporting: no $want in $MOUSE"
 done
+# One wheel notch is one report (it was three, one per toolkit line).
+NOTCHES="$(grep -o '033\[<64;' <<<"$MOUSE" | wc -l)"
+[[ "$NOTCHES" -eq 1 ]] || fail "one wheel notch sent $NOTCHES mouse reports: $MOUSE"
 # The reported right click must not also open the context menu: an open
 # menu would take the wheel below.
 xdotool key --clearmodifiers ctrl+u
