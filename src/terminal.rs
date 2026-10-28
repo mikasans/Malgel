@@ -38,10 +38,10 @@ use std::{
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EntityInputHandler as _,
     EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, Global, HighlightStyle, Hsla,
-    InteractiveElement as _, IntoElement, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement as _, Pixels, Point, Render, ScrollDelta, ScrollStrategy, ScrollWheelEvent,
-    SharedString, Size, Styled as _, StyledText, UnderlineStyle, UniformListScrollHandle,
-    WeakEntity, Window,
+    InteractiveElement as _, IntoElement, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render, ScrollDelta,
+    ScrollStrategy, ScrollWheelEvent, SharedString, Size, Styled as _, StyledText, UnderlineStyle,
+    UniformListScrollHandle, WeakEntity, Window,
     assets::IconName,
     base::Disableable as _,
     canvas,
@@ -60,8 +60,9 @@ use gpui_kit::{
 use portable_pty::CommandBuilder;
 
 use crate::term_session::{
-    CellColor, CellStyle, CursorShape, GridSize, PtySession, SelectKind, StyledRow, ViewInfo,
-    encode_key,
+    CellColor, CellStyle, CursorShape, GridSize, MouseAction, MouseButtonCode, MouseMods,
+    PtySession, SelectKind, StyledRow, ViewInfo, alternate_scroll, encode_key, mouse_report,
+    wants_mouse,
 };
 
 /// Transcript kept from a stopped / exited shell above the next one.
@@ -206,6 +207,11 @@ pub struct TerminalPanel {
     _pump: Option<gpui_kit::Task<()>>,
     /// Stick output viewport to the end while the user has not scrolled up.
     follow_tail: bool,
+    /// The last cell a motion report named, so moving inside one cell
+    /// sends nothing.
+    mouse_cell: Option<Cell2>,
+    /// Wheel travel not yet a whole row (touchpads send pixels).
+    wheel_rows: f32,
     /// Selection in the transcript of earlier shells (the prelude, which
     /// never scrolls under a running shell): anchor, head and how it grows.
     /// A selection in the live session is kept by the emulator instead
@@ -308,6 +314,8 @@ impl TerminalPanel {
             settle_paint: None,
             _pump: None,
             follow_tail: true,
+            mouse_cell: None,
+            wheel_rows: 0.,
             selection: None,
             selecting: None,
             scrollback: crate::term_session::SCROLLBACK_LINES,
@@ -534,6 +542,85 @@ impl TerminalPanel {
             }
             self.selection = Some(((row, col), (row, col), kind));
             self.selecting = Some(SelTarget::Prelude);
+        }
+    }
+
+    /// Send a mouse event to a full-screen program that asked for the
+    /// mouse (htop, vim with `mouse=a`, tmux). True when the program owns
+    /// the mouse, so the panel must not select; Shift always selects, as in
+    /// xterm and VS Code.
+    fn report_mouse(&mut self, pos: Point<Pixels>, action: MouseAction, mods: Modifiers) -> bool {
+        if mods.shift || !self.view.alt_screen {
+            return false;
+        }
+        let Some(mode) = self.session.as_ref().map(|s| s.mode()) else {
+            return false;
+        };
+        if !wants_mouse(mode) {
+            return false;
+        }
+        // Whole cells, not the nearest boundary a selection uses.
+        let Some((row, col)) = self.cell_at(pos, SelectKind::Word) else {
+            return true;
+        };
+        if matches!(action, MouseAction::Move(_)) {
+            if self.mouse_cell == Some((row, col)) {
+                return true;
+            }
+            self.mouse_cell = Some((row, col));
+        }
+        let mods = MouseMods {
+            shift: false,
+            alt: mods.alt,
+            control: mods.control,
+        };
+        if let Some(bytes) = mouse_report(mode, action, col, row, mods)
+            && let Some(session) = &self.session
+        {
+            session.write(&bytes);
+        }
+        true
+    }
+
+    /// The wheel on the alternate screen: mouse reports when the program
+    /// reads the mouse, arrow keys when it does not (less, man). True when
+    /// the program took it; the panel scrolls otherwise.
+    fn wheel_to_program(&mut self, event: &ScrollWheelEvent) -> bool {
+        if !self.view.alt_screen || event.modifiers.shift {
+            return false;
+        }
+        let Some(mode) = self.session.as_ref().map(|s| s.mode()) else {
+            return false;
+        };
+        let line_h = f32::from(self.cell.1).max(1.);
+        let rows = match event.delta {
+            ScrollDelta::Pixels(p) => f32::from(p.y) / line_h,
+            ScrollDelta::Lines(l) => l.y,
+        };
+        let (whole, rest) = wheel_steps(self.wheel_rows + rows);
+        self.wheel_rows = rest;
+        if wants_mouse(mode) {
+            let action = if whole > 0 {
+                MouseAction::WheelUp
+            } else {
+                MouseAction::WheelDown
+            };
+            for _ in 0..whole.unsigned_abs() {
+                self.report_mouse(event.position, action, event.modifiers);
+            }
+            return true;
+        }
+        if whole == 0 {
+            return alternate_scroll(mode, true, 1).is_some();
+        }
+        match alternate_scroll(mode, whole > 0, whole.unsigned_abs() as usize) {
+            Some(bytes) => {
+                if let Some(session) = &self.session {
+                    session.write(&bytes);
+                }
+                true
+            }
+            None => false,
         }
     }
 
@@ -1007,6 +1094,13 @@ impl TerminalPanel {
         };
         Some((row + offset, col))
     }
+}
+
+/// Whole wheel rows in `rows` (positive: up) and the fraction kept for
+/// the next event.
+fn wheel_steps(rows: f32) -> (i32, f32) {
+    let whole = rows.trunc();
+    (whole as i32, rows - whole)
 }
 
 /// The height of one terminal row: `LINE_HEIGHT_REMS` rem rounded to whole
@@ -1566,6 +1660,15 @@ impl Render for TerminalPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            if this.report_mouse(
+                                event.position,
+                                MouseAction::Press(MouseButtonCode::Left),
+                                event.modifiers,
+                            ) {
+                                this.focus_input(window, cx);
+                                window.prevent_default();
+                                return;
+                            }
                             // Start a selection (a plain click clears it);
                             // double-click selects a word, triple a line,
                             // Shift+click extends. Following the tail is left
@@ -1584,7 +1687,71 @@ impl Render for TerminalPanel {
                             cx.notify();
                         }),
                     )
+                    // The right button goes to a program that reads the
+                    // mouse (htop, tmux) instead of opening the menu; Shift
+                    // keeps the menu, as in xterm.
+                    // Capture phase: stopping there also keeps the context
+                    // menu (a bubble listener on the panel) from opening.
+                    .capture_any_mouse_down(cx.listener(
+                        |this, event: &MouseDownEvent, window, cx| {
+                            if event.button == MouseButton::Right
+                                && this.report_mouse(
+                                    event.position,
+                                    MouseAction::Press(MouseButtonCode::Right),
+                                    event.modifiers,
+                                )
+                            {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseUpEvent, _, _| {
+                            this.report_mouse(
+                                event.position,
+                                MouseAction::Release(MouseButtonCode::Right),
+                                event.modifiers,
+                            );
+                        }),
+                    )
+                    // The middle button goes to a program that reads the
+                    // mouse; otherwise it does nothing here.
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(|this, event: &MouseDownEvent, window, _| {
+                            if this.report_mouse(
+                                event.position,
+                                MouseAction::Press(MouseButtonCode::Middle),
+                                event.modifiers,
+                            ) {
+                                window.prevent_default();
+                            }
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(|this, event: &MouseUpEvent, _, _| {
+                            this.report_mouse(
+                                event.position,
+                                MouseAction::Release(MouseButtonCode::Middle),
+                                event.modifiers,
+                            );
+                        }),
+                    )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        let held = (event.pressed_button == Some(MouseButton::Left))
+                            .then_some(MouseButtonCode::Left);
+                        if this.selecting.is_none()
+                            && this.report_mouse(
+                                event.position,
+                                MouseAction::Move(held),
+                                event.modifiers,
+                            )
+                        {
+                            return;
+                        }
                         if this.selecting.is_none()
                             || event.pressed_button != Some(MouseButton::Left)
                         {
@@ -1595,7 +1762,14 @@ impl Render for TerminalPanel {
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            if this.selecting.is_none() {
+                                this.report_mouse(
+                                    event.position,
+                                    MouseAction::Release(MouseButtonCode::Left),
+                                    event.modifiers,
+                                );
+                            }
                             this.selecting = None;
                             cx.notify();
                         }),
@@ -1608,6 +1782,10 @@ impl Render for TerminalPanel {
                         }),
                     )
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        if this.wheel_to_program(event) {
+                            cx.stop_propagation();
+                            return;
+                        }
                         // Scrolling up pauses follow; scrolling down to the
                         // end resumes it.
                         let dy = match event.delta {
@@ -1882,6 +2060,16 @@ mod tests {
 
     fn ks(s: &str) -> Keystroke {
         Keystroke::parse(s).unwrap()
+    }
+
+    #[test]
+    fn touchpad_wheel_rows_carry_their_fraction() {
+        use super::wheel_steps;
+        assert_eq!(wheel_steps(0.4), (0, 0.4));
+        let (whole, rest) = wheel_steps(0.4 + 0.7);
+        assert_eq!(whole, 1);
+        assert!((rest - 0.1).abs() < 1e-5);
+        assert_eq!(wheel_steps(-3.0), (-3, 0.));
     }
 
     #[test]

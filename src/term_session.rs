@@ -787,6 +787,117 @@ pub fn user_shell() -> String {
     "/bin/sh".to_string()
 }
 
+/// A mouse button as xterm numbers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButtonCode {
+    Left,
+    Middle,
+    Right,
+}
+
+/// What the mouse did, at a 0-based cell of the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseAction {
+    Press(MouseButtonCode),
+    Release(MouseButtonCode),
+    /// Moved with this button held (`None`: no button).
+    Move(Option<MouseButtonCode>),
+    WheelUp,
+    WheelDown,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MouseMods {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+}
+
+/// Whether the program asked for mouse events (DECSET 1000/1002/1003).
+pub fn wants_mouse(mode: TermMode) -> bool {
+    mode.intersects(TermMode::MOUSE_MODE)
+}
+
+/// The bytes xterm sends for a mouse event, in the program's mode: SGR
+/// (`CSI < b ; x ; y M/m`, DECSET 1006) or the classic X10 form
+/// (`CSI M` and three bytes, cells past 223 unreportable). `None` when the
+/// mode does not ask for this event: no mouse mode, motion without 1002 /
+/// 1003, motion with no button without 1003.
+pub fn mouse_report(
+    mode: TermMode,
+    action: MouseAction,
+    col: usize,
+    row: usize,
+    mods: MouseMods,
+) -> Option<Vec<u8>> {
+    if !wants_mouse(mode) {
+        return None;
+    }
+    let button = |b: MouseButtonCode| match b {
+        MouseButtonCode::Left => 0u32,
+        MouseButtonCode::Middle => 1,
+        MouseButtonCode::Right => 2,
+    };
+    let (code, release) = match action {
+        MouseAction::Press(b) => (button(b), false),
+        MouseAction::Release(b) => (button(b), true),
+        MouseAction::Move(held) => {
+            let wanted = match held {
+                Some(_) => mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION),
+                None => mode.contains(TermMode::MOUSE_MOTION),
+            };
+            if !wanted {
+                return None;
+            }
+            (32 + held.map_or(3, button), false)
+        }
+        MouseAction::WheelUp => (64, false),
+        MouseAction::WheelDown => (65, false),
+    };
+    let code = code
+        + if mods.shift { 4 } else { 0 }
+        + if mods.alt { 8 } else { 0 }
+        + if mods.control { 16 } else { 0 };
+    let (x, y) = (col + 1, row + 1);
+    if mode.contains(TermMode::SGR_MOUSE) {
+        let end = if release { 'm' } else { 'M' };
+        return Some(format!("\x1b[<{code};{x};{y}{end}").into_bytes());
+    }
+    // X10 cannot say which button was released.
+    let code = if release { 3 + (code & !3) } else { code };
+    if x > 223 || y > 223 {
+        return None;
+    }
+    Some(vec![
+        0x1b,
+        b'[',
+        b'M',
+        (32 + code) as u8,
+        (32 + x) as u8,
+        (32 + y) as u8,
+    ])
+}
+
+/// The wheel on the alternate screen of a program without mouse mode (less,
+/// man, vim without `mouse=`): arrow keys, as xterm's alternate scroll
+/// (DECSET 1007, on by default) sends. `None` when the wheel should scroll
+/// the panel instead.
+pub fn alternate_scroll(mode: TermMode, up: bool, lines: usize) -> Option<Vec<u8>> {
+    if wants_mouse(mode)
+        || !mode.contains(TermMode::ALT_SCREEN)
+        || !mode.contains(TermMode::ALTERNATE_SCROLL)
+    {
+        return None;
+    }
+    let key: &[u8] = match (mode.contains(TermMode::APP_CURSOR), up) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1bOB",
+        (false, true) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+    };
+    Some(key.repeat(lines.max(1)))
+}
+
 /// Bytes a paste sends: CR line endings (what Enter sends), wrapped in
 /// bracketed-paste markers when the program enabled them.
 pub fn paste_payload(text: &str, bracketed: bool) -> Vec<u8> {
@@ -942,12 +1053,7 @@ fn row_text<T>(term: &Term<T>, line: Line) -> (String, bool) {
         {
             continue;
         }
-        // A tab leaves '\t' in the cell where it started and moves the
-        // cursor to the next stop; the cells it skips are blanks. Drawn as
-        // a space, every cell keeps its column (a '\t' glyph would be
-        // shaped at some other width and shift the rest of the row).
-        let ch = shown_char(cell.c);
-        text.push(ch);
+        text.push(shown_char(cell.c));
         if let Some(extra) = cell.zerowidth() {
             text.extend(extra.iter());
         }
@@ -975,7 +1081,12 @@ fn styled_row<T>(term: &Term<T>, line: Line) -> StyledRow {
             continue;
         }
         let start = text.len();
-        text.push(shown_char(cell.c));
+        // A tab leaves '\t' in the cell where it started and moves the
+        // cursor to the next stop; the cells it skips are blanks. Drawn as
+        // a space, every cell keeps its column (a '\t' glyph would be
+        // shaped at some other width and shift the rest of the row).
+        let ch = shown_char(cell.c);
+        text.push(ch);
         if let Some(extra) = cell.zerowidth() {
             text.extend(extra.iter());
         }
@@ -1796,6 +1907,101 @@ mod selection_tests {
     use super::*;
 
     #[test]
+    fn tabs_line_up_at_every_eighth_column() {
+        let mut t = term(40, 6, 100);
+        feed(&mut t, "a\tX\r\nabc\tX\r\nabcd\tX\r\n12345678\tX\r\n");
+        let columns: Vec<_> = (0..4)
+            .map(|line| {
+                let row = styled_row(&t, Line(line));
+                assert!(!row.text.contains('\t'), "{:?}", row.text);
+                row.text.chars().position(|c| c == 'X')
+            })
+            .collect();
+        assert_eq!(columns, [Some(8), Some(8), Some(8), Some(16)]);
+        assert_eq!(
+            row_text(&t, Line(0)).0.chars().position(|c| c == 'X'),
+            Some(8)
+        );
+        // A row holding only a tab is blank.
+        feed(&mut t, "\t");
+        assert!(row_is_blank(&t, Line(4)));
+    }
+
+    #[test]
+    fn mouse_reports_follow_the_programs_mode() {
+        use MouseAction::*;
+        use MouseButtonCode::*;
+        let none = MouseMods::default();
+        let mut t = term(20, 4, 100);
+        let mode = |t: &Term<VoidListener>| *t.mode();
+        assert_eq!(mouse_report(mode(&t), Press(Left), 0, 0, none), None);
+        // 1000 + 1006: clicks in SGR, 1-based, release with `m`.
+        feed(&mut t, "\x1b[?1000h\x1b[?1006h");
+        let r =
+            |a, c, r, m| mouse_report(mode(&t), a, c, r, m).map(|b| String::from_utf8(b).unwrap());
+        assert_eq!(r(Press(Left), 4, 2, none).as_deref(), Some("\x1b[<0;5;3M"));
+        assert_eq!(
+            r(Release(Middle), 4, 2, none).as_deref(),
+            Some("\x1b[<1;5;3m")
+        );
+        assert_eq!(r(Press(Right), 0, 1, none).as_deref(), Some("\x1b[<2;1;2M"));
+        assert_eq!(r(WheelUp, 0, 0, none).as_deref(), Some("\x1b[<64;1;1M"));
+        let ctrl = MouseMods {
+            control: true,
+            ..none
+        };
+        assert_eq!(r(WheelDown, 0, 0, ctrl).as_deref(), Some("\x1b[<81;1;1M"));
+        // Clicks only: no drags or motion.
+        assert_eq!(r(Move(Some(Left)), 1, 1, none), None);
+        feed(&mut t, "\x1b[?1002h");
+        let r =
+            |a, c, r| mouse_report(mode(&t), a, c, r, none).map(|b| String::from_utf8(b).unwrap());
+        assert_eq!(r(Move(Some(Left)), 1, 1).as_deref(), Some("\x1b[<32;2;2M"));
+        assert_eq!(r(Move(None), 1, 1), None);
+        feed(&mut t, "\x1b[?1003h");
+        let r = |a, c, r| mouse_report(mode(&t), a, c, r, none);
+        assert_eq!(r(Move(None), 1, 1), Some(b"\x1b[<35;2;2M".to_vec()));
+        // X10: bytes offset by 32, any release is button 3, far cells dropped.
+        feed(&mut t, "\x1b[?1006l");
+        let r = |a, c, r| mouse_report(mode(&t), a, c, r, none);
+        assert_eq!(
+            r(Press(Left), 0, 0),
+            Some(vec![0x1b, b'[', b'M', 32, 33, 33])
+        );
+        assert_eq!(
+            r(Release(Left), 9, 4),
+            Some(vec![0x1b, b'[', b'M', 35, 42, 37])
+        );
+        assert_eq!(r(Press(Left), 300, 0), None);
+        feed(&mut t, "\x1b[?1000l\x1b[?1002l\x1b[?1003l");
+        assert!(!wants_mouse(mode(&t)));
+    }
+
+    #[test]
+    fn the_wheel_sends_arrows_on_the_alternate_screen_without_mouse_mode() {
+        let mut t = term(20, 4, 100);
+        assert_eq!(alternate_scroll(*t.mode(), true, 3), None, "normal screen");
+        feed(&mut t, "\x1b[?1049h");
+        assert_eq!(
+            alternate_scroll(*t.mode(), true, 3).as_deref(),
+            Some(&b"\x1b[A\x1b[A\x1b[A"[..])
+        );
+        feed(&mut t, "\x1b[?1h");
+        assert_eq!(
+            alternate_scroll(*t.mode(), false, 1).as_deref(),
+            Some(&b"\x1bOB"[..])
+        );
+        feed(&mut t, "\x1b[?1000h");
+        assert_eq!(
+            alternate_scroll(*t.mode(), true, 1),
+            None,
+            "the program reads the wheel"
+        );
+        feed(&mut t, "\x1b[?1000l\x1b[?1007l");
+        assert_eq!(alternate_scroll(*t.mode(), true, 1), None, "turned off");
+    }
+
+    #[test]
     fn decscusr_sets_the_cursor_shape_and_hiding_drops_it() {
         let mut t = term(20, 4, 100);
         assert_eq!(view_info_term(&t).cursor_shape, CursorShape::Block);
@@ -1906,27 +2112,6 @@ mod selection_tests {
     fn wide_chars_map_view_columns_to_cells() {
         let mut t = term(40, 5, 100);
         feed(&mut t, "中文 ok\n");
-        #[test]
-        fn tabs_line_up_at_every_eighth_column() {
-            let mut t = term(40, 6, 100);
-            feed(&mut t, "a\tX\r\nabc\tX\r\nabcd\tX\r\n12345678\tX\r\n");
-            let columns: Vec<_> = (0..4)
-                .map(|line| {
-                    let row = styled_row(&t, Line(line));
-                    assert!(!row.text.contains('\t'), "{:?}", row.text);
-                    row.text.chars().position(|c| c == 'X')
-                })
-                .collect();
-            assert_eq!(columns, [Some(8), Some(8), Some(8), Some(16)]);
-            assert_eq!(
-                row_text(&t, Line(0)).0.chars().position(|c| c == 'X'),
-                Some(8)
-            );
-            // A row holding only a tab is blank.
-            feed(&mut t, "\t");
-            assert!(row_is_blank(&t, Line(4)));
-        }
-
         // View chars: 中 文 ' ' o k — the grid has spacer cells between.
         term_select_start(&mut t, SelectKind::Cells, 0, 1);
         term_select_update(&mut t, 0, 5);

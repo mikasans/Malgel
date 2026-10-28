@@ -1968,6 +1968,36 @@ TABS_DIFF="$(region_differ 49g12-term-tabs 49g13-term-spaces "$TERM_ROWS")"
 [[ "$TABS_DIFF" -lt 4000 ]] || fail "tab stops do not line up with spaces ($TABS_DIFF px)"
 pass "terminal: tabs stop at every 8th column like the spaces they stand for"
 # 21f5. Mouse reporting: a full-screen program that asked for the mouse
+#       (DECSET 1000 + 1006) gets SGR clicks and the wheel, right click
+#       included; a plain alternate screen gets arrow keys from the wheel.
+#       `cat` in raw mode writes what arrives.
+rm -f "$WS/mouse-bytes" "$WS/alt-bytes"
+xdotool type --delay 15 "printf '\\033[?1049h\\033[?1000h\\033[?1006h'; stty raw -echo; timeout 5 cat > '$WS/mouse-bytes'; stty sane; printf '\\033[?1000l\\033[?1006l\\033[?1049l'"
+xdotool key --clearmodifiers Return
+wait_for 5 test -e "$WS/mouse-bytes" || fail "the mouse probe did not start"
+sleep 0.6
+xdotool mousemove $(( SW / 2 )) $(( SH * 70 / 100 )) click 1
+sleep 0.2
+xdotool click 4
+sleep 0.2
+xdotool click 3
+sleep 5.5
+MOUSE="$(od -An -c "$WS/mouse-bytes" | tr -d ' \n')"
+for want in '033[<0;' '033[<64;' '033[<2;'; do
+  [[ "$MOUSE" == *"$want"* ]] || fail "mouse reporting: no $want in $MOUSE"
+done
+# The reported right click must not also open the context menu: an open
+# menu would take the wheel below.
+xdotool key --clearmodifiers ctrl+u
+xdotool type --delay 15 "printf '\\033[?1049h'; stty raw -echo; timeout 3 cat > '$WS/alt-bytes'; stty sane; printf '\\033[?1049l'"
+xdotool key --clearmodifiers Return
+wait_for 5 test -e "$WS/alt-bytes" || fail "the alternate-scroll probe did not start"
+sleep 0.6
+xdotool mousemove $(( SW / 2 )) $(( SH * 70 / 100 )) click 4
+sleep 3.5
+ALT="$(od -An -c "$WS/alt-bytes" | tr -d ' \n')"
+[[ "$ALT" == *'033[A'* || "$ALT" == *'033OA'* ]] || fail "alternate scroll: the wheel sent '$ALT', not ↑"
+pass "terminal: SGR mouse reports (click, wheel, right click) and alternate-screen wheel arrows"
 xdotool key --clearmodifiers ctrl+grave
 sleep 0.5
 
