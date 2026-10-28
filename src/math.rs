@@ -145,8 +145,10 @@ pub fn to_typst(tex: &str) -> Result<String, String> {
 fn paired_bars(tex: &str) -> String {
     #[derive(Clone, Copy, PartialEq)]
     enum Bar {
-        Single,
-        Double,
+        /// `|`, and whether an operand comes right before it (then it can
+        /// close a bar that is open).
+        Single(bool),
+        Double(bool),
         Open(bool),
         Close(bool),
     }
@@ -160,15 +162,31 @@ fn paired_bars(tex: &str) -> String {
         if sized {
             return;
         }
-        for (kind, open, shut) in [
-            (Bar::Single, r"\left|", r"\right|"),
-            (Bar::Double, r"\left\|", r"\right\|"),
+        // Bars nest (`|a - |b||`): one after an operand closes the bar
+        // open, any other opens one. Left over open bars mean they were
+        // not absolute values (`\{x | x > 0\}`): leave the group's alone.
+        for (double, open, shut) in [
+            (false, r"\left|", r"\right|"),
+            (true, r"\left\|", r"\right\|"),
         ] {
-            let bars: Vec<_> = group.iter().filter(|(_, k)| *k == kind).collect();
-            if bars.len() % 2 == 0 {
-                for (n, (range, _)) in bars.into_iter().enumerate() {
-                    edits.push((range.clone(), if n % 2 == 0 { open } else { shut }));
+            let mut pending = 0usize;
+            let mut marks = Vec::new();
+            for (range, kind) in &group {
+                let after_operand = match kind {
+                    Bar::Single(after) if !double => *after,
+                    Bar::Double(after) if double => *after,
+                    _ => continue,
+                };
+                if pending > 0 && after_operand {
+                    pending -= 1;
+                    marks.push((range.clone(), shut));
+                } else {
+                    pending += 1;
+                    marks.push((range.clone(), open));
                 }
+            }
+            if pending == 0 {
+                edits.extend(marks);
             }
         }
         for double in [false, true] {
@@ -212,7 +230,11 @@ fn paired_bars(tex: &str) -> String {
                 if name_end == i {
                     // `\|`, `\{`, `\\`…: one escaped char.
                     if i < bytes.len() && bytes[i] == b'|' {
-                        stack.last_mut().unwrap().push((start..i + 1, Bar::Double));
+                        let after = operand_before(tex, start);
+                        stack
+                            .last_mut()
+                            .unwrap()
+                            .push((start..i + 1, Bar::Double(after)));
                     }
                     i += tex[i..].chars().next().map_or(1, char::len_utf8);
                     continue;
@@ -270,7 +292,13 @@ fn paired_bars(tex: &str) -> String {
                 let was = sized.pop().unwrap();
                 close(group, was, &mut edits);
             }
-            b'|' => stack.last_mut().unwrap().push((i..i + 1, Bar::Single)),
+            b'|' => {
+                let after = operand_before(tex, i);
+                stack
+                    .last_mut()
+                    .unwrap()
+                    .push((i..i + 1, Bar::Single(after)));
+            }
             _ => {}
         }
         i += 1;
@@ -296,6 +324,75 @@ fn paired_bars(tex: &str) -> String {
     }
     out.push_str(&tex[at..]);
     out
+}
+
+/// Whether what comes before byte `at` of `tex` ends an operand (a
+/// letter, digit, closing bracket or bar, a Greek letter), so a `|` there
+/// closes rather than opens. Operators, relations, opening brackets and
+/// commands like `\cdot` do not.
+fn operand_before(tex: &str, at: usize) -> bool {
+    let before = tex[..at].trim_end();
+    let Some(last) = before.chars().next_back() else {
+        return false;
+    };
+    if last.is_ascii_alphabetic() {
+        // A command name, or a plain variable.
+        let word_start = before
+            .rfind(|c: char| !c.is_ascii_alphabetic())
+            .map_or(0, |i| i + 1);
+        if before[..word_start].ends_with('\\') {
+            const OPERANDS: &[&str] = &[
+                "alpha",
+                "beta",
+                "gamma",
+                "delta",
+                "epsilon",
+                "varepsilon",
+                "zeta",
+                "eta",
+                "theta",
+                "vartheta",
+                "iota",
+                "kappa",
+                "lambda",
+                "mu",
+                "nu",
+                "xi",
+                "pi",
+                "rho",
+                "sigma",
+                "tau",
+                "upsilon",
+                "phi",
+                "varphi",
+                "chi",
+                "psi",
+                "omega",
+                "Gamma",
+                "Delta",
+                "Theta",
+                "Lambda",
+                "Xi",
+                "Pi",
+                "Sigma",
+                "Phi",
+                "Psi",
+                "Omega",
+                "infty",
+                "ell",
+                "hbar",
+                "dots",
+                "ldots",
+                "cdots",
+                "prime",
+                "rvert",
+                "rVert",
+            ];
+            return OPERANDS.contains(&&before[word_start..]);
+        }
+        return true;
+    }
+    last.is_ascii_digit() || matches!(last, ')' | ']' | '}' | '|' | '\'' | '!')
 }
 
 /// A space between a closing brace and the command after it: the converter
@@ -754,6 +851,10 @@ mod tests {
             (r"\| x \|_2", "norm(x)_(2)"),
             (r"\lVert x\rVert", "norm(x)"),
             (r"\left| x \right|", "abs(x)"),
+            // Nested bars.
+            (r"|a - |b||", "abs(a - abs(b))"),
+            (r"|\alpha| + |\beta|", "abs(alpha) + abs(beta)"),
+            (r"\|x - \|y\|\|", "norm(x - norm(y))"),
             // A lone set-builder bar stays a bar; sized bars are untouched.
             (r"\{ x | x > 0 \}", "{ x | x > 0 }"),
         ] {

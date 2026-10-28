@@ -971,7 +971,27 @@ impl MarkdownPlugin for InlineMathPlugin {
                 Some(InlineElement::new(math_image(&math)).with_baseline(px(math.baseline)))
             }
             // The preview shows the node's text until the formula is ready.
-            Lookup::Waiting | Lookup::Failed(_) => None,
+            Lookup::Waiting => None,
+            // A formula that cannot be typeset shows its source in the
+            // error colour, the reason on hover (display math prints it
+            // under the source): plain text read as if nothing was wrong.
+            Lookup::Failed(error) => {
+                let id =
+                    SharedString::from(format!("inline-math-error-{}", content_hash(&formula.tex)));
+                Some(InlineElement::new(
+                    div()
+                        .id(id)
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_color(cx.theme().danger)
+                        .border_b_1()
+                        .border_color(cx.theme().danger)
+                        .child(format!("${}$", math::shown_source(&formula.tex)))
+                        .tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(error.clone())
+                                .build(window, cx)
+                        }),
+                ))
+            }
         }
     }
 }
@@ -1261,6 +1281,30 @@ impl MarkdownPlugin for MermaidPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_math_with_nested_bars_is_one_formula_that_typesets() {
+        let source = "Distance $|a - |b||$ here.";
+        let Ok(Node::Root(root)) =
+            markdown::to_mdast(source, &crate::analysis::preview_parse_options())
+        else {
+            panic!("no root");
+        };
+        let Some(Node::Paragraph(paragraph)) = root.children.first() else {
+            panic!("no paragraph");
+        };
+        let maths: Vec<_> = paragraph
+            .children
+            .iter()
+            .filter_map(|node| match node {
+                Node::InlineMath(math) => Some(math.value.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(maths, ["|a - |b||"]);
+        assert!(is_inline_math(&maths[0], Some(' ')));
+        assert!(math::render(&maths[0], MathStyle::Inline, 16.0, "#000000ff").is_ok());
+    }
 
     #[test]
     fn parses_github_alerts() {
