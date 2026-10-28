@@ -82,7 +82,8 @@ pub fn to_typst(tex: &str) -> Result<String, String> {
     }
     // The converter is written for well-formed input; formulas are converted
     // as they are typed, so never let a half-written one take down a thread.
-    let math = std::panic::catch_unwind(|| tylax::latex_to_typst(tex))
+    let spaced = space_after_groups(tex);
+    let math = std::panic::catch_unwind(|| tylax::latex_to_typst(&spaced))
         .map_err(|_| "Couldn’t read the formula.".to_string())?;
     // It reports what it can't match as a comment and carries on.
     if math.contains("/* LaTeX Error") {
@@ -95,7 +96,74 @@ pub fn to_typst(tex: &str) -> Result<String, String> {
         .and_then(|math| math.strip_suffix('$'))
         .unwrap_or(math)
         .trim();
-    Ok(space_cases(math))
+    // `\boxed` comes back with a 2pt inset, which lets tall glyphs touch
+    // the frame; LaTeX's \fboxsep is 3pt.
+    let math = space_cases(math).replace(
+        "#box(stroke: 0.5pt, inset: 2pt,",
+        "#box(stroke: 0.5pt, inset: 3pt,",
+    );
+    Ok(text_strings(&math))
+}
+
+/// A space between a closing brace and the command after it: the converter
+/// glues them, so `\frac{1}{T}\sum` came out as `1/Tsum` (an unknown
+/// variable). LaTeX ignores the space.
+fn space_after_groups(tex: &str) -> String {
+    let mut out = String::with_capacity(tex.len() + 8);
+    let mut chars = tex.chars().peekable();
+    while let Some(ch) = chars.next() {
+        out.push(ch);
+        if ch == '}' && chars.peek() == Some(&'\\') {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+/// `\text{…}` arrives as `#text[…]` content; Typst's own form for text in
+/// math is a string, `"…"`, which takes any script (CJK, full-width
+/// punctuation) as is and is never read as markup. Content that holds
+/// markup (math, escapes, brackets) stays as it is.
+fn text_strings(math: &str) -> String {
+    const OPEN: &str = "#text[";
+    let mut out = String::with_capacity(math.len());
+    let mut rest = math;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let body_start = start + OPEN.len();
+        match rest[body_start..].find(']') {
+            Some(len)
+                if !rest[body_start..body_start + len].contains(['$', '#', '[', '\\', '"']) =>
+            {
+                out.push('"');
+                out.push_str(&rest[body_start..body_start + len]);
+                out.push('"');
+                rest = &rest[body_start + len + 1..];
+            }
+            _ => {
+                out.push_str(OPEN);
+                rest = &rest[body_start..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether `text` has Chinese, Japanese or Korean characters (or the
+/// full-width forms that go with them), which the bundled fonts lack.
+fn needs_cjk(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(ch as u32,
+            0x1100..=0x11FF
+            | 0x2E80..=0x9FFF
+            | 0xA960..=0xA97F
+            | 0xAC00..=0xD7FF
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFFEF
+            | 0x20000..=0x3FFFF)
+    })
 }
 
 /// Put a quad between each case and its condition, as LaTeX's `cases` does;
@@ -220,15 +288,59 @@ fn layout(tex: &str, style: MathStyle, font_size: f32, color: &str) -> Result<Pa
 }
 
 fn typeset(body: &str, font_size: f32, color: &str) -> Result<Page, String> {
+    // Text in CJK scripts needs fonts Typst doesn't bundle: compile those
+    // formulas with the system's CJK faces too, named after the default
+    // Latin font so Latin text keeps its look. Other formulas never load
+    // them.
+    let (fonts, font_list, math_fonts) = if needs_cjk(body) {
+        let fonts = &*typst_world::CJK_MATH_FONTS;
+        let families = typst_world::cjk_families(fonts);
+        if families.is_empty() {
+            return Err(
+                "This formula has Chinese, Japanese or Korean text, but no CJK font \
+                 is installed (for example Noto Serif CJK SC)."
+                    .into(),
+            );
+        }
+        let quoted = |first: &'static str| {
+            std::iter::once(first)
+                .chain(families.iter().copied())
+                .map(|family| format!("\"{family}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        // Text in an equation (`"中文"`) is set in the math font: name the
+        // CJK families after it too, or Typst picks any face that has the
+        // glyphs.
+        (
+            fonts,
+            format!(", font: ({})", quoted("libertinus serif")),
+            format!(
+                "#show math.equation: set text(font: ({}))",
+                quoted("new computer modern math")
+            ),
+        )
+    } else {
+        (&*typst_world::BUNDLED_FONTS, String::new(), String::new())
+    };
+    const PREAMBLE_LINES: usize = 4;
     let source = format!(
         "#set page(width: auto, height: auto, margin: 0pt, fill: none)\n\
-         #set text(size: {font_size}pt, fill: rgb(\"{color}\"), top-edge: \"bounds\", bottom-edge: \"bounds\")\n\
+         #set text(size: {font_size}pt, fill: rgb(\"{color}\"), top-edge: \"bounds\", bottom-edge: \"bounds\"{font_list})\n\
          #set math.equation(numbering: none)\n\
+         {math_fonts}\n\
          {body}\n"
     );
 
-    let document = typst_world::compile(source, VirtualFiles::new(), &typst_world::BUNDLED_FONTS)
-        .map_err(|error| format!("Couldn’t typeset the formula: {error}."))?;
+    let document = typst_world::compile_located(source, VirtualFiles::new(), fonts).map_err(
+        |(error, line)| match line.and_then(|line| line.checked_sub(PREAMBLE_LINES)) {
+            Some(line) if line > 0 => {
+                let text = body.lines().nth(line - 1).unwrap_or("").trim();
+                format!("Couldn’t typeset the formula: {error} (Typst line {line}: {text}).")
+            }
+            _ => format!("Couldn’t typeset the formula: {error}."),
+        },
+    )?;
     document
         .pages()
         .first()
@@ -378,5 +490,98 @@ mod tests {
         ] {
             assert!(checked_typst(tex, MathStyle::Display).is_ok(), "{tex}");
         }
+    }
+
+    /// Glyph id 0 is a font's .notdef box ("tofu"): no glyph for the char.
+    fn tofu(frame: &Frame) -> usize {
+        frame
+            .items()
+            .map(|(_, item)| match item {
+                FrameItem::Group(group) => tofu(&group.frame),
+                FrameItem::Text(text) => text.glyphs.iter().filter(|g| g.id == 0).count(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn typeset_tex(tex: &str, style: MathStyle) -> Result<Page, String> {
+        typeset(&equation(&to_typst(tex)?, style), 16., "#000000ff")
+    }
+
+    /// The formulas of a Chinese research note: CJK in `\text`, full-width
+    /// punctuation, `\boxed` around `gathered`, `\mathbb`, `\mathcal`,
+    /// `\mathbf 1`, `\left[ \right]`, `\Downarrow`.
+    const NOTE_FORMULAS: &[&str] = &[
+        r"J_j=(a_j,d_j,w_j,D_j,\mathcal G_j(t))",
+        r"\boxed{G_{\mathrm{FreeMig}}>G_{\mathrm{NoMig}}}",
+        r"G(t)=(\mathcal S\cup\mathcal C,\mathcal E(t))",
+        r"y_{rik}(t)\in\{0,1\}",
+        r"\boxed{\max_{\pi}\; \mathbb E\left[ \frac{1}{T}\sum_j w_j\mathbf 1(C_j^\pi\le d_j) \right]}",
+        r"\boxed{\begin{gathered}\text{动态推理负载 + 变化的卫星计算能力}\\ \Downarrow\\ \text{需要动态重分配（Claim 1）}\\ \Downarrow\\ \text{迁移收益与资源成本联合优化}\end{gathered}}",
+        r"\text{中文}x",
+    ];
+
+    #[test]
+    fn cjk_text_is_a_typst_string() {
+        assert_eq!(to_typst(r"\text{中文}x").unwrap(), "\"中文\" x");
+        let boxed = to_typst(NOTE_FORMULAS[5]).unwrap();
+        assert!(
+            boxed.starts_with("#box(stroke: 0.5pt, inset: 3pt,"),
+            "{boxed}"
+        );
+        assert!(boxed.contains("\"需要动态重分配（Claim 1）\""), "{boxed}");
+        assert!(boxed.contains("arrow.b.double"), "{boxed}");
+        assert!(!boxed.contains("#text["), "{boxed}");
+        // `\frac{1}{T}\sum` used to come out as the unknown `Tsum`.
+        let max = to_typst(NOTE_FORMULAS[4]).unwrap();
+        assert!(!max.contains("Tsum"), "{max}");
+    }
+
+    #[test]
+    fn a_chinese_note_typesets_every_formula_without_tofu() {
+        let cjk_installed = !typst_world::cjk_families(&typst_world::CJK_MATH_FONTS).is_empty();
+        for tex in NOTE_FORMULAS {
+            for style in [MathStyle::Display, MathStyle::Inline] {
+                match typeset_tex(tex, style) {
+                    Ok(page) => assert_eq!(tofu(&page.frame), 0, "tofu in {tex}"),
+                    Err(error) => {
+                        assert!(needs_cjk(tex) && !cjk_installed, "{tex}: {error}");
+                        assert!(error.contains("no CJK font"), "{error}");
+                    }
+                }
+            }
+        }
+        // The check can see tofu: the bundled fonts alone draw boxes.
+        let source = equation(&to_typst(NOTE_FORMULAS[6]).unwrap(), MathStyle::Display);
+        let bundled =
+            typst_world::compile(source, VirtualFiles::new(), &typst_world::BUNDLED_FONTS).unwrap();
+        assert!(tofu(&bundled.pages()[0].frame) > 0);
+        // Latin-only formulas keep the bundled fonts alone.
+        assert!(!needs_cjk(NOTE_FORMULAS[4]));
+    }
+
+    #[test]
+    #[ignore = "timing probe"]
+    fn cjk_formula_timing() {
+        let t = std::time::Instant::now();
+        let _ = &*typst_world::CJK_MATH_FONTS;
+        let index = t.elapsed();
+        let t = std::time::Instant::now();
+        typeset_tex(NOTE_FORMULAS[5], MathStyle::Display).unwrap();
+        let first = t.elapsed();
+        let t = std::time::Instant::now();
+        typeset_tex(NOTE_FORMULAS[5], MathStyle::Display).unwrap();
+        let again = t.elapsed();
+        let t = std::time::Instant::now();
+        typeset_tex(NOTE_FORMULAS[0], MathStyle::Display).unwrap();
+        let latin = t.elapsed();
+        eprintln!("TIMING index {index:?} first {first:?} again {again:?} latin {latin:?}");
+    }
+
+    #[test]
+    fn a_typst_error_names_its_line() {
+        let error = typeset("$ a\nunknownthing $", 11., "#000000ff").unwrap_err();
+        assert!(error.contains("Typst line 2"), "{error}");
+        assert!(error.contains("unknownthing"), "{error}");
     }
 }

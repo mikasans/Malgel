@@ -97,9 +97,6 @@ pub static SYSTEM_FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
 });
 
 /// Family / path names that strongly suggest a CJK or emoji face.
-///
-/// Used only by tests that assert CJK faces were indexed with real coverage.
-#[cfg(test)]
 fn is_cjk_or_emoji_face(family: &str, path: &std::path::Path) -> bool {
     let family = family.to_ascii_lowercase();
     let path = path.to_string_lossy().to_ascii_lowercase();
@@ -149,6 +146,79 @@ fn is_cjk_or_emoji_face(family: &str, path: &std::path::Path) -> bool {
         "twemoji",
     ];
     NEEDLES.iter().any(|n| hay.contains(n))
+}
+
+/// Whether a face looks like a CJK face (not emoji) by its family or path.
+fn is_cjk_face(family: &str, path: &std::path::Path) -> bool {
+    let hay = format!("{family} {}", path.to_string_lossy()).to_ascii_lowercase();
+    is_cjk_or_emoji_face(family, path) && !hay.contains("emoji") && !hay.contains("seguiemj")
+}
+
+/// Typst's bundled fonts plus only the system's CJK faces, for math whose
+/// text is Chinese, Japanese or Korean: indexing just these is far cheaper
+/// than every system font, and other formulas never pay for it (built on
+/// first use).
+pub static CJK_MATH_FONTS: LazyLock<FontSet> = LazyLock::new(|| {
+    let _span = crate::perf::Span::new("cjk_math_fonts_index");
+    let (mut book, mut slots) = bundled_fonts();
+    let mut infos_by_path: HashMap<PathBuf, Vec<FontInfo>> = HashMap::new();
+    for face in SYSTEM_FONT_DB.faces() {
+        let path = match &face.source {
+            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path.clone(),
+            _ => continue,
+        };
+        let family = face.families.first().map_or("", |(name, _)| name.as_str());
+        if !is_cjk_face(family, &path) {
+            continue;
+        }
+        let infos = infos_by_path.entry(path.clone()).or_insert_with(|| {
+            SYSTEM_FONT_DB
+                .with_face_data(face.id, |data, _| FontInfo::iter(data).collect::<Vec<_>>())
+                .unwrap_or_default()
+        });
+        let Some(info) = infos.get(face.index as usize).cloned() else {
+            continue;
+        };
+        book.push(info);
+        slots.push(FontSlot::System {
+            path,
+            index: face.index,
+            font: OnceLock::new(),
+        });
+    }
+    FontSet {
+        book: LazyHash::new(book),
+        slots,
+    }
+});
+
+/// The CJK families, best first for Chinese, that `fonts` offers, by the
+/// names Typst matches `text(font: …)` against.
+pub fn cjk_families(fonts: &FontSet) -> Vec<&'static str> {
+    const PREFERRED: &[&str] = &[
+        "noto serif cjk sc",
+        "noto sans cjk sc",
+        "source han serif sc",
+        "source han sans sc",
+        "noto serif cjk tc",
+        "noto sans cjk tc",
+        "noto serif cjk jp",
+        "noto sans cjk jp",
+        "noto serif cjk kr",
+        "noto sans cjk kr",
+        "wenquanyi zen hei",
+        "wenquanyi micro hei",
+        "droid sans fallback",
+        "ar pl uming cn",
+        "pingfang sc",
+        "microsoft yahei",
+        "simsun",
+    ];
+    PREFERRED
+        .iter()
+        .copied()
+        .filter(|name| fonts.book.contains_family(name))
+        .collect()
 }
 
 /// The bundled fonts first, then the system's, so documents keep their
@@ -256,6 +326,16 @@ pub fn compile(
     files: VirtualFiles,
     fonts: &'static FontSet,
 ) -> Result<PagedDocument, String> {
+    compile_located(source, files, fonts).map_err(|(message, _)| message)
+}
+
+/// As [`compile`], with the 1-based source line of the first error when
+/// the error has a place in the source.
+pub fn compile_located(
+    source: String,
+    files: VirtualFiles,
+    fonts: &'static FontSet,
+) -> Result<PagedDocument, (String, Option<usize>)> {
     let world = SandboxWorld {
         source: Source::detached(source),
         files,
@@ -266,10 +346,13 @@ pub fn compile(
     // many distinct inputs don't accumulate.
     comemo::evict(30);
     result.map_err(|errors| {
-        errors
-            .first()
-            .map(|error| error.message.to_string())
-            .unwrap_or_else(|| "unknown error".to_string())
+        let Some(error) = errors.first() else {
+            return ("unknown error".to_string(), None);
+        };
+        let line = typst::WorldExt::range(&world, error.span)
+            .and_then(|range| world.source.lines().byte_to_line(range.start))
+            .map(|line| line + 1);
+        (error.message.to_string(), line)
     })
 }
 
