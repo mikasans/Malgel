@@ -22,6 +22,7 @@ mod format;
 mod image_view;
 mod images;
 mod links;
+mod logfile;
 mod math;
 mod menus;
 mod paths;
@@ -97,12 +98,20 @@ impl log::Log for StdErrLogger {
         if self.quiet && is_benign_platform_error(record.target(), &record.args().to_string()) {
             return;
         }
-        eprintln!(
+        let line = format!(
             "[{}::{}] {}",
             record.level(),
             record.target(),
             record.args()
         );
+        eprintln!("{line}");
+        // Warnings and errors also go to the rotating log file.
+        if record.level() <= log::Level::Warn
+            && !is_benign_platform_error(record.target(), &record.args().to_string())
+            && let Some(file) = crate::logfile::RotatingLog::app()
+        {
+            file.write_line(&format!("[{}] {line}", crate::logfile::timestamp()));
+        }
     }
     fn flush(&self) {}
 }
