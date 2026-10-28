@@ -2841,7 +2841,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.7.0"
-source = "git+https://github.com/mikasans/gpui-kit?rev=26cfdc52f7f4f824ea33f177039c8a4b39e1344d#26cfdc52f7f4f824ea33f177039c8a4b39e1344d"
+source = "git+https://github.com/mikasans/gpui-kit?rev=56e3890b8b8885d006591367bc106e321fb69cb9#56e3890b8b8885d006591367bc106e321fb69cb9"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2880,7 +2880,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.7.0"
-source = "git+https://github.com/mikasans/gpui-kit?rev=26cfdc52f7f4f824ea33f177039c8a4b39e1344d#26cfdc52f7f4f824ea33f177039c8a4b39e1344d"
+source = "git+https://github.com/mikasans/gpui-kit?rev=56e3890b8b8885d006591367bc106e321fb69cb9#56e3890b8b8885d006591367bc106e321fb69cb9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2953,7 +2953,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.7.0"
-source = "git+https://github.com/mikasans/gpui-kit?rev=26cfdc52f7f4f824ea33f177039c8a4b39e1344d#26cfdc52f7f4f824ea33f177039c8a4b39e1344d"
+source = "git+https://github.com/mikasans/gpui-kit?rev=56e3890b8b8885d006591367bc106e321fb69cb9#56e3890b8b8885d006591367bc106e321fb69cb9"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2978,7 +2978,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit-assets"
 version = "0.7.0"
-source = "git+https://github.com/mikasans/gpui-kit?rev=26cfdc52f7f4f824ea33f177039c8a4b39e1344d#26cfdc52f7f4f824ea33f177039c8a4b39e1344d"
+source = "git+https://github.com/mikasans/gpui-kit?rev=56e3890b8b8885d006591367bc106e321fb69cb9#56e3890b8b8885d006591367bc106e321fb69cb9"
 dependencies = [
  "anyhow",
  "gpui-pre",

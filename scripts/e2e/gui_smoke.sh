@@ -1437,6 +1437,37 @@ xdotool key --clearmodifiers Escape
 sleep 0.3
 pass "Find: regex 2 matches, Replace All bar(\$2, \$1) is one undo step, '(' is an error not a crash"
 
+# 21a1c2. Find as you type follows the query in a big file: the only match
+#         is on the last of 40k lines (past the quick scan around the
+#         viewport, so the background scan finds it) and the editor must
+#         select it without Enter. Esc keeps the caret there: copy its line.
+python3 -c 'import sys; sys.stdout.write("".join(f"let value_{i} = foo(a, b); // line {i}\n" for i in range(40000)) + "needle_tail at the end\n")' >"$WS/notes/bigfind.rs"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'bigfind.rs'
+xdotool key --clearmodifiers Return
+sleep 1.5
+xdotool key --clearmodifiers ctrl+Home
+xdotool key --clearmodifiers ctrl+f
+sleep 0.4
+xdotool key --clearmodifiers ctrl+a
+xdotool type --delay 30 'needle_tail'
+sleep 1.5
+shot 43k2-find-as-you-type-big
+xdotool key --clearmodifiers Escape
+sleep 0.3
+xdotool key --clearmodifiers Home shift+End
+printf '' | xclip -selection clipboard
+xdotool key --clearmodifiers ctrl+c
+sleep 0.3
+GOT="$(xclip -o -selection clipboard 2>/dev/null || true)"
+[[ "$GOT" == "needle_tail at the end" ]] \
+  || fail "Find as you type did not go to the match on line 40001 (caret line: '${GOT:0:80}')"
+xdotool key --clearmodifiers ctrl+w
+sleep 0.5
+rm -f "$WS/notes/bigfind.rs"
+pass "Find as you type selects and reveals a match the big-file background scan finds"
+
 # 21a1d. Ctrl+D (VS Code's Add Selection to Next Find Match): the word, then
 #        each next match; typing edits every one, one Ctrl+Z undoes it, and
 #        typing over one selection also undoes in one step.
