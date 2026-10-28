@@ -2070,6 +2070,26 @@ for item in $CONTRAST; do
 done
 (( TOGGLED % 2 == 0 )) || palette_run 'Toggle light and dark'
 pass "terminal: white on red/blue/magenta/white reaches 4.5:1 in the light theme"
+# 21f7. Typing while the terminal's context menu is open closes it, and the
+#       key still reaches the shell.
+xdotool key --clearmodifiers ctrl+u
+xdotool type --delay 15 "clear"
+xdotool key --clearmodifiers Return
+sleep 0.8
+shot 49g15-term-before-menu
+xdotool mousemove $(( SW / 2 )) $(( SH * 70 / 100 )) click 3
+sleep 0.8
+shot 49g16-term-menu
+[[ "$(region_differ 49g15-term-before-menu 49g16-term-menu "$TERM_ROWS")" -gt 1500 ]] \
+  || fail "right click in the terminal opened no context menu"
+xdotool type --delay 30 'z'
+sleep 0.8
+shot 49g17-term-menu-typed
+MENU_LEFT="$(region_differ 49g15-term-before-menu 49g17-term-menu-typed "$TERM_ROWS")"
+[[ "$MENU_LEFT" -lt 1500 ]] || fail "typing left the terminal's context menu open ($MENU_LEFT px)"
+[[ "$MENU_LEFT" -gt 0 ]] || fail "the key typed with the menu open did not reach the shell"
+xdotool key --clearmodifiers BackSpace
+pass "terminal: one wheel notch is one mouse report; typing closes the context menu"
 xdotool key --clearmodifiers ctrl+grave
 sleep 0.5
 

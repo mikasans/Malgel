@@ -36,12 +36,12 @@ use std::{
 };
 
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EntityInputHandler as _,
-    EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, Global, HighlightStyle, Hsla,
-    InteractiveElement as _, IntoElement, Keystroke, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render, ScrollDelta,
-    ScrollStrategy, ScrollWheelEvent, SharedString, Size, Styled as _, StyledText, UnderlineStyle,
-    UniformListScrollHandle, WeakEntity, Window,
+    App, AppContext as _, ClipboardItem, Context, DismissEvent, ElementId, Entity,
+    EntityInputHandler as _, EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, Global,
+    HighlightStyle, Hsla, InteractiveElement as _, IntoElement, Keystroke, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render,
+    ScrollDelta, ScrollStrategy, ScrollWheelEvent, SharedString, Size, Styled as _, StyledText,
+    UnderlineStyle, UniformListScrollHandle, WeakEntity, Window,
     assets::IconName,
     base::Disableable as _,
     canvas,
@@ -50,7 +50,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants as _},
         h_flex,
         input::{Input, InputEvent, InputState},
-        menu::{ContextMenuExt as _, PopupMenuItem},
+        menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
         v_flex,
     },
     div,
@@ -197,6 +197,8 @@ pub struct TerminalPanel {
     /// The foreground job's name for the tab label, and when it was read.
     process_name: Option<String>,
     name_polled: Instant,
+    /// The context menu while it is open (typing closes it).
+    open_menu: Rc<Cell<Option<WeakEntity<PopupMenu>>>>,
     bytes_at_paint: u64,
     /// When the current flood (painting throttled) began.
     flood_since: Option<Instant>,
@@ -328,6 +330,7 @@ impl TerminalPanel {
             rem: px(16.),
             last_paint: Instant::now(),
             process_name: None,
+            open_menu: Rc::default(),
             name_polled: Instant::now() - NAME_POLL,
             bytes_at_paint: 0,
             flood_since: None,
@@ -372,6 +375,15 @@ impl TerminalPanel {
             self.start_shell(window, cx);
         }
         cx.notify();
+    }
+
+    /// Close the panel's context menu if it is open; true if it was.
+    fn close_context_menu(&mut self, cx: &mut App) -> bool {
+        let Some(menu) = self.open_menu.take().and_then(|menu| menu.upgrade()) else {
+            return false;
+        };
+        menu.update(cx, |_, cx| cx.emit(DismissEvent));
+        true
     }
 
     pub fn focus_input(&self, window: &mut Window, cx: &mut App) {
@@ -817,6 +829,9 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Typing while the context menu is open closes it (VS Code): the
+        // keys go to the terminal, and the menu must not linger over them.
+        self.close_context_menu(cx);
         if self.session.is_none() {
             return false;
         }
@@ -1768,6 +1783,7 @@ impl Render for TerminalPanel {
         );
         let row_count = self.total_rows().max(1);
         let menu_focus = self.input.focus_handle(cx);
+        let open_menu = self.open_menu.clone();
 
         v_flex()
             .id(ElementId::NamedInteger("terminal-panel".into(), eid))
@@ -2060,7 +2076,8 @@ impl Render for TerminalPanel {
                     )
                     // VS Code's terminal context menu: Copy (only with a
                     // selection), Paste, Select All, Clear. Ctrl+C stays ^C.
-                    .context_menu(move |menu, _, _| {
+                    .context_menu(move |menu, _, cx| {
+                        open_menu.set(Some(cx.weak_entity()));
                         menu.action_context(menu_focus.clone())
                             // The shortcuts are handled by the panel's key
                             // handler, not the keymap, so the hints are drawn
