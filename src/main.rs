@@ -20,6 +20,8 @@ mod export;
 mod file_icon;
 mod file_tree;
 mod format;
+#[cfg(test)]
+mod fuzz_tests;
 mod image_view;
 mod images;
 mod links;

@@ -357,16 +357,22 @@ fn shift_items(text: &str, selection: Range<usize>, deeper: bool) -> Option<Edit
     // Rewrite the lines, tracking where the selection's ends move.
     let region = lines[first].start..lines[last].end;
     let mut out = String::new();
-    let map_offset = |offset: usize, shifts: &[(usize, isize)]| -> usize {
+    // (indent start, old indent length, change in line length): an offset
+    // after the indent moves with the line; one inside it stays in the new
+    // indent (never in the line above, which would be mid-char there).
+    let map_offset = |offset: usize, shifts: &[(usize, usize, isize)]| -> usize {
         let mut moved = offset as isize;
-        for &(line_start, delta) in shifts {
-            if line_start <= offset {
+        for &(start, indent, delta) in shifts {
+            if offset >= start + indent {
                 moved += delta;
+            } else if offset > start {
+                let inside = (offset - start) as isize;
+                moved += inside.min((indent as isize + delta).max(0)) - inside;
             }
         }
         moved.max(0) as usize
     };
-    let mut shifts: Vec<(usize, isize)> = Vec::new();
+    let mut shifts: Vec<(usize, usize, isize)> = Vec::new();
     let mut first_in_group = true;
     for ix in first..=last {
         let line = &text[lines[ix].clone()];
@@ -403,6 +409,7 @@ fn shift_items(text: &str, selection: Range<usize>, deeper: bool) -> Option<Edit
         first_in_group = false;
         shifts.push((
             lines[ix].start + prefix.quote.len(),
+            prefix.indent.len(),
             rewritten.len() as isize - line.len() as isize,
         ));
         out.push_str(&rewritten);
@@ -802,7 +809,14 @@ fn table_edit(
     let selection = if select_cell {
         range.start + span.start..range.start + span.end
     } else {
-        let at = range.start + span.start + within.min(span.len());
+        // `within` counts bytes in the line the caret was on; on the
+        // delimiter row that is not the cell it lands in, so keep it on a
+        // char boundary of the rendered cell.
+        let mut at = span.start + within.min(span.len());
+        while !rendered.is_char_boundary(at) {
+            at -= 1;
+        }
+        let at = range.start + at;
         at..at
     };
     Edit {
@@ -931,6 +945,37 @@ pub fn image_markdown(text: &str, offset: usize, relative_path: &str, alt: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outdent_with_the_caret_before_the_indent_stays_on_its_line() {
+        // Found by the fuzz soak: the caret at column 0 moved back by the
+        // removed indent, into the emoji on the line above.
+        let text = "🙂中文🙂\n  - ";
+        let edit = outdent(text, 15..15).unwrap();
+        let mut out = text.to_string();
+        out.replace_range(edit.range.clone(), &edit.text);
+        assert_eq!(out, "🙂中文🙂\n- ");
+        assert_eq!(edit.selection, 15..15);
+        // Inside the indent: clamped to the new, shorter indent.
+        let edit = outdent("- a\n    - b", 6..6).unwrap();
+        assert_eq!(edit.selection, 4..4);
+        // After it: moves with the text.
+        let edit = outdent("- a\n    - b", 10..10).unwrap();
+        assert_eq!(edit.selection, 6..6);
+    }
+
+    #[test]
+    fn tidying_from_the_delimiter_row_keeps_the_caret_on_a_char_boundary() {
+        // Found by the property tests: the caret's offset on the `|---|`
+        // row was applied to the header cell, inside a multi-byte char.
+        let text = "| 🙂🙂 | b |\n|---|---|\n";
+        for caret in 12..text.len() - 1 {
+            let edit = tidy_table(text, caret..caret).unwrap();
+            let mut out = text.to_string();
+            out.replace_range(edit.range.clone(), &edit.text);
+            assert!(out.is_char_boundary(edit.selection.start), "caret {caret}");
+        }
+    }
 
     fn apply(text: &str, edit: &Edit) -> String {
         let mut out = text.to_string();

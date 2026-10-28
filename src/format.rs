@@ -84,9 +84,9 @@ pub fn toggle_inline(text: &str, selection: Range<usize>, style: Inline) -> Edit
     let before = selection.start.checked_sub(marker.len());
     let after = selection.end + marker.len();
     if let Some(before) = before
-        && after <= text.len()
-        && &text[before..selection.start] == marker
-        && &text[selection.end..after] == marker
+        // `get`: the bytes just outside may be inside a multi-byte char.
+        && text.get(before..selection.start) == Some(marker)
+        && text.get(selection.end..after) == Some(marker)
     {
         return Edit {
             range: before..after,
@@ -558,10 +558,14 @@ pub fn move_lines(text: &str, selection: Range<usize>, direction: LineMove) -> O
     let block_start: usize = parts[..moved].iter().map(|part| part.len() + 1).sum();
     let shift = |offset: usize| offset + block_start - starts[first];
 
+    let text = parts.join("\n");
+    // A selection that took the block's newline, moved below a last line
+    // that has none, ends with the block now that the newline is gone.
+    let selection = shift(start).min(text.len())..shift(end).min(text.len());
     Some(Edit {
         range: 0..len,
-        text: parts.join("\n"),
-        selection: shift(start)..shift(end),
+        text,
+        selection,
     })
 }
 
@@ -832,6 +836,28 @@ mod tests {
         // Selecting the markers too also unwraps.
         let edit = toggle_inline("**x**", 0..5, Inline::Bold);
         assert_eq!(apply("**x**", &edit), "x");
+    }
+
+    #[test]
+    fn moving_a_block_with_its_newline_below_the_unterminated_last_line() {
+        // Found by the property tests: the selection ran one past the end.
+        let text = "a\nb";
+        let edit = move_lines(text, 0..2, LineMove::Down).unwrap();
+        let out = apply(text, &edit);
+        assert_eq!(out, "b\na");
+        assert_eq!(&out[edit.selection], "a");
+    }
+
+    #[test]
+    fn toggling_next_to_a_multibyte_char_does_not_slice_inside_it() {
+        // Found by the property tests: the "markers just outside" check
+        // sliced into `¡` (2 bytes) before the caret.
+        let text = "¡x";
+        let edit = toggle_inline(text, 2..2, Inline::Code);
+        assert_eq!(apply(text, &edit), "¡`x`");
+        let text = "a**¡";
+        let edit = toggle_inline(text, 5..5, Inline::Bold);
+        assert!(text.is_char_boundary(edit.range.start));
     }
 
     #[test]

@@ -1180,6 +1180,11 @@ fn term_selection_text<T>(term: &Term<T>) -> Option<String> {
 
 fn term_selection_view<T>(term: &Term<T>) -> Option<((usize, usize), (usize, usize))> {
     let range = term.selection.as_ref()?.to_range(term)?;
+    // A selection between two adjacent cells' facing sides across a line
+    // break comes back with its ends crossed: it selects nothing.
+    if range.start > range.end {
+        return None;
+    }
     let (top, bottom) = view_bounds(term);
     if range.end.line < Line(top) || range.start.line > Line(bottom) {
         return None;
@@ -1666,11 +1671,70 @@ mod tests {
     }
 }
 
+/// Feed `bytes` to a headless emulator of about `cols` × `rows` (clamped as
+/// the app clamps), selecting, resizing and reading the view in between —
+/// everything the UI does with a session. Used by the property tests.
+#[cfg(test)]
+pub fn fuzz_terminal(bytes: &[u8], cols: u16, rows: u16, picks: &[(usize, usize, u8)]) {
+    use alacritty_terminal::event::VoidListener;
+    let size = GridSize::clamped(cols as usize, rows as usize);
+    let mut term = Term::new(term_config(200), &size, VoidListener);
+    let mut processor: ansi::Processor = ansi::Processor::new();
+    let step = (bytes.len() / (picks.len() + 1)).max(1);
+    let mut chunks = bytes.chunks(step);
+    for &(row, col, op) in picks {
+        if let Some(chunk) = chunks.next() {
+            processor.advance(&mut term, chunk);
+        }
+        match op % 6 {
+            0 => term_select_start(&mut term, SelectKind::Cells, row, col),
+            1 => term_select_start(&mut term, SelectKind::Word, row, col),
+            2 => term_select_start(&mut term, SelectKind::Line, row, col),
+            3 => term_select_update(&mut term, row, col),
+            4 => term_select_all(&mut term),
+            _ => term.resize(GridSize::clamped(col / 2, row / 4)),
+        }
+        let _ = term_selection_text(&term);
+        let _ = term_selection_view(&term);
+    }
+    for chunk in chunks {
+        processor.advance(&mut term, chunk);
+    }
+    let info = view_info_term(&term);
+    let _ = rows_term(&term, 0..info.line_count + 3);
+    let (top, bottom) = view_bounds(&term);
+    for line in top..=bottom {
+        let _ = styled_row(&term, Line(line));
+    }
+    let _ = snapshot_term(&term, 50);
+    let _ = term_selection_text(&term);
+    if let Some(((r0, c0), (r1, c1))) = term_selection_view(&term) {
+        assert!(
+            r0 <= r1 && r1 < info.line_count.max(1),
+            "{r0} {r1} {info:?}"
+        );
+        assert!(r0 < r1 || c0 <= c1);
+    }
+}
+
 /// Selection on a headless emulator: no PTY, bytes fed straight to the
 /// parser, so scrolling and history trimming are exact.
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    #[test]
+    fn a_crossed_word_selection_at_a_wide_char_wrap_selects_nothing() {
+        // Found by the property tests: wide chars wrapping at the last
+        // column, then a word click there, gave a view range ending above
+        // where it started.
+        let bytes = [
+            "\x1b[999;999H".repeat(6).as_bytes(),
+            "\x1b[中文🙂e\u{301}中文🙂e\u{301}\x1b[L".as_bytes(),
+        ]
+        .concat();
+        fuzz_terminal(&bytes, 1, 1, &[(3, 19, 151)]);
+    }
     use alacritty_terminal::event::VoidListener;
 
     fn term(cols: u16, rows: u16, scrollback: usize) -> Term<VoidListener> {

@@ -80,7 +80,7 @@ pub struct LoadedText {
 }
 
 fn decode_utf16(bytes: &[u8], encoding: Encoding) -> io::Result<String> {
-    let body = &bytes[2..];
+    let body = bytes.get(2..).unwrap_or_default();
     if !body.len().is_multiple_of(2) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -104,7 +104,11 @@ fn decode_utf16(bytes: &[u8], encoding: Encoding) -> io::Result<String> {
 /// Read a text file: UTF-8, or UTF-16 with a byte-order mark. A byte-order
 /// mark is dropped.
 pub fn load(path: &Path) -> io::Result<LoadedText> {
-    let bytes = fs::read(path)?;
+    decode(fs::read(path)?)
+}
+
+/// [`load`] on bytes already read.
+pub fn decode(bytes: Vec<u8>) -> io::Result<LoadedText> {
     let encoding = Encoding::from_bom(&bytes);
     let text = if encoding != Encoding::Utf8 {
         Ok(decode_utf16(&bytes, encoding)?)
@@ -171,21 +175,7 @@ pub fn save_encoded(
     line_ending: LineEnding,
     encoding: Encoding,
 ) -> io::Result<()> {
-    let contents = match line_ending {
-        LineEnding::CrLf => text.replace('\n', "\r\n"),
-        LineEnding::Lf => text.to_string(),
-    };
-    let contents = match encoding {
-        Encoding::Utf8 => contents.into_bytes(),
-        Encoding::Utf16Le => [0xFF, 0xFE]
-            .into_iter()
-            .chain(contents.encode_utf16().flat_map(u16::to_le_bytes))
-            .collect(),
-        Encoding::Utf16Be => [0xFE, 0xFF]
-            .into_iter()
-            .chain(contents.encode_utf16().flat_map(u16::to_be_bytes))
-            .collect(),
-    };
+    let contents = encode(text, line_ending, encoding);
 
     // Symlinks and hard links must be written through in place: a temp+rename
     // would replace the link with a new regular file.
@@ -254,6 +244,26 @@ pub fn save_encoded(
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// The bytes [`save_encoded`] writes for `text`: line endings expanded,
+/// UTF-16 with its byte-order mark.
+pub fn encode(text: &str, line_ending: LineEnding, encoding: Encoding) -> Vec<u8> {
+    let contents = match line_ending {
+        LineEnding::CrLf => text.replace('\n', "\r\n"),
+        LineEnding::Lf => text.to_string(),
+    };
+    match encoding {
+        Encoding::Utf8 => contents.into_bytes(),
+        Encoding::Utf16Le => [0xFF, 0xFE]
+            .into_iter()
+            .chain(contents.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect(),
+        Encoding::Utf16Be => [0xFE, 0xFF]
+            .into_iter()
+            .chain(contents.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect(),
+    }
 }
 
 /// Whether `path` looks like a Markdown document.
