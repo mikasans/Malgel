@@ -3540,7 +3540,14 @@ impl DocumentView {
         if session.open && !session.query.is_empty() {
             let viewport = editor.input_bounds();
             let ranges = session.matcher.matched_ranges();
-            for range in other_matches(&ranges, session.matcher.current_match_index()) {
+            // Only the matches on screen: a big file can have millions.
+            let window = editor
+                .visible_range_offset()
+                .map(|visible| on_screen(&ranges, visible))
+                .unwrap_or(0..0);
+            let current = session.matcher.current_match_index();
+            for range in other_matches(&ranges[window.clone()], current.wrapping_sub(window.start))
+            {
                 let Some(bounds) = editor.range_to_bounds(range) else {
                     continue;
                 };
@@ -4239,6 +4246,13 @@ fn extend_line_selection(text: &str, anchor: &Range<usize>, caret: usize) -> Ran
 const MAX_MATCH_OUTLINES: usize = 400;
 
 /// Every match but the current one, in document order.
+/// The indices of `ranges` (sorted, non-overlapping) that touch `visible`.
+fn on_screen(ranges: &[Range<usize>], visible: Range<usize>) -> Range<usize> {
+    let start = ranges.partition_point(|r| r.end < visible.start);
+    let end = start + ranges[start..].partition_point(|r| r.start <= visible.end);
+    start..end
+}
+
 fn other_matches(ranges: &[Range<usize>], current: usize) -> impl Iterator<Item = &Range<usize>> {
     ranges
         .iter()
@@ -4323,6 +4337,21 @@ mod tests {
         let others: Vec<_> = super::other_matches(&ranges, 1).cloned().collect();
         assert_eq!(others, vec![0..3, 20..23]);
         assert_eq!(super::other_matches(&ranges, 9).count(), 3);
+    }
+
+    #[test]
+    fn find_outlines_only_look_at_the_matches_on_screen() {
+        let ranges: Vec<_> = (0..1_000_000).map(|n| n * 10..n * 10 + 3).collect();
+        assert_eq!(
+            super::on_screen(&ranges, 5_000_002..5_000_031),
+            500_000..500_004
+        );
+        assert_eq!(super::on_screen(&ranges, 0..0), 0..1);
+        assert_eq!(
+            super::on_screen(&ranges, 20_000_000..20_000_100),
+            1_000_000..1_000_000
+        );
+        assert_eq!(super::on_screen(&[], 0..10), 0..0);
     }
 
     #[test]

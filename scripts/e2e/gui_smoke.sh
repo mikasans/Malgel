@@ -1151,6 +1151,55 @@ assert n > 150, n
 PY
 pass "Find outlines the other matches"
 
+# 21a1b. Find's current match: Enter moves it AND the selection (VS Code),
+#        painted with a strong fill while the find box has focus; after Esc
+#        the selection stays on that match, so the caret's line is its line.
+python3 -c "
+import sys
+open(sys.argv[1], 'w').write(''.join(f'item {i:02d} ' + ('needle tail' if i % 3 == 0 else 'plain') + '\n' for i in range(1, 61)))
+" "$WS/notes/findcur.md"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'findcur.md'
+xdotool key --clearmodifiers Return
+sleep 1.0
+xdotool key --clearmodifiers ctrl+f
+sleep 0.5
+xdotool key --clearmodifiers ctrl+a
+xdotool type --delay 30 'needle'
+sleep 0.6
+for _ in 1 2 3; do xdotool key --clearmodifiers Return; sleep 0.3; done
+shot 43g-find-current
+python3 - "$ART_DIR/43g-find-current.png" <<'PY' || fail "Find's current match has no strong fill"
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("RGB")
+w, h = im.size
+# The current match's fill is the selection blue at >= 55% alpha; the other
+# matches are a pale grey with an amber outline, so count saturated blue.
+n = sum(1 for y in range(int(h * 0.16), int(h * 0.85)) for x in range(int(w * 0.30), int(w * 0.45))
+        if (lambda p: p[2] > 200 and p[2] - p[0] > 70 and p[2] - p[1] > 30)(im.getpixel((x, y))))
+print(f"current-match fill: {n} px")
+assert n > 400, n
+PY
+xdotool key --clearmodifiers Escape
+sleep 0.4
+shot 43h-find-after-esc
+printf '' | xclip -selection clipboard
+xdotool key --clearmodifiers ctrl+c
+sleep 0.3
+GOT="$(xclip -o -selection clipboard 2>/dev/null || true)"
+[[ "$GOT" == "needle" ]] || fail "after Find + Esc the selection is '${GOT:0:80}', not the match"
+xdotool key --clearmodifiers Home shift+End
+sleep 0.2
+xdotool key --clearmodifiers ctrl+c
+sleep 0.3
+GOT="$(xclip -o -selection clipboard 2>/dev/null || true)"
+[[ "$GOT" == "item 12 needle tail" ]] || fail "after Find + Enter x3 + Esc the caret is on '${GOT:0:80}', not line 12"
+xdotool key --clearmodifiers ctrl+w
+sleep 0.4
+pass "Find: Enter selects and fills the current match; Esc leaves the caret on it (line 12)"
+
 # 21a2. After scrolling (Ctrl+End in the 12k-line file) a line-number click
 #       still selects: click the last line's number and copy it.
 xdotool key --clearmodifiers ctrl+p

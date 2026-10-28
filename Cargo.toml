@@ -176,7 +176,10 @@ strip = "debuginfo"
 # gtk-cursor-blink-timeout): each blink repainted the whole window, ~20% of a
 # core on a software renderer while nobody typed. A keystroke while the caret
 # already shows no longer repaints (it was one whole-window frame per key).
-# Remove when upstream ships
-# the same.
+# Find matches big documents (>1 MiB) on the background executor, debounced
+# and batched, on-screen rows first, and next/previous select the current
+# match with a strong fill even while the window is inactive.
+# Pinned to a commit on the fork's malgel-0.7.0 branch.
+# Remove when upstream ships the same.
 [patch.crates-io]
-gpui-base = { git = "https://github.com/mikasans/gpui-kit", branch = "malgel-0.7.0" }
+gpui-base = { git = "https://github.com/mikasans/gpui-kit", rev = "2c750c221761788dc849aa6c065230afc2bde7de" }
