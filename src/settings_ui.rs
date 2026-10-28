@@ -219,7 +219,7 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Live filter: always read the input so typing narrows even if an event was missed.
         self.query = self.filter.read(cx).value().to_string();
         let settings = AppSettings::get(cx).clone();
@@ -257,7 +257,7 @@ impl Render for SettingsView {
             .gap_0()
             .w_full()
             .pr_3()
-            .h(px(BODY_HEIGHT))
+            .h(body_height(window.viewport_size().height))
             .overflow_y_scrollbar();
         let mut last_section = "";
         for row in &matched {
@@ -487,10 +487,10 @@ pub fn open(window: &mut Window, cx: &mut App) {
     let view = cx.new(|cx| SettingsView::new(window, cx));
     let focus = view.read(cx).filter_focus(cx);
     window.defer(cx, move |window, cx| focus.focus(window, cx));
-    window.open_dialog(cx, move |dialog, _window, _cx| {
+    window.open_dialog(cx, move |dialog, window, _cx| {
         dialog
             .title("Settings")
-            .width(px(DIALOG_WIDTH))
+            .width(px(DIALOG_WIDTH).min(window.viewport_size().width - px(32.)))
             .child(view.clone())
     });
 }
@@ -499,10 +499,26 @@ pub fn open(window: &mut Window, cx: &mut App) {
 const DIALOG_WIDTH: f32 = 600.;
 /// The settings list's height, fixed so filtering does not move the card.
 const BODY_HEIGHT: f32 = 480.;
+/// What the card needs besides the list: its offset from the window top,
+/// title, filter box, padding, and a bottom margin.
+const CARD_CHROME_HEIGHT: f32 = 230.;
+
+/// The list's height in a window `viewport` tall: [`BODY_HEIGHT`], or less
+/// so the card still fits a small window (never under 120 px).
+fn body_height(viewport: gpui_kit::Pixels) -> gpui_kit::Pixels {
+    px((f32::from(viewport) - CARD_CHROME_HEIGHT).clamp(120., BODY_HEIGHT))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_list_shrinks_to_fit_a_small_window() {
+        assert_eq!(body_height(px(1000.)), px(BODY_HEIGHT));
+        assert_eq!(body_height(px(560.)), px(560. - CARD_CHROME_HEIGHT));
+        assert_eq!(body_height(px(200.)), px(120.));
+    }
 
     #[test]
     fn filter_matches_wrap_and_autosave() {
