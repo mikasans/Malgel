@@ -1576,6 +1576,33 @@ xdotool key --clearmodifiers ctrl+w
 sleep 0.4
 pass "Ctrl+Alt+Down and Alt+Click add cursors; one Ctrl+Z undoes; Esc goes back to one cursor"
 
+# 21a1f. Auto-surround (VS Code): an opening bracket or quote typed over
+#        selections wraps each one and keeps it selected; one Ctrl+Z per wrap.
+# Select both "foo"s on line 1 (Ctrl+D twice), type ( then ".
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'cursors.txt'
+xdotool key --clearmodifiers Return
+sleep 1.0
+xdotool key --clearmodifiers ctrl+Home
+xdotool key --clearmodifiers ctrl+d
+sleep 0.15
+xdotool key --clearmodifiers ctrl+d
+sleep 0.15
+xdotool type --delay 40 '("'
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 file_is "$WS/notes/cursors.txt" $'("foo") bar ("foo")\nfoo\nbaz' \
+  || fail "typing ( and \" over two selections gave '$(cat "$WS/notes/cursors.txt")'"
+shot 43n-auto-surround
+xdotool key --clearmodifiers ctrl+z
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 file_is "$WS/notes/cursors.txt" $'(foo) bar (foo)\nfoo\nbaz' \
+  || fail "one Ctrl+Z did not undo one surround: '$(cat "$WS/notes/cursors.txt")'"
+xdotool key --clearmodifiers Escape
+xdotool key --clearmodifiers ctrl+w
+sleep 0.4
+pass "( and \" typed over two selections wrap both; one Ctrl+Z undoes one wrap"
+
 # 21a2. After scrolling (Ctrl+End in the 12k-line file) a line-number click
 #       still selects: click the last line's number and copy it.
 xdotool key --clearmodifiers ctrl+p

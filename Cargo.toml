@@ -202,7 +202,7 @@ strip = "debuginfo"
 # Pinned to a commit on the fork's malgel-0.7.0 branch.
 # Remove when upstream ships the same.
 [patch.crates-io]
-gpui-base = { git = "https://github.com/mikasans/gpui-kit", rev = "56e3890b8b8885d006591367bc106e321fb69cb9" }
-gpui-component = { git = "https://github.com/mikasans/gpui-kit", rev = "56e3890b8b8885d006591367bc106e321fb69cb9" }
-gpui-component-macros = { git = "https://github.com/mikasans/gpui-kit", rev = "56e3890b8b8885d006591367bc106e321fb69cb9" }
-gpui-kit-assets = { git = "https://github.com/mikasans/gpui-kit", rev = "56e3890b8b8885d006591367bc106e321fb69cb9" }
+gpui-base = { git = "https://github.com/mikasans/gpui-kit", rev = "1759e2662f90e4dd1a4e6124086a8f28c50787bf" }
+gpui-component = { git = "https://github.com/mikasans/gpui-kit", rev = "1759e2662f90e4dd1a4e6124086a8f28c50787bf" }
+gpui-component-macros = { git = "https://github.com/mikasans/gpui-kit", rev = "1759e2662f90e4dd1a4e6124086a8f28c50787bf" }
+gpui-kit-assets = { git = "https://github.com/mikasans/gpui-kit", rev = "1759e2662f90e4dd1a4e6124086a8f28c50787bf" }
