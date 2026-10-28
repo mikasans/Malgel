@@ -55,7 +55,7 @@ use gpui_kit::{
     },
     div,
     prelude::FluentBuilder as _,
-    px, rems, uniform_list,
+    px, uniform_list,
 };
 use portable_pty::CommandBuilder;
 
@@ -531,7 +531,7 @@ impl TerminalPanel {
         }
         let y = f32::from(pos.y - bounds.origin.y - offset.y);
         let x = f32::from(pos.x - bounds.origin.x - offset.x);
-        let row = ((y / line_h).floor().max(0.) as usize).min(rows - 1);
+        let row = hit_row(y, line_h, rows);
         let cells = (x / cell_w).max(0.);
         let col = if kind == SelectKind::Cells {
             cells.round()
@@ -917,6 +917,20 @@ impl TerminalPanel {
         };
         Some((row + offset, col))
     }
+}
+
+/// The height of one terminal row: `LINE_HEIGHT_REMS` rem rounded to whole
+/// pixels. Rows are laid out at whole pixels, so hit-testing, the PTY size
+/// and rendering must all use this one value: with the unrounded 23.76px a
+/// click's row drifted by a quarter pixel per row and, thousands of lines
+/// into the scrollback, landed rows away (or on the last one).
+fn row_height(rem: Pixels) -> Pixels {
+    (rem * LINE_HEIGHT_REMS).round().max(px(1.))
+}
+
+/// The row under `y` pixels from the top of the transcript.
+fn hit_row(y: f32, line_h: f32, rows: usize) -> usize {
+    ((y / line_h).floor().max(0.) as usize).min(rows.saturating_sub(1))
 }
 
 /// Columns × rows of `cell_w` × `line_h` cells that fit a viewport with the
@@ -1366,7 +1380,7 @@ impl Render for TerminalPanel {
         // Cell metrics for PTY sizing (mono font advance × line height).
         let rem = window.rem_size();
         let font_size = rem * FONT_REMS;
-        let line_h = rem * LINE_HEIGHT_REMS;
+        let line_h = row_height(rem);
         let font_id = window
             .text_system()
             .resolve_font(&gpui_kit::font(cx.theme().mono_font_family.clone()));
@@ -1418,7 +1432,7 @@ impl Render for TerminalPanel {
                     .p_2()
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_sm()
-                    .line_height(rems(LINE_HEIGHT_REMS))
+                    .line_height(line_h)
                     // Clicking the transcript focuses the input so typing
                     // resumes without hunting for it.
                     .on_mouse_down(
@@ -1655,6 +1669,22 @@ pub fn terminal_cwd(folder: Option<&Path>, doc_path: Option<&Path>) -> Option<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hit_testing_uses_the_rendered_whole_pixel_row_height() {
+        // 17.6px rem × 1.35 = 23.76px, laid out as 24px rows.
+        let line_h = f32::from(super::row_height(px(17.6)));
+        assert_eq!(line_h, 24.0);
+        assert_eq!(f32::from(super::row_height(px(16.))), 22.0);
+        // Thousands of rows down, the click lands on the row drawn there
+        // (with 23.76 it was off by ~1400px = 59 rows at row 5990).
+        for row in [0usize, 1, 999, 5990, 19_999] {
+            let y = row as f32 * 24.0 + 3.0;
+            assert_eq!(super::hit_row(y, line_h, 20_000), row);
+        }
+        assert_eq!(super::hit_row(1e9, line_h, 20_000), 19_999);
+        assert_eq!(super::hit_row(-5.0, line_h, 20_000), 0);
+    }
 
     #[test]
     fn selection_background_keeps_run_colors() {

@@ -1617,6 +1617,65 @@ grep -qx 'SMOKECOPY42' "$WS/notes/termpaste.md" \
   || fail "pasted terminal text not saved: '$(head -c 80 "$WS/notes/termpaste.md")'"
 pass "terminal: copied text pastes into the editor unchanged"
 
+# 21f. Terminal hit-testing deep in the scrollback: 6000 lines with a green
+#      marker ten rows from the end; scrolled to it, a drag, a double click
+#      and a triple click on the marker each copy exactly it (rows used to
+#      drift a quarter pixel each, landing ~60 rows off by then).
+xdotool key --clearmodifiers ctrl+grave
+sleep 1.0
+xdotool type --delay 20 "clear; for i in \$(seq 1 6000); do if [ \$i = 5990 ]; then printf '\\033[42mDEEPMARK5990\\033[0m\\n'; else echo \"row \$i\"; fi; done"
+xdotool key --clearmodifiers Return
+sleep 3.0
+find_green() { # find_green <shot>: "x0 x1 y" of the green run, or nothing
+  python3 - "$ART_DIR/$1.png" <<'PY'
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("RGB")
+w, h = im.size
+pts = [(x, y) for y in range(int(h * 0.3), h, 1) for x in range(0, w, 2)
+       if (lambda p: p[1] > 90 and p[1] > p[0] + 40 and p[1] > p[2] + 25)(im.getpixel((x, y)))]
+if len(pts) > 100:
+    xs = sorted(p[0] for p in pts); ys = sorted(p[1] for p in pts)
+    print(xs[2] + 2, xs[-3] - 2, (ys[len(ys) // 10] + ys[len(ys) * 9 // 10]) // 2)
+PY
+}
+shot 49f-term-deep
+read -r DX0 DX1 DY < <(find_green 49f-term-deep) || true
+for _ in $(seq 1 30); do
+  [[ -n "${DY:-}" ]] && break
+  # Over the transcript, wheel up a little at a time until the marker shows.
+  xdotool mousemove "$TX0" "$TY" click --repeat 2 --delay 30 4
+  sleep 0.3
+  shot 49f-term-deep
+read -r DX0 DX1 DY < <(find_green 49f-term-deep) || true
+done
+[[ -n "${DY:-}" ]] || fail "the green marker never scrolled into view"
+copy_check() { # copy_check <how>
+  sleep 0.4
+  xdotool key --clearmodifiers ctrl+shift+c
+  sleep 0.4
+  GOT="$(xclip -o -selection clipboard 2>/dev/null || true)"
+  [[ "$GOT" == "DEEPMARK5990" ]] || fail "terminal $1 at scrollback row 5990 copied '${GOT:0:80}' ($DX0..$DX1,$DY)"
+}
+printf '' | xclip -selection clipboard
+xdotool mousemove "$DX0" "$DY" mousedown 1
+xdotool mousemove $(( (DX0 + DX1) / 2 )) "$DY"
+sleep 0.1
+xdotool mousemove "$DX1" "$DY"
+sleep 0.2
+xdotool mouseup 1
+copy_check drag
+shot 49g-term-deep-selected
+printf '' | xclip -selection clipboard
+xdotool mousemove $(( (DX0 + DX1) / 2 )) "$DY" click --repeat 2 --delay 80 1
+copy_check "double click"
+printf '' | xclip -selection clipboard
+xdotool mousemove $(( (DX0 + DX1) / 2 )) "$DY" click --repeat 3 --delay 80 1
+copy_check "triple click"
+pass "terminal: drag / double / triple click 5990 rows into the scrollback copy exactly the row under the mouse"
+xdotool key --clearmodifiers ctrl+grave
+sleep 0.5
+
 # 22. Ctrl+Q → Don't save: dialog, disk unchanged, then the app exits.
 #     Last so later steps are not stranded without a process.
 printf 'quit-disk\n' >"$WS/notes/quit-final.md"
