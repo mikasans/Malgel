@@ -138,12 +138,14 @@ fn encode_round_trip(text: &str, crlf: bool, enc: u8) -> Result<(), TestCaseErro
     } else {
         LineEnding::Lf
     };
-    let encoding = match enc % 3 {
+    let encoding = match enc % 4 {
         0 => Encoding::Utf8,
-        1 => Encoding::Utf16Le,
+        1 => Encoding::Utf8Bom,
+        2 => Encoding::Utf16Le,
         _ => Encoding::Utf16Be,
     };
-    let bytes = document::encode(text, line_ending, encoding);
+    let bytes = document::encode(text, line_ending, encoding)
+        .map_err(|e| TestCaseError::fail(e.to_string()))?;
     let back = document::decode(bytes).map_err(|e| TestCaseError::fail(e.to_string()))?;
     prop_assert_eq!(back.text.as_str(), text);
     if encoding != Encoding::Utf8 || !text.is_empty() {

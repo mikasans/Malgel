@@ -754,6 +754,25 @@ wait_for 5 file_is "$WS/notes/brackets.md" "$BRACKETS_ORIG" \
 shot 20c-brackets-undone
 pass "Convert \\[ \\] / \\( \\) math to \$\$ / \$: the preview draws it, one Ctrl+Z restores the original"
 
+# 11b. A GBK file (no BOM, not UTF-8) opens as GBK, and saving an edit
+#      writes GBK again, not UTF-8 or replacement characters.
+printf '第一行\n' | iconv -t gbk >"$WS/notes/gbk.txt"
+sleep 1.0
+xdotool key --clearmodifiers ctrl+p
+sleep 0.6
+xdotool type --delay 40 'gbk.txt'
+sleep 0.6
+xdotool key --clearmodifiers Return
+sleep 1.0
+shot 20b-gbk-open
+xdotool key --clearmodifiers ctrl+End
+xdotool type --delay 40 'OK'
+xdotool key --clearmodifiers ctrl+s
+expected="$(printf '第一行\nOK' | iconv -t gbk | od -An -tx1 | tr -d ' \n')"
+gbk_saved() { [[ "$(od -An -tx1 "$WS/notes/gbk.txt" | tr -d ' \n')" == "$expected" ]]; }
+wait_for 5 gbk_saved \
+  || fail "the GBK file did not open and save as GBK: $(od -An -tx1 "$WS/notes/gbk.txt" | head -2)"
+pass "a GBK file opens as GBK and an edit saves as GBK"
 # 12. The PDF viewer: open the fixture and switch its page thumbnails on and
 #     off with the "PDF page thumbnails" command.
 xdotool key --clearmodifiers ctrl+p

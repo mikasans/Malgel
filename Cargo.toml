@@ -53,6 +53,9 @@ gpui-kit = { version = "0.7.0", features = [
 reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.7" }
 # Same Markdown parser the preview uses; drives HTML export and scroll-sync block indexing.
 markdown = "1.0.0"
+# Legacy text encodings (GBK, Big5, Shift-JIS, Latin-1...) and guessing them.
+encoding_rs = "0.8.35"
+chardetng = "0.1.17"
 serde = { version = "1", features = ["derive"] }
 # Display width of table cells, so wide characters line up.
 unicode-width = "0.2"

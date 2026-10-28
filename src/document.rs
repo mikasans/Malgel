@@ -47,27 +47,82 @@ impl LineEnding {
 pub enum Encoding {
     #[default]
     Utf8,
+    /// UTF-8 starting with the EF BB BF byte-order mark, which saving keeps.
+    Utf8Bom,
     /// UTF-16 with a byte-order mark, little or big endian.
     Utf16Le,
     Utf16Be,
+    Gbk,
+    Gb18030,
+    Big5,
+    ShiftJis,
+    /// ISO 8859-1 as browsers read it (windows-1252), which maps every byte
+    /// to a char and back.
+    Latin1,
 }
 
 impl Encoding {
-    /// What the status bar shows; UTF-8 needs no mention.
-    pub fn label(self) -> Option<&'static str> {
+    /// The encodings the status bar offers for Reopen / Save with Encoding.
+    pub const CHOICES: [Encoding; 9] = [
+        Encoding::Utf8,
+        Encoding::Utf8Bom,
+        Encoding::Utf16Le,
+        Encoding::Utf16Be,
+        Encoding::Gbk,
+        Encoding::Gb18030,
+        Encoding::Big5,
+        Encoding::ShiftJis,
+        Encoding::Latin1,
+    ];
+
+    /// What the status bar shows (always, UTF-8 included, as VS Code does).
+    pub fn label(self) -> &'static str {
         match self {
-            Encoding::Utf8 => None,
-            Encoding::Utf16Le => Some("UTF-16 LE"),
-            Encoding::Utf16Be => Some("UTF-16 BE"),
+            Encoding::Utf8 => "UTF-8",
+            Encoding::Utf8Bom => "UTF-8 with BOM",
+            Encoding::Utf16Le => "UTF-16 LE",
+            Encoding::Utf16Be => "UTF-16 BE",
+            Encoding::Gbk => "GBK",
+            Encoding::Gb18030 => "GB18030",
+            Encoding::Big5 => "Big5",
+            Encoding::ShiftJis => "Shift JIS",
+            Encoding::Latin1 => "Latin-1",
         }
     }
 
     /// The encoding a byte-order mark at the start of `bytes` names.
     pub fn from_bom(bytes: &[u8]) -> Self {
         match bytes {
+            [0xEF, 0xBB, 0xBF, ..] => Encoding::Utf8Bom,
             [0xFF, 0xFE, ..] => Encoding::Utf16Le,
             [0xFE, 0xFF, ..] => Encoding::Utf16Be,
             _ => Encoding::Utf8,
+        }
+    }
+
+    fn legacy(self) -> Option<&'static encoding_rs::Encoding> {
+        Some(match self {
+            Encoding::Gbk => encoding_rs::GBK,
+            Encoding::Gb18030 => encoding_rs::GB18030,
+            Encoding::Big5 => encoding_rs::BIG5,
+            Encoding::ShiftJis => encoding_rs::SHIFT_JIS,
+            Encoding::Latin1 => encoding_rs::WINDOWS_1252,
+            _ => return None,
+        })
+    }
+
+    fn from_legacy(encoding: &'static encoding_rs::Encoding) -> Option<Self> {
+        Self::CHOICES
+            .into_iter()
+            .find(|choice| choice.legacy() == Some(encoding))
+    }
+
+    fn bom(self) -> &'static [u8] {
+        match self {
+            Encoding::Utf8Bom => &[0xEF, 0xBB, 0xBF],
+            Encoding::Utf16Le => &[0xFF, 0xFE],
+            Encoding::Utf16Be => &[0xFE, 0xFF],
+            _ => &[],
         }
     }
 }
@@ -77,61 +132,116 @@ pub struct LoadedText {
     pub text: String,
     pub line_ending: LineEnding,
     pub encoding: Encoding,
+    /// Some bytes were not valid in `encoding` and read as U+FFFD; saving
+    /// would replace them.
+    pub lossy: bool,
 }
 
-fn decode_utf16(bytes: &[u8], encoding: Encoding) -> io::Result<String> {
-    let body = bytes.get(2..).unwrap_or_default();
-    if !body.len().is_multiple_of(2) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "The file isn’t valid UTF-16 text.",
-        ));
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+/// UTF-16 `body` (no byte-order mark); invalid units become U+FFFD when
+/// `lossy`, otherwise they are an error.
+fn decode_utf16(body: &[u8], encoding: Encoding, lossy: bool) -> io::Result<(String, bool)> {
+    if !lossy && !body.len().is_multiple_of(2) {
+        return Err(invalid("The file isn’t valid UTF-16 text."));
     }
-    let units = body.as_chunks::<2>().0.iter().map(|&pair| match encoding {
+    let (pairs, rest) = body.as_chunks::<2>();
+    let units = pairs.iter().map(|&pair| match encoding {
         Encoding::Utf16Be => u16::from_be_bytes(pair),
         _ => u16::from_le_bytes(pair),
     });
-    char::decode_utf16(units)
-        .collect::<Result<String, _>>()
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "The file isn’t valid UTF-16 text.",
-            )
-        })
+    let mut replaced = !rest.is_empty();
+    let mut text = String::with_capacity(body.len() / 2);
+    for unit in char::decode_utf16(units) {
+        match unit {
+            Ok(c) => text.push(c),
+            Err(_) if lossy => {
+                replaced = true;
+                text.push(char::REPLACEMENT_CHARACTER);
+            }
+            Err(_) => return Err(invalid("The file isn’t valid UTF-16 text.")),
+        }
+    }
+    if !rest.is_empty() {
+        text.push(char::REPLACEMENT_CHARACTER);
+    }
+    Ok((text, replaced))
 }
 
-/// Read a text file: UTF-8, or UTF-16 with a byte-order mark. A byte-order
-/// mark is dropped.
+/// `bytes` in a legacy encoding; invalid sequences read as U+FFFD.
+fn decode_legacy(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> (String, bool) {
+    let (text, had_errors) = encoding.decode_without_bom_handling(bytes);
+    (text.into_owned(), had_errors)
+}
+
+/// Read a text file: UTF-8 (a byte-order mark is remembered), UTF-16 with a
+/// byte-order mark, or, when the bytes are not UTF-8, the legacy encoding
+/// they confidently look like (GBK, Big5, Shift JIS, Latin-1...). Otherwise
+/// the invalid bytes read as U+FFFD and [`LoadedText::lossy`] is set.
 pub fn load(path: &Path) -> io::Result<LoadedText> {
     decode(fs::read(path)?)
 }
 
 /// [`load`] on bytes already read.
 pub fn decode(bytes: Vec<u8>) -> io::Result<LoadedText> {
-    let encoding = Encoding::from_bom(&bytes);
-    let text = if encoding != Encoding::Utf8 {
-        Ok(decode_utf16(&bytes, encoding)?)
-    } else {
-        String::from_utf8(bytes)
+    decode_as(bytes, None)
+}
+
+/// [`decode`], or with `forced`, read in that encoding whatever the bytes
+/// look like (Reopen with Encoding); what does not fit reads as U+FFFD.
+pub fn decode_as(mut bytes: Vec<u8>, forced: Option<Encoding>) -> io::Result<LoadedText> {
+    let bom = Encoding::from_bom(&bytes);
+    let encoding = forced.unwrap_or(bom);
+    // A byte-order mark is dropped from the text when the encoding it names
+    // is the one used; a forced encoding reads it like any other bytes.
+    let bom_len = if encoding == bom { bom.bom().len() } else { 0 };
+    let (text, encoding, lossy) = match encoding {
+        Encoding::Utf16Le | Encoding::Utf16Be => {
+            let (text, lossy) = decode_utf16(&bytes[bom_len..], encoding, forced.is_some())?;
+            (text, encoding, lossy)
+        }
+        Encoding::Utf8 | Encoding::Utf8Bom => {
+            // Edit the bytes read from disk in place: copying them would
+            // briefly hold a large file twice.
+            bytes.drain(..bom_len);
+            let utf8 = if bom_len > 0 {
+                Encoding::Utf8Bom
+            } else {
+                Encoding::Utf8
+            };
+            match String::from_utf8(bytes) {
+                Ok(text) => (text, if forced.is_some() { encoding } else { utf8 }, false),
+                Err(err) => {
+                    let bytes = err.into_bytes();
+                    if forced.is_some() {
+                        (String::from_utf8_lossy(&bytes).into_owned(), encoding, true)
+                    } else if looks_binary(&bytes) {
+                        return Err(invalid(
+                            "This looks like a binary file, which Malgel can’t show as text.",
+                        ));
+                    } else {
+                        let mut detector = chardetng::EncodingDetector::new();
+                        detector.feed(&bytes, true);
+                        let (guess, confident) = detector.guess_assess(None, false);
+                        match Encoding::from_legacy(guess).filter(|_| confident) {
+                            Some(legacy) => {
+                                let (text, lossy) = decode_legacy(&bytes, guess);
+                                (text, legacy, lossy)
+                            }
+                            None => (String::from_utf8_lossy(&bytes).into_owned(), utf8, true),
+                        }
+                    }
+                }
+            }
+        }
+        legacy => {
+            let (text, lossy) = decode_legacy(&bytes, legacy.legacy().expect("a legacy encoding"));
+            (text, legacy, lossy)
+        }
     };
-    let text = text.map_err(|err| {
-        // Distinguish a genuinely binary file from text that merely has a
-        // stray invalid byte, so the message tells the user what happened.
-        let bytes = err.as_bytes();
-        let message = if looks_binary(bytes) {
-            "This looks like a binary file, which Malgel can’t show as text."
-        } else {
-            "The file isn’t valid UTF-8 text."
-        };
-        io::Error::new(io::ErrorKind::InvalidData, message)
-    })?;
-    // Edit the string read from disk in place: copying it would briefly
-    // hold a large file twice.
     let mut text = text;
-    if text.starts_with('\u{feff}') {
-        text.drain(..'\u{feff}'.len_utf8());
-    }
     let line_ending = LineEnding::detect(&text);
     if line_ending == LineEnding::CrLf {
         text = text.replace("\r\n", "\n");
@@ -140,6 +250,7 @@ pub fn decode(bytes: Vec<u8>) -> io::Result<LoadedText> {
         text,
         line_ending,
         encoding,
+        lossy,
     })
 }
 
@@ -175,7 +286,7 @@ pub fn save_encoded(
     line_ending: LineEnding,
     encoding: Encoding,
 ) -> io::Result<()> {
-    let contents = encode(text, line_ending, encoding);
+    let contents = encode(text, line_ending, encoding)?;
 
     // Symlinks and hard links must be written through in place: a temp+rename
     // would replace the link with a new regular file.
@@ -247,23 +358,37 @@ pub fn save_encoded(
 }
 
 /// The bytes [`save_encoded`] writes for `text`: line endings expanded,
-/// UTF-16 with its byte-order mark.
-pub fn encode(text: &str, line_ending: LineEnding, encoding: Encoding) -> Vec<u8> {
+/// a byte-order mark for UTF-8 with BOM and UTF-16. Text a legacy encoding
+/// cannot hold is an error rather than silently changed.
+pub fn encode(text: &str, line_ending: LineEnding, encoding: Encoding) -> io::Result<Vec<u8>> {
     let contents = match line_ending {
         LineEnding::CrLf => text.replace('\n', "\r\n"),
         LineEnding::Lf => text.to_string(),
     };
-    match encoding {
+    let bom = encoding.bom().iter().copied();
+    Ok(match encoding {
         Encoding::Utf8 => contents.into_bytes(),
-        Encoding::Utf16Le => [0xFF, 0xFE]
-            .into_iter()
+        Encoding::Utf8Bom => bom.chain(contents.into_bytes()).collect(),
+        Encoding::Utf16Le => bom
             .chain(contents.encode_utf16().flat_map(u16::to_le_bytes))
             .collect(),
-        Encoding::Utf16Be => [0xFE, 0xFF]
-            .into_iter()
+        Encoding::Utf16Be => bom
             .chain(contents.encode_utf16().flat_map(u16::to_be_bytes))
             .collect(),
-    }
+        legacy => {
+            let (bytes, _, unmappable) = legacy
+                .legacy()
+                .expect("a legacy encoding")
+                .encode(&contents);
+            if unmappable {
+                return Err(invalid(format!(
+                    "Some characters can’t be written in {}. Use Save with Encoding → UTF-8 to keep them.",
+                    legacy.label()
+                )));
+            }
+            bytes.into_owned()
+        }
+    })
 }
 
 /// Whether `path` looks like a Markdown document.
@@ -600,7 +725,11 @@ pub fn open_check(path: &Path) -> OpenCheck {
     let head = &head[..read];
     // UTF-16 holds NUL bytes in every ASCII character; its byte-order mark
     // says it is text.
-    if Encoding::from_bom(head) != Encoding::Utf8 || !head.contains(&0) {
+    if matches!(
+        Encoding::from_bom(head),
+        Encoding::Utf16Le | Encoding::Utf16Be
+    ) || !head.contains(&0)
+    {
         return OpenCheck::Fine;
     }
     if size <= BINARY_VALIDATE_BYTES
@@ -650,6 +779,74 @@ mod tests {
         let nul = dir.join("nul.md");
         std::fs::write(&nul, b"text\x00more").unwrap();
         assert_eq!(open_check(&nul), OpenCheck::BinaryText);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gbk_and_latin1_files_open_and_save_in_their_own_encoding() {
+        use super::{Encoding, decode, decode_as, encode};
+        // printf '第一行\n' | iconv -t gbk
+        let gbk = b"\xb5\xda\xd2\xbb\xd0\xd0\n".to_vec();
+        let loaded = decode(gbk.clone()).unwrap();
+        assert_eq!(loaded.text, "第一行\n");
+        assert_eq!(loaded.encoding, Encoding::Gbk);
+        assert!(!loaded.lossy);
+        // An unchanged save writes the same bytes; an edit stays GBK.
+        assert_eq!(
+            encode(&loaded.text, loaded.line_ending, loaded.encoding).unwrap(),
+            gbk
+        );
+        let edited = encode("第一行\n第二行\n", loaded.line_ending, loaded.encoding).unwrap();
+        assert_eq!(
+            edited,
+            b"\xb5\xda\xd2\xbb\xd0\xd0\n\xb5\xda\xb6\xfe\xd0\xd0\n"
+        );
+        // A char GBK cannot hold is refused, not written as something else.
+        assert!(encode("emoji 🎉", loaded.line_ending, Encoding::Gbk).is_err());
+        // Latin-1: every byte is a char and back.
+        let latin1: Vec<u8> = b"caf\xe9 na\xefve \xa9 2026\r\n".to_vec();
+        let loaded = decode(latin1.clone()).unwrap();
+        assert_eq!(loaded.text, "café naïve © 2026\n");
+        assert_eq!(loaded.encoding, Encoding::Latin1);
+        assert_eq!(
+            encode(&loaded.text, loaded.line_ending, loaded.encoding).unwrap(),
+            latin1
+        );
+        let all: Vec<u8> = (0x20..=0xffu8).collect();
+        let loaded = decode_as(all.clone(), Some(Encoding::Latin1)).unwrap();
+        assert_eq!(
+            encode(&loaded.text, loaded.line_ending, Encoding::Latin1).unwrap(),
+            all
+        );
+        // Reopen with Encoding reads the same bytes another way.
+        let as_utf8 = decode_as(gbk, Some(Encoding::Utf8)).unwrap();
+        assert!(as_utf8.lossy && as_utf8.text.contains('\u{fffd}'));
+        assert_eq!(as_utf8.encoding, Encoding::Utf8);
+    }
+
+    #[test]
+    fn text_in_no_confident_encoding_opens_with_replacement_chars() {
+        let loaded = super::decode(b"ok \xff\xfe\xfd ok\n".to_vec()).unwrap();
+        assert!(loaded.lossy);
+        assert_eq!(loaded.encoding, super::Encoding::Utf8);
+        assert!(loaded.text.starts_with("ok ") && loaded.text.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn a_utf8_bom_survives_an_edit_and_save() {
+        use super::{Encoding, load, save_encoded};
+        let dir = std::env::temp_dir().join(format!("malgel-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bom.txt");
+        std::fs::write(&path, b"\xef\xbb\xbfhello\n").unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.text, "hello\n");
+        assert_eq!(loaded.encoding, Encoding::Utf8Bom);
+        let edited = format!("{}world\n", loaded.text);
+        save_encoded(&path, &edited, loaded.line_ending, loaded.encoding).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xef\xbb\xbfhello\nworld\n");
+        // Every encoding's status bar label is shown, UTF-8 included.
+        assert_eq!(Encoding::Utf8.label(), "UTF-8");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

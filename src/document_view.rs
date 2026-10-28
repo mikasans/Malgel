@@ -132,6 +132,9 @@ pub struct DocumentView {
     line_ending: LineEnding,
     /// How the file is encoded on disk; saved back the same way.
     encoding: crate::document::Encoding,
+    /// Bytes of the file were not valid in `encoding` and show as U+FFFD:
+    /// a bar says so until the user dismisses it or reopens the file.
+    lossy_decode: bool,
     /// The line ending last read from or written to disk, so that changing
     /// only the line ending still counts as an unsaved change.
     saved_line_ending: LineEnding,
@@ -164,6 +167,7 @@ pub struct DocumentView {
     reduced: bool,
     /// The large-file info bar was closed for this tab.
     bar_dismissed: bool,
+    lossy_bar_dismissed: bool,
     /// The "convert \[ \( math" hint was closed for this document.
     math_bar_dismissed: bool,
     /// Heavy-render consent: under budget / waiting for inline confirm / skipped.
@@ -331,11 +335,13 @@ impl DocumentView {
             large: false,
             reduced: false,
             bar_dismissed: false,
+            lossy_bar_dismissed: false,
             math_bar_dismissed: false,
             render_gate: crate::render_budget::RenderConsent::Allowed,
             render_estimate: None,
             render_confirmed: false,
             encoding: Default::default(),
+            lossy_decode: false,
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -600,11 +606,13 @@ impl DocumentView {
             large: false,
             reduced: false,
             bar_dismissed: false,
+            lossy_bar_dismissed: false,
             math_bar_dismissed: false,
             render_gate: crate::render_budget::RenderConsent::Allowed,
             render_estimate: None,
             render_confirmed: false,
             encoding: Default::default(),
+            lossy_decode: false,
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -672,11 +680,13 @@ impl DocumentView {
             large: false,
             reduced: false,
             bar_dismissed: false,
+            lossy_bar_dismissed: false,
             math_bar_dismissed: false,
             render_gate: crate::render_budget::RenderConsent::Allowed,
             render_estimate: None,
             render_confirmed: false,
             encoding: Default::default(),
+            lossy_decode: false,
             pending_anchor: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
@@ -938,10 +948,53 @@ impl DocumentView {
         out
     }
 
-    /// Record the encoding the file was read in, so saving keeps it.
-    pub fn with_encoding(mut self, encoding: crate::document::Encoding) -> Self {
+    /// Record the encoding the file was read in, so saving keeps it, and
+    /// whether reading it replaced invalid bytes.
+    pub fn with_encoding(mut self, encoding: crate::document::Encoding, lossy: bool) -> Self {
         self.encoding = encoding;
+        self.lossy_decode = lossy;
         self
+    }
+
+    /// Save with Encoding: the next save writes `encoding`.
+    pub fn set_encoding(&mut self, encoding: crate::document::Encoding, cx: &mut Context<Self>) {
+        self.encoding = encoding;
+        cx.notify();
+    }
+
+    /// Whether the current text can be written in `encoding` (GBK has no
+    /// emoji, Latin-1 no CJK...).
+    pub fn fits_encoding(&self, encoding: crate::document::Encoding, cx: &App) -> bool {
+        let text = self.editor.read(cx).value();
+        crate::document::encode(&text, LineEnding::Lf, encoding).is_ok()
+    }
+
+    /// Reopen with Encoding: read the file again as `encoding`. Refused
+    /// while there are unsaved changes, which reading would throw away.
+    pub fn reopen_with_encoding(
+        &mut self,
+        encoding: crate::document::Encoding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(path) = self.path.clone() else {
+            return Err("Save the file first, then reopen it with another encoding.".into());
+        };
+        if self.dirty {
+            return Err(format!(
+                "Save or undo your changes to “{}” before reopening it with another encoding.",
+                self.name()
+            ));
+        }
+        let bytes = std::fs::read(&path).map_err(|err| format!("Couldn’t read the file: {err}"))?;
+        let loaded = crate::document::decode_as(bytes, Some(encoding))
+            .map_err(|err| format!("Couldn’t read the file as {}: {err}", encoding.label()))?;
+        self.reload(loaded.text, loaded.line_ending, window, cx);
+        self.encoding = loaded.encoding;
+        self.lossy_decode = loaded.lossy;
+        self.lossy_bar_dismissed = false;
+        cx.notify();
+        Ok(())
     }
 
     pub fn encoding(&self) -> crate::document::Encoding {
@@ -3278,6 +3331,41 @@ impl DocumentView {
             )
     }
 
+    /// Said when reading the file replaced bytes that are not valid in its
+    /// encoding: saving would write U+FFFD in their place.
+    fn render_lossy_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("lossy-decode-bar")
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .text_sm()
+            .text_color(cx.theme().foreground)
+            .child(
+                gpui_kit::component::Icon::new(gpui_kit::component::IconName::TriangleAlert)
+                    .text_color(cx.theme().warning),
+            )
+            .child(div().flex_1().min_w_0().child(lossy_message(self.encoding)))
+            .child(
+                Button::new("dismiss-lossy-bar")
+                    .ghost()
+                    .flex_none()
+                    .icon(gpui_kit::assets::IconName::X)
+                    .tooltip("Dismiss")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.lossy_bar_dismissed = true;
+                        cx.notify();
+                    })),
+            )
+    }
+
     /// Offered when the document has `\[ \]` or `\( \)` math, which
     /// the preview does not render: one click converts it to dollars.
     fn render_math_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3860,16 +3948,18 @@ impl Render for DocumentView {
                 | crate::render_budget::RenderConsent::Skipped
         );
         let show_large = self.large && !self.bar_dismissed;
+        let show_lossy = self.lossy_decode && !self.lossy_bar_dismissed;
         let show_math = self.analysis.bracket_math
             && !self.math_bar_dismissed
             && self.highlight_language() == "markdown";
-        if !show_budget && !show_large && !show_math {
+        if !show_budget && !show_large && !show_lossy && !show_math {
             return body;
         }
         v_flex()
             .size_full()
             .min_w_0()
             .when(show_budget, |this| this.child(self.render_budget_bar(cx)))
+            .when(show_lossy, |this| this.child(self.render_lossy_bar(cx)))
             .when(show_math, |this| this.child(self.render_math_bar(cx)))
             .when(show_large, |this| {
                 this.child(self.render_large_file_bar(cx))
@@ -3877,6 +3967,15 @@ impl Render for DocumentView {
             .child(div().flex_1().min_h_0().min_w_0().child(body))
             .into_any_element()
     }
+}
+
+/// The lossy-decode bar's text.
+fn lossy_message(encoding: crate::document::Encoding) -> String {
+    format!(
+        "Some bytes aren’t valid {} and show as \u{FFFD}; saving would replace them. \
+         Pick the right encoding in the status bar (Reopen with Encoding).",
+        encoding.label()
+    )
 }
 
 /// The Force Recompile button's tooltip, naming its shortcut.

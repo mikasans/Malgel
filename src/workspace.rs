@@ -1340,7 +1340,7 @@ impl Workspace {
                                 window,
                                 cx,
                             )
-                            .with_encoding(loaded.encoding)
+                            .with_encoding(loaded.encoding, loaded.lossy)
                         });
                         doc.update(cx, |doc, cx| doc.set_cursor(cursor, window, cx));
                         this.swap_in_loaded(id, ix, doc, window, cx);
@@ -2029,7 +2029,7 @@ impl Workspace {
                                     window,
                                     cx,
                                 )
-                                .with_encoding(loaded.encoding)
+                                .with_encoding(loaded.encoding, loaded.lossy)
                             });
                             this.place_document(doc, placement, window, cx);
                         }
@@ -2166,7 +2166,7 @@ impl Workspace {
                             window,
                             cx,
                         )
-                        .with_encoding(loaded.encoding);
+                        .with_encoding(loaded.encoding, loaded.lossy);
                         if plain {
                             doc.reduce(cx);
                         }
@@ -2990,7 +2990,7 @@ impl Workspace {
             );
             return;
         };
-        let Ok(disk) = std::fs::read_to_string(&path) else {
+        let Ok(disk) = crate::document::load(&path).map(|l| l.text) else {
             window.push_notification(
                 Notification::info("Couldn’t read the saved file from disk."),
                 cx,
@@ -4336,10 +4336,14 @@ impl Workspace {
             if doc.read(cx).is_dirty() {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(crate::document::LoadedText {
+                text,
+                line_ending: ending,
+                ..
+            }) = crate::document::load(&path)
+            else {
                 continue;
             };
-            let ending = LineEnding::detect(&text);
             doc.update(cx, |doc, cx| {
                 doc.reload(text, ending, window, cx);
             });
@@ -5200,6 +5204,47 @@ impl Workspace {
 
     /// Save `doc`, asking for a location first when it has none, then
     /// continue with `next`.
+    /// Status bar → Reopen with Encoding.
+    fn reopen_with_encoding(
+        &mut self,
+        encoding: crate::document::Encoding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let doc = self.active_document().clone();
+        if let Err(message) =
+            doc.update(cx, |doc, cx| doc.reopen_with_encoding(encoding, window, cx))
+        {
+            window.push_notification(Notification::warning(message), cx);
+        }
+        cx.notify();
+    }
+
+    /// Status bar → Save with Encoding: refused, with the reason, when the
+    /// text has characters the encoding cannot hold.
+    fn save_with_encoding(
+        &mut self,
+        encoding: crate::document::Encoding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let doc = self.active_document().clone();
+        if !doc.read(cx).fits_encoding(encoding, cx) {
+            window.push_notification(
+                Notification::error(format!(
+                    "Some characters in “{}” can’t be written in {}; it was not saved.",
+                    doc.read(cx).name(),
+                    encoding.label()
+                )),
+                cx,
+            );
+            return;
+        }
+        doc.update(cx, |doc, cx| doc.set_encoding(encoding, cx));
+        self.save_document(doc, None, window, cx);
+        cx.notify();
+    }
+
     fn save_document(
         &mut self,
         doc: Entity<DocumentView>,
@@ -5221,8 +5266,10 @@ impl Workspace {
             let name = doc.read(cx).name();
             let (text, line_ending, stamp) = match &path {
                 Some(path) => {
-                    let text = std::fs::read_to_string(path).unwrap_or_default();
-                    let line_ending = LineEnding::detect(&text);
+                    // In the file's own encoding (GBK, UTF-16...), not only UTF-8.
+                    let (text, line_ending) = crate::document::load(path)
+                        .map(|l| (l.text, l.line_ending))
+                        .unwrap_or_default();
                     let stamp = crate::session::DiskStamp::of(path);
                     (text, line_ending, stamp)
                 }
@@ -5243,8 +5290,9 @@ impl Workspace {
             let now = crate::session::DiskStamp::of(&path);
             if known.is_some() && now.is_some() && known != now {
                 // External change since we last agreed on the stamp.
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let line_ending = crate::document::LineEnding::detect(&text);
+                let (text, line_ending) = crate::document::load(&path)
+                    .map(|l| (l.text, l.line_ending))
+                    .unwrap_or_default();
                 self.pending_disk_prompt.insert(id);
                 self.open_disk_conflict(
                     doc,
@@ -5320,7 +5368,9 @@ impl Workspace {
                 let name = name.clone();
                 move |window: &mut Window, cx: &mut App| {
                     window.close_dialog(cx);
-                    let disk = std::fs::read_to_string(&path).unwrap_or_default();
+                    let disk = crate::document::load(&path)
+                        .map(|l| l.text)
+                        .unwrap_or_default();
                     let label = format!("{name} (on disk)");
                     _ = workspace.update(cx, |this, cx| {
                         this.open_compare_buffer(disk, label, window, cx);
@@ -8116,7 +8166,19 @@ impl Workspace {
                                 }),
                         )
                     })
-                    .children(doc.encoding().label().map(|label| item(label.to_string())))
+                    // Encoding picker (VS Code): always shown, UTF-8 too.
+                    .child({
+                        let ws_enc = workspace.clone();
+                        Button::new("status-encoding")
+                            .ghost()
+                            .xsmall()
+                            .compact()
+                            .label(doc.encoding().label())
+                            .tooltip("Select Encoding")
+                            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
+                                encoding_menu(menu, ws_enc.clone(), window, cx)
+                            })
+                    })
                     // EOL picker: LF / CRLF (VS Code-like).
                     .child(
                         Button::new("line-ending")
@@ -10602,6 +10664,42 @@ fn push_closed(closed: &mut Vec<(PathBuf, usize)>, path: PathBuf, ix: usize) {
     closed.push((path, ix));
     let excess = closed.len().saturating_sub(CLOSED_EDITORS_LIMIT);
     closed.drain(..excess);
+}
+
+/// The status bar's encoding menu: Reopen with Encoding and Save with
+/// Encoding, each listing [`Encoding::CHOICES`](crate::document::Encoding).
+fn encoding_menu(
+    menu: PopupMenu,
+    workspace: gpui_kit::WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    use crate::document::Encoding;
+    let reopen = workspace.clone();
+    menu.submenu("Reopen with Encoding", window, cx, move |mut menu, _, _| {
+        for encoding in Encoding::CHOICES {
+            let ws = reopen.clone();
+            menu = menu.item(PopupMenuItem::new(encoding.label()).on_click(
+                move |_, window, cx| {
+                    _ = ws.update(cx, |this, cx| {
+                        this.reopen_with_encoding(encoding, window, cx)
+                    });
+                },
+            ));
+        }
+        menu
+    })
+    .submenu("Save with Encoding", window, cx, move |mut menu, _, _| {
+        for encoding in Encoding::CHOICES {
+            let ws = workspace.clone();
+            menu = menu.item(PopupMenuItem::new(encoding.label()).on_click(
+                move |_, window, cx| {
+                    _ = ws.update(cx, |this, cx| this.save_with_encoding(encoding, window, cx));
+                },
+            ));
+        }
+        menu
+    })
 }
 
 #[cfg(test)]
