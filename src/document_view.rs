@@ -962,11 +962,15 @@ impl DocumentView {
         cx.notify();
     }
 
-    /// Whether the current text can be written in `encoding` (GBK has no
-    /// emoji, Latin-1 no CJK...).
-    pub fn fits_encoding(&self, encoding: crate::document::Encoding, cx: &App) -> bool {
+    /// The first character of the current text that `encoding` cannot hold
+    /// (GBK has no emoji, Latin-1 no CJK...), or `None` when it all fits.
+    pub fn unmappable_in(
+        &self,
+        encoding: crate::document::Encoding,
+        cx: &App,
+    ) -> Option<crate::document::Unmappable> {
         let text = self.editor.read(cx).value();
-        crate::document::encode(&text, LineEnding::Lf, encoding).is_ok()
+        crate::document::first_unmappable(&text, encoding)
     }
 
     /// Reopen with Encoding: read the file again as `encoding`. Refused

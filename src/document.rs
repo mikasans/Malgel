@@ -381,13 +381,56 @@ pub fn encode(text: &str, line_ending: LineEnding, encoding: Encoding) -> io::Re
                 .expect("a legacy encoding")
                 .encode(&contents);
             if unmappable {
+                let what = first_unmappable(text, legacy)
+                    .map_or_else(|| "Some characters".to_string(), |u| u.describe());
                 return Err(invalid(format!(
-                    "Some characters can’t be written in {}. Use Save with Encoding → UTF-8 to keep them.",
+                    "{what} can’t be written in {}. Use Save with Encoding → UTF-8 to keep it.",
                     legacy.label()
                 )));
             }
             bytes.into_owned()
         }
+    })
+}
+
+/// The first character a legacy encoding cannot hold, and where it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unmappable {
+    pub ch: char,
+    /// 1-based, counted in `\n`-separated lines.
+    pub line: usize,
+    /// 1-based, in characters.
+    pub column: usize,
+}
+
+impl Unmappable {
+    /// `“😀” (U+1F600) on line 12`, for a toast.
+    pub fn describe(&self) -> String {
+        format!(
+            "“{}” (U+{:04X}) on line {}",
+            self.ch, self.ch as u32, self.line
+        )
+    }
+}
+
+/// Where `text` first stops fitting `encoding`, or `None` when all of it
+/// fits (UTF-8 and UTF-16 hold everything). Lines are tried whole first, so
+/// a large document costs one encode per line, not per character.
+pub fn first_unmappable(text: &str, encoding: Encoding) -> Option<Unmappable> {
+    let legacy = encoding.legacy()?;
+    let fits = |s: &str| !legacy.encode(s).2;
+    text.split('\n').enumerate().find_map(|(index, line)| {
+        if fits(line) {
+            return None;
+        }
+        let mut buf = [0u8; 4];
+        line.chars().enumerate().find_map(|(column, ch)| {
+            (!fits(ch.encode_utf8(&mut buf))).then_some(Unmappable {
+                ch,
+                line: index + 1,
+                column: column + 1,
+            })
+        })
     })
 }
 

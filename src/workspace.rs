@@ -5240,12 +5240,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let doc = self.active_document().clone();
-        if !doc.read(cx).fits_encoding(encoding, cx) {
+        if let Some(unmappable) = doc.read(cx).unmappable_in(encoding, cx) {
             window.push_notification(
-                Notification::error(format!(
-                    "Some characters in “{}” can’t be written in {}; it was not saved.",
-                    doc.read(cx).name(),
-                    encoding.label()
+                Notification::error(unmappable_message(
+                    unmappable,
+                    &doc.read(cx).name(),
+                    encoding,
                 )),
                 cx,
             );
@@ -10680,6 +10680,19 @@ fn push_closed(closed: &mut Vec<(PathBuf, usize)>, path: PathBuf, ix: usize) {
 
 /// The status bar's encoding menu: Reopen with Encoding and Save with
 /// Encoding, each listing [`Encoding::CHOICES`](crate::document::Encoding).
+/// Save with Encoding refused: which character, where, and in which file.
+fn unmappable_message(
+    unmappable: crate::document::Unmappable,
+    name: &str,
+    encoding: crate::document::Encoding,
+) -> String {
+    format!(
+        "{} in “{name}” can’t be written in {}; it was not saved.",
+        unmappable.describe(),
+        encoding.label()
+    )
+}
+
 /// The encoding menu's rows: every choice, with the document's current
 /// encoding checked (VS Code marks it the same way).
 fn encoding_entries(
@@ -10730,6 +10743,23 @@ fn encoding_menu(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_unmappable_toast_names_the_character_and_line() {
+        use crate::document::{Encoding, first_unmappable};
+        let text = "第一行\nascii\n中文 and 😀 here\n";
+        let found = first_unmappable(text, Encoding::Gbk).expect("GBK has no emoji");
+        assert_eq!((found.ch, found.line, found.column), ('😀', 3, 8));
+        assert_eq!(
+            super::unmappable_message(found, "notes.md", Encoding::Gbk),
+            "“😀” (U+1F600) on line 3 in “notes.md” can’t be written in GBK; it was not saved."
+        );
+        let latin = first_unmappable(text, Encoding::Latin1).expect("Latin-1 has no CJK");
+        assert_eq!((latin.ch, latin.line, latin.column), ('第', 1, 1));
+        assert_eq!(first_unmappable(text, Encoding::Gb18030), None);
+        assert_eq!(first_unmappable(text, Encoding::Utf16Le), None);
+        assert_eq!(first_unmappable("plain\ntext", Encoding::Latin1), None);
+    }
+
     #[test]
     fn the_encoding_menu_checks_only_the_current_encoding() {
         use crate::document::Encoding;
