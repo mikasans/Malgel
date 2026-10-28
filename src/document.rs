@@ -243,7 +243,10 @@ pub fn decode_as(mut bytes: Vec<u8>, forced: Option<Encoding>) -> io::Result<Loa
     };
     let mut text = text;
     let line_ending = LineEnding::detect(&text);
-    if line_ending == LineEnding::CrLf {
+    // The editor holds `\n` endings only. A file whose first line ends in
+    // LF can still hold CRLF further down (mixed endings): those become `\n`
+    // too, and saving writes the detected ending everywhere (VS Code).
+    if text.contains("\r\n") {
         text = text.replace("\r\n", "\n");
     }
     Ok(LoadedText {
@@ -1060,6 +1063,17 @@ mod tests {
         assert_eq!(load(&path).unwrap().line_ending, LineEnding::Lf);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mixed_line_endings_load_as_lf_only() {
+        // Found by the decode fuzz test: LF first, then CRLF.
+        let loaded = decode(b"\n\r\n".to_vec()).unwrap();
+        assert_eq!(loaded.text, "\n\n");
+        assert_eq!(loaded.line_ending, LineEnding::Lf);
+        let loaded = decode(b"a\r\nb\nc\r\n".to_vec()).unwrap();
+        assert_eq!(loaded.text, "a\nb\nc\n");
+        assert_eq!(loaded.line_ending, LineEnding::CrLf);
     }
 
     #[test]
