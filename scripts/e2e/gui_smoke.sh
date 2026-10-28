@@ -1569,6 +1569,130 @@ fi
   || fail "Don't save + Quit mutated quit-final.md: $(head -c 80 "$WS/notes/quit-final.md")"
 pass "Ctrl+Q Don't save: dialog shown, disk unchanged, app exits"
 
+# 23. Crash safety: unsaved text survives a panic on the UI thread. With
+#     MALGEL_CRASH_TEST=1 the debounced recovery write is off and a hidden
+#     palette command panics, so only the panic hook can save the text.
+wait_window() { # wait_window <log>: sets WIN once the app's window maps
+  WIN=""
+  for _ in $(seq 1 100); do
+    WIN="$(xdotool search --onlyvisible --class malgel 2>/dev/null | head -1 || true)"
+    [[ -n "$WIN" ]] && break
+    kill -0 "$APP_PID" 2>/dev/null || fail "process exited during startup; see $1"
+    sleep 0.1
+  done
+  [[ -n "$WIN" ]] || fail "no window appeared ($1)"
+  xdotool windowfocus "$WIN" 2>/dev/null || true
+  sleep 1.0
+}
+printf 'crash-disk\n' >"$WS/notes/crash.md"
+MALGEL_CRASH_TEST=1 env -u DBUS_SESSION_BUS_ADDRESS "$BIN" --new-instance "$WS" "$WS/notes/crash.md" \
+  >"$ART_DIR/app-crash.log" 2>&1 &
+APP_PID=$!
+wait_window "$ART_DIR/app-crash.log"
+xdotool key --clearmodifiers ctrl+End
+xdotool type --delay 30 'CRASH_UNSAVED_77'
+sleep 0.3
+shot 51a-crash-before
+xdotool key --clearmodifiers ctrl+shift+p
+sleep 0.5
+xdotool type --delay 30 'Developer: Crash'
+sleep 0.4
+xdotool key --clearmodifiers Return
+for _ in $(seq 1 50); do kill -0 "$APP_PID" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$APP_PID" 2>/dev/null && fail "Developer: Crash did not bring the app down"
+APP_PID=""
+grep -q "CRASH_UNSAVED_77" "$WS/notes/crash.md" && fail "crash.md was saved before the crash"
+grep -q "PANIC on thread" "$HOME/.config/malgel/logs/malgel.log" \
+  || fail "the panic was not logged to logs/malgel.log"
+grep -rq "CRASH_UNSAVED_77" "$HOME/.config/malgel/recovery" \
+  || fail "the panic hook wrote no recovery file with the unsaved text"
+pass "a UI-thread panic writes the unsaved text to recovery and the log"
+env -u DBUS_SESSION_BUS_ADDRESS "$BIN" --new-instance "$WS" >"$ART_DIR/app-restart.log" 2>&1 &
+APP_PID=$!
+wait_window "$ART_DIR/app-restart.log"
+shot 51b-crash-restored
+xdotool key --clearmodifiers ctrl+shift+p
+sleep 0.5
+xdotool type --delay 30 'Save All'
+sleep 0.4
+xdotool key --clearmodifiers Return
+wait_for 5 grep -q 'CRASH_UNSAVED_77' "$WS/notes/crash.md" \
+  || fail "the restarted app did not restore the unsaved text: $(head -c 80 "$WS/notes/crash.md")"
+pass "after a crash the next launch restores the unsaved text (Save All writes it)"
+kill "$APP_PID" 2>/dev/null || true
+APP_PID=""
+sleep 0.5
+
+# 23b. The file changes on disk after the crash: the restored text must not
+#      silently replace it. The relaunch asks (Keep Recovered / Use Disk
+#      Version / Compare); Ctrl+S before answering writes nothing.
+MALGEL_CRASH_TEST=1 env -u DBUS_SESSION_BUS_ADDRESS "$BIN" --new-instance "$WS" "$WS/notes/crash.md" \
+  >"$ART_DIR/app-crash2.log" 2>&1 &
+APP_PID=$!
+wait_window "$ART_DIR/app-crash2.log"
+xdotool key --clearmodifiers ctrl+End
+xdotool type --delay 30 'SECOND_EDIT_88'
+sleep 0.3
+xdotool key --clearmodifiers ctrl+shift+p
+sleep 0.5
+xdotool type --delay 30 'Developer: Crash'
+sleep 0.4
+xdotool key --clearmodifiers Return
+for _ in $(seq 1 50); do kill -0 "$APP_PID" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$APP_PID" 2>/dev/null && fail "the second Developer: Crash did not bring the app down"
+APP_PID=""
+grep -rq "SECOND_EDIT_88" "$HOME/.config/malgel/recovery" \
+  || fail "the second crash wrote no recovery"
+printf 'EXTERNAL_99\n' >"$WS/notes/crash.md"
+env -u DBUS_SESSION_BUS_ADDRESS "$BIN" --new-instance "$WS" >"$ART_DIR/app-restart2.log" 2>&1 &
+APP_PID=$!
+wait_window "$ART_DIR/app-restart2.log"
+wait_for 6 grep -q "changed on disk since the crash" "$ART_DIR/app-restart2.log" \
+  || fail "no disk-conflict question for a file changed after the crash"
+shot 51c-crash-disk-conflict
+# The question has the keyboard: typed text must not reach the buffer.
+xdotool type --delay 30 'LEAK_77'
+xdotool key --clearmodifiers ctrl+s
+sleep 1.5
+[[ "$(cat "$WS/notes/crash.md")" == "EXTERNAL_99" ]] \
+  || fail "Ctrl+S before answering overwrote the newer file: $(head -c 80 "$WS/notes/crash.md")"
+pass "a file changed after the crash is not overwritten: the relaunch asks first"
+# Esc = Keep Recovered: the dialog closes, nothing is written.
+xdotool key --clearmodifiers Escape
+sleep 0.8
+shot 51d-crash-kept
+[[ "$(pixels_differ 51c-crash-disk-conflict 51d-crash-kept)" -gt 1000 ]] \
+  || fail "Esc did not dismiss the crash disk-conflict question"
+[[ "$(cat "$WS/notes/crash.md")" == "EXTERNAL_99" ]] || fail "Keep Recovered wrote the file"
+# Saving the kept text over the newer file asks again (Overwrite?) ...
+xdotool key --clearmodifiers ctrl+s
+sleep 1
+shot 51e-crash-overwrite-newer
+[[ "$(pixels_differ 51d-crash-kept 51e-crash-overwrite-newer)" -gt 1000 ]] \
+  || fail "Ctrl+S after Keep Recovered did not ask before overwriting the newer file"
+[[ "$(cat "$WS/notes/crash.md")" == "EXTERNAL_99" ]] \
+  || fail "Ctrl+S after Keep Recovered overwrote the newer file without asking"
+# ... whose default (Enter) is Cancel: nothing is written ...
+xdotool key --clearmodifiers Return
+sleep 1
+[[ "$(cat "$WS/notes/crash.md")" == "EXTERNAL_99" ]] \
+  || fail "Enter on 'file is newer, Overwrite?' wrote the file; Cancel is the default"
+# ... and choosing Overwrite (Shift+Tab from Cancel, then Enter) writes it.
+xdotool key --clearmodifiers ctrl+s
+sleep 1
+xdotool key --clearmodifiers shift+Tab
+sleep 0.3
+shot 51e2-crash-overwrite-focused
+xdotool key --clearmodifiers Return
+wait_for 5 grep -q 'SECOND_EDIT_88' "$WS/notes/crash.md" \
+  || fail "Overwrite did not write the recovered text"
+! grep -q 'LEAK_77' "$WS/notes/crash.md" \
+  || fail "keys typed while the crash question was open reached the buffer"
+shot 51f-crash-overwritten
+pass "Keep Recovered, then Ctrl+S asks Overwrite? (Enter cancels; Overwrite writes the recovered text)"
+kill "$APP_PID" 2>/dev/null || true
+APP_PID=""
+
 echo
 echo "PASS — artifacts in $ART_DIR"
 ls -1 "$ART_DIR"/*.png

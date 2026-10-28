@@ -100,8 +100,17 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
     if mode.is_dark() && default_dark {
         Theme::update(cx, tune_default_dark);
     }
-    Theme::update(cx, |theme| theme.font_size = px(settings.font_size));
+    Theme::update(cx, |theme| {
+        theme.font_size = px(settings.font_size);
+        // Toasts bottom-right above the status bar, as VS Code shows them:
+        // top-right they covered the tab bar's + and the preview header.
+        theme.notification.placement = gpui_kit::Anchor::BottomRight;
+        theme.notification.margins.bottom = px(STATUS_BAR_CLEARANCE);
+    });
 }
+
+/// Room below a bottom-right toast: the status bar plus a gap.
+const STATUS_BAR_CLEARANCE: f32 = 40.;
 
 /// The bundled dark theme's selection (~1.4:1 on its background) and current
 /// line (~1.1:1) are too faint to see a long selection's edge or the caret's

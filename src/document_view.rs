@@ -140,6 +140,9 @@ pub struct DocumentView {
     dirty: bool,
     /// The file as last read or written, to notice other programs' changes.
     disk: Option<DiskStamp>,
+    /// Restored from a crash recovery over a file that changed on disk
+    /// since: the workspace asks before anything is written.
+    recovered_conflict: bool,
     /// The current source, shared with the preview and background analysis.
     source: SharedString,
     revision: usize,
@@ -231,6 +234,13 @@ pub struct DocumentView {
 
 impl EventEmitter<DocumentEvent> for DocumentView {}
 
+impl Drop for DocumentView {
+    fn drop(&mut self) {
+        // Closed: its recovery file (if any) is the workspace's business now.
+        crate::crash::forget(&self.recovery_id);
+    }
+}
+
 impl DocumentView {
     /// A document showing `text`, saved at `path` when it has one.
     pub fn new(
@@ -308,6 +318,7 @@ impl DocumentView {
             saved_hash: content_hash(""),
             dirty: false,
             disk: None,
+            recovered_conflict: false,
             source: SharedString::default(),
             revision: 0,
             analysis: Arc::default(),
@@ -575,6 +586,7 @@ impl DocumentView {
             saved_hash: 0,
             dirty: false,
             disk: None,
+            recovered_conflict: false,
             source: "".into(),
             revision: 0,
             analysis: Arc::new(Analysis::default()),
@@ -645,6 +657,7 @@ impl DocumentView {
             saved_hash: 0,
             dirty: false,
             disk: None,
+            recovered_conflict: false,
             source: "".into(),
             revision: 0,
             analysis: Arc::new(Analysis::default()),
@@ -951,6 +964,10 @@ impl DocumentView {
         self.disk
     }
 
+    pub fn recovered_conflict(&self) -> bool {
+        self.recovered_conflict
+    }
+
     pub fn saved_hash(&self) -> u64 {
         self.saved_hash
     }
@@ -1093,8 +1110,13 @@ impl DocumentView {
             .path
             .as_deref()
             .and_then(|path| crate::document::load(path).ok());
+        let conflict = session::recovery_conflicts(
+            &recovery,
+            saved.as_ref().map(|saved| content_hash(&saved.text)),
+        );
         self.path = recovery.path;
         self.disk = self.path.as_deref().and_then(DiskStamp::of);
+        self.recovered_conflict = conflict;
         self.line_ending = if recovery.crlf {
             LineEnding::CrLf
         } else {
@@ -1104,6 +1126,15 @@ impl DocumentView {
             .as_ref()
             .map_or(LineEnding::Lf, |saved| saved.line_ending);
         self.saved_hash = saved.map_or(content_hash(""), |saved| content_hash(&saved.text));
+        if conflict {
+            // The file changed on disk after the crash. Keep the base the
+            // recovered edits were made on and a stamp that matches no
+            // file, so the disk-change check asks Keep / Reload / Compare
+            // and Ctrl+S goes through the same question instead of
+            // silently writing over the newer file.
+            self.saved_hash = recovery.base_hash.unwrap_or(self.saved_hash);
+            self.disk = Some(DiskStamp::UNKNOWN);
+        }
         self.recovery_id = id;
         self.recovery_written = true;
         self.editor
@@ -1254,6 +1285,7 @@ impl DocumentView {
     /// Recompute statistics, the outline and the block index off the UI
     /// thread once typing pauses. Stale results are discarded.
     fn schedule_analysis(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        self.note_crash_snapshot(cx);
         let revision = self.revision;
         let delay = if self.large {
             LARGE_ANALYSIS_DEBOUNCE
@@ -2120,9 +2152,41 @@ impl DocumentView {
         Ok(())
     }
 
+    /// The saved text the unsaved changes sit on, for a recovery: only a
+    /// document with a file has one.
+    fn recovery_base(&self) -> Option<u64> {
+        self.path.as_ref().map(|_| self.saved_hash)
+    }
+
+    /// Hand the latest unsaved text to the panic hook (no copy: a shared
+    /// string or a rope clone), or tell it there is nothing to rescue.
+    fn note_crash_snapshot(&self, cx: &App) {
+        if !self.dirty {
+            crate::crash::forget(&self.recovery_id);
+            return;
+        }
+        let text = if self.large {
+            crate::crash::Snapshot::Rope(self.editor.read(cx).text().clone())
+        } else {
+            crate::crash::Snapshot::Text(self.source.clone())
+        };
+        crate::crash::note_unsaved(
+            &self.recovery_id,
+            self.path.clone(),
+            self.recovery_base(),
+            self.line_ending == LineEnding::CrLf,
+            text,
+        );
+    }
+
     /// Write unsaved changes aside once typing pauses, so a crash can't lose
     /// them.
     fn schedule_recovery(&mut self, cx: &mut Context<Self>) {
+        self.note_crash_snapshot(cx);
+        // Crash tests prove the panic hook alone rescues the text.
+        if crate::crash::crash_test_enabled() {
+            return;
+        }
         let revision = self.revision;
         self.recovery_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RECOVERY_DEBOUNCE).await;
@@ -2140,6 +2204,7 @@ impl DocumentView {
                                 this.source.to_string()
                             },
                             crlf: this.line_ending == LineEnding::CrLf,
+                            base_hash: this.recovery_base(),
                         },
                         this.large.then(|| this.editor.read(cx).text().clone()),
                     )
@@ -2167,6 +2232,7 @@ impl DocumentView {
     /// Forget the unsaved changes written aside: they were saved or thrown
     /// away.
     pub fn discard_recovery(&mut self) {
+        crate::crash::forget(&self.recovery_id);
         self.recovery_task = None;
         if self.recovery_written {
             session::remove_recovery(&self.recovery_id);

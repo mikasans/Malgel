@@ -23,6 +23,7 @@ actions!(
         NewTerminal,
         ClearTerminal,
         TerminalCopy,
+        DebugCrash,
         TerminalPaste,
         TerminalSelectAll,
         TerminalClear,

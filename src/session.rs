@@ -76,18 +76,39 @@ pub struct Recovery {
     pub path: Option<PathBuf>,
     pub text: String,
     pub crlf: bool,
+    /// `content_hash` of the file's text as last loaded or saved — what the
+    /// unsaved changes were made on top of. On restore, a file whose text
+    /// no longer hashes to this was changed on disk after the crash, and
+    /// the recovered text must not silently replace it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_hash: Option<u64>,
 }
 
-fn recovery_dir() -> Option<PathBuf> {
+/// Whether restoring `recovery` over the file now on disk (whose text
+/// hashes to `disk_hash`, `None` when it cannot be read) would replace
+/// changes made after the recovered edits began.
+pub fn recovery_conflicts(recovery: &Recovery, disk_hash: Option<u64>) -> bool {
+    match (recovery.base_hash, disk_hash) {
+        (Some(base), Some(disk)) => base != disk,
+        // No base recorded (older recovery) or no file: nothing to compare.
+        _ => false,
+    }
+}
+
+pub fn recovery_dir() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("recovery"))
 }
 
 fn recovery_path(id: &str) -> Option<PathBuf> {
+    recovery_file(&recovery_dir()?, id)
+}
+
+fn recovery_file(dir: &Path, id: &str) -> Option<PathBuf> {
     // Ids are generated here; refuse anything that could leave the folder.
     if id.is_empty() || !id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-') {
         return None;
     }
-    recovery_dir().map(|dir| dir.join(format!("{id}.json")))
+    Some(dir.join(format!("{id}.json")))
 }
 
 /// A new, unique recovery id.
@@ -104,7 +125,12 @@ pub fn new_recovery_id() -> String {
 }
 
 pub fn write_recovery(id: &str, recovery: &Recovery) -> std::io::Result<()> {
-    let path = recovery_path(id).ok_or_else(|| std::io::Error::other("no config folder"))?;
+    let dir = recovery_dir().ok_or_else(|| std::io::Error::other("no config folder"))?;
+    write_recovery_in(&dir, id, recovery)
+}
+
+pub fn write_recovery_in(dir: &Path, id: &str, recovery: &Recovery) -> std::io::Result<()> {
+    let path = recovery_file(dir, id).ok_or_else(|| std::io::Error::other("bad recovery id"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -120,7 +146,17 @@ pub fn write_recovery_chunks<'a>(
     recovery: &Recovery,
     chunks: impl IntoIterator<Item = &'a str>,
 ) -> std::io::Result<()> {
-    let path = recovery_path(id).ok_or_else(|| std::io::Error::other("no config folder"))?;
+    let dir = recovery_dir().ok_or_else(|| std::io::Error::other("no config folder"))?;
+    write_recovery_chunks_in(&dir, id, recovery, chunks)
+}
+
+pub fn write_recovery_chunks_in<'a>(
+    dir: &Path,
+    id: &str,
+    recovery: &Recovery,
+    chunks: impl IntoIterator<Item = &'a str>,
+) -> std::io::Result<()> {
+    let path = recovery_file(dir, id).ok_or_else(|| std::io::Error::other("bad recovery id"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -194,6 +230,13 @@ pub struct DiskStamp {
 }
 
 impl DiskStamp {
+    /// A stamp no file has: the document's idea of the file is out of date
+    /// and the next check or save must compare contents.
+    pub const UNKNOWN: DiskStamp = DiskStamp {
+        modified: None,
+        len: u64::MAX,
+    };
+
     pub fn of(path: &Path) -> Option<Self> {
         let metadata = std::fs::metadata(path).ok()?;
         Some(Self {
@@ -214,6 +257,7 @@ mod tests {
             path: Some(PathBuf::from("/tmp/a b.md")),
             text: String::new(),
             crlf: true,
+            base_hash: None,
         };
         let mut out = Vec::new();
         let chunks = ["line \"one\"\n", "\ttab \\ ", "标题\u{1}"];
@@ -222,6 +266,39 @@ mod tests {
         assert_eq!(back.text, text);
         assert_eq!(back.path, recovery.path);
         assert!(back.crlf);
+    }
+
+    #[test]
+    fn a_recovery_conflicts_only_when_the_file_changed_after_its_base() {
+        let rec = |base| Recovery {
+            path: Some(PathBuf::from("/tmp/x.md")),
+            text: "recovered".into(),
+            crlf: false,
+            base_hash: base,
+        };
+        assert!(recovery_conflicts(&rec(Some(1)), Some(2)), "disk moved on");
+        assert!(
+            !recovery_conflicts(&rec(Some(1)), Some(1)),
+            "disk as it was"
+        );
+        assert!(
+            !recovery_conflicts(&rec(None), Some(2)),
+            "old recovery: as before"
+        );
+        assert!(
+            !recovery_conflicts(&rec(Some(1)), None),
+            "file gone: as before"
+        );
+        // The base survives the round trip through JSON; an old file
+        // without it still reads.
+        let json = serde_json::to_string(&rec(Some(u64::MAX))).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Recovery>(&json).unwrap().base_hash,
+            Some(u64::MAX)
+        );
+        let old: Recovery =
+            serde_json::from_str(r#"{"path":null,"text":"t","crlf":false}"#).unwrap();
+        assert_eq!(old.base_hash, None);
     }
 
     #[test]
@@ -256,6 +333,7 @@ mod tests {
             path: None,
             text: "unsaved".into(),
             crlf: false,
+            base_hash: Some(7),
         };
         write_recovery(&id, &recovery).unwrap();
         assert_eq!(read_recovery(&id), Some(recovery.clone()));

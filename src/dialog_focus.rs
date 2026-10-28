@@ -54,12 +54,34 @@ impl DialogFocus {
         } else {
             gpui_kit::transparent_black()
         };
+        let primary = self.primary.clone();
+        let ours: Vec<FocusHandle> = std::iter::once(self.trap.clone())
+            .chain(self.secondary.iter().cloned())
+            .collect();
         div()
             .track_focus(&self.primary)
             .rounded(cx.theme().radius + px(2.))
             .border_2()
             .border_color(ring)
             .child(button.tab_stop(false))
+            // While the alert shows, the keyboard belongs to it: focus taken
+            // before it was laid out (lost), or pulled away by a late
+            // editor focus (a tab finishing loading at startup), comes back
+            // to the primary button.
+            .child(
+                gpui_kit::canvas(
+                    move |_, window, cx| {
+                        let inside = primary.is_focused(window)
+                            || ours.iter().any(|handle| handle.is_focused(window));
+                        if !inside {
+                            primary.focus(window, cx);
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_0(),
+            )
     }
 
     /// Non-primary button number `ix` (0-based, at most three per dialog):

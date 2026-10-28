@@ -6,6 +6,7 @@
 mod actions;
 mod analysis;
 mod commands;
+mod crash;
 mod default_app;
 mod diagram;
 mod diagram_viewer;
@@ -168,6 +169,7 @@ fn log_level(value: Option<&str>) -> log::LevelFilter {
 
 fn main() {
     crate::perf::init();
+    crate::crash::install_panic_hook();
     let _ = log::set_boxed_logger(Box::new(StdErrLogger {
         quiet: std::env::var_os("RUST_LOG").is_none(),
     }));

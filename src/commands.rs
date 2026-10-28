@@ -523,7 +523,18 @@ pub fn groups() -> Vec<CommandGroupSpec> {
         ],
     );
 
-    vec![file, explorer, edit, go, view, format, settings, help]
+    let mut all = vec![file, explorer, edit, go, view, format, settings, help];
+    if crate::crash::crash_test_enabled() {
+        all.push(group(
+            "Developer",
+            vec![cmd(
+                "Developer: Crash (test recovery)",
+                IconName::TriangleAlert,
+                DebugCrash,
+            )],
+        ));
+    }
+    all
 }
 
 #[cfg(test)]

@@ -747,6 +747,12 @@ pub struct Workspace {
     discarded: HashSet<EntityId>,
     /// Files changed on disk that are waiting for the user to decide.
     pending_disk_prompt: HashSet<EntityId>,
+    /// Documents restored from a crash recovery whose file changed on disk
+    /// after the crash: their conflict question says so.
+    crash_conflicts: HashSet<EntityId>,
+    /// Documents whose file on disk is newer than the buffer by the user's
+    /// choice (Keep in the disk-change question): saving asks first.
+    overwrite_confirm: HashSet<EntityId>,
     /// Files the user chose to open despite the size warning, and how.
     approved_opens: HashMap<PathBuf, OpenMode>,
     /// The paths of editors closed recently, newest last, so Ctrl+Shift+T
@@ -1005,6 +1011,8 @@ impl Workspace {
             closing: false,
             discarded: HashSet::new(),
             pending_disk_prompt: HashSet::new(),
+            crash_conflicts: HashSet::new(),
+            overwrite_confirm: HashSet::new(),
             approved_opens: HashMap::new(),
             closed_documents: Vec::new(),
             pinned: HashSet::new(),
@@ -1144,11 +1152,31 @@ impl Workspace {
         };
         let mut restoring: Vec<(EntityId, PathBuf, usize)> = Vec::new();
 
+        referenced.extend(
+            previous
+                .documents
+                .iter()
+                .filter_map(|entry| entry.recovery.clone()),
+        );
+        let mut orphans = session::orphaned_recoveries(&referenced);
+
         for (ix, entry) in previous.documents.iter().enumerate() {
-            let recovery = entry.recovery.as_deref().and_then(|id| {
-                referenced.insert(id.to_string());
-                session::read_recovery(id).map(|recovery| (id.to_string(), recovery))
-            });
+            let recovery = entry
+                .recovery
+                .as_deref()
+                .and_then(|id| {
+                    session::read_recovery(id).map(|recovery| (id.to_string(), recovery))
+                })
+                // A crash can come before the session learned this tab had
+                // unsaved changes: its orphaned recovery takes the tab's
+                // place instead of opening a second, clean copy beside it.
+                .or_else(|| {
+                    let path = entry.path.as_ref()?;
+                    let ix = orphans
+                        .iter()
+                        .position(|(_, recovery)| recovery.path.as_ref() == Some(path))?;
+                    Some(orphans.remove(ix))
+                });
             // Unsaved changes always come back; saved documents only when
             // the session is restored (just the active one without tabs).
             let wanted = restoring_session && (settings.tabs || ix == previous.active);
@@ -1187,28 +1215,32 @@ impl Workspace {
             }
         }
 
-        let orphans = session::orphaned_recoveries(&referenced);
-        let recovered = orphans.len()
-            + self
-                .documents
-                .iter()
-                .filter(|doc| doc.read(cx).is_dirty())
-                .count();
         for (id, recovery) in orphans {
             let doc = self.restored_document(id, recovery, window, cx);
             self.add_document(doc, false, window, cx);
         }
-        if recovered > 0 {
-            let message = if recovered == 1 {
-                "Recovered unsaved changes from the last session.".to_string()
-            } else {
-                format!("Recovered unsaved changes to {recovered} documents.")
-            };
-            // The window can show notifications once it has finished opening.
-            window.defer(cx, move |window, cx| {
-                window.push_notification(Notification::info(message), cx)
-            });
-        }
+        // Name what came back; a file changed on disk since the crash gets
+        // the disk-conflict question (Keep recovered / Use disk / Compare)
+        // before anything can write over it.
+        let recovered: Vec<(EntityId, String, bool)> = self
+            .documents
+            .iter()
+            .filter(|doc| doc.read(cx).is_dirty())
+            .map(|doc| {
+                let id = doc.entity_id();
+                let doc = doc.read(cx);
+                (id, doc.name(), doc.recovered_conflict())
+            })
+            .collect();
+        let crash_notice = recovered_message(&recovered).map(|message| {
+            let conflicted: Vec<EntityId> = recovered
+                .iter()
+                .filter(|(_, _, conflict)| *conflict)
+                .map(|(id, _, _)| *id)
+                .collect();
+            self.crash_conflicts.extend(conflicted.iter().copied());
+            (message, conflicted)
+        });
 
         if restoring_session {
             self.file_tree
@@ -1245,6 +1277,16 @@ impl Workspace {
             });
         }
         self.focus_active(window, cx);
+        // After the focus above (deferred too), or the editor would take the
+        // keyboard back from the question: Esc and Ctrl+S must reach it.
+        if let Some((message, conflicted)) = crash_notice {
+            cx.defer_in(window, move |this, window, cx| {
+                window.push_notification(Notification::info(message), cx);
+                for id in conflicted {
+                    this.ask_about_crash_conflict(id, window, cx);
+                }
+            });
+        }
         self.sync_file_tree(cx);
     }
 
@@ -1738,7 +1780,14 @@ impl Workspace {
         // Typst live preview is a PdfView, not the Markdown TextView —
         // focusing an off-tree handle drops every workspace action.
         let focus = self.active_focus_target(cx);
-        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        window.defer(cx, move |window, cx| {
+            // A question on screen keeps the keyboard: a late focus (a tab
+            // finishing loading at startup) must not pull it into the editor
+            // behind the dialog, where Enter and typing would edit the file.
+            if !window.has_active_dialog(cx) {
+                focus.focus(window, cx);
+            }
+        });
     }
 
     /// The handle [`Self::focus_active`] would focus.
@@ -2300,6 +2349,42 @@ impl Workspace {
         .detach();
     }
 
+    /// Put the disk-conflict question to a document restored over a file
+    /// that changed after the crash (see `DocumentView::restore_unsaved`).
+    fn ask_about_crash_conflict(
+        &mut self,
+        id: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(doc) = self.document_index(id).map(|ix| self.documents[ix].clone()) else {
+            return;
+        };
+        let Some(path) = doc.read(cx).path().cloned() else {
+            return;
+        };
+        let Ok(loaded) = document::load(&path) else {
+            return;
+        };
+        log::warn!(
+            "recovered unsaved changes to {} over a file changed on disk since the crash; asking",
+            path.display()
+        );
+        let change = DiskChange::Changed {
+            text: loaded.text,
+            line_ending: loaded.line_ending,
+            stamp: crate::session::DiskStamp::of(&path),
+        };
+        if window.has_active_dialog(cx) {
+            // Ask once the current dialog is answered: the disk check
+            // still sees the conflict (the stamp matches no file) and Ctrl+S
+            // re-asks meanwhile.
+            self.pending_disk_prompt.insert(id);
+            return;
+        }
+        self.apply_disk_change(id, change, window, cx);
+    }
+
     fn apply_disk_change(
         &mut self,
         id: EntityId,
@@ -2368,10 +2453,13 @@ impl Workspace {
         let workspace = cx.weak_entity();
         let text = Arc::new(text);
         let decided = Rc::new(Cell::new(false));
+        let after_crash = self.crash_conflicts.contains(&id);
         // Do not focus a fresh handle here: open_dialog already focuses the
         // alert's own focus trap. A deferred cx.focus_handle() steals focus
         // from the dialog, so Esc/Tab die and typed keys leak into the editor.
-        window.open_alert_dialog(cx, move |alert, _, cx| {
+        let focus = self.alert_focus.clone();
+        focus.focus_primary_soon(window, cx);
+        window.open_alert_dialog(cx, move |alert, window, cx| {
             let keep = {
                 let workspace = workspace.clone();
                 let doc = doc.clone();
@@ -2381,9 +2469,13 @@ impl Workspace {
                         return;
                     }
                     window.close_dialog(cx);
+                    // The disk stays newer than the buffer: the next save asks
+                    // before overwriting it (as VS Code does), the poll does not.
                     doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
                     _ = workspace.update(cx, |this, cx| {
                         this.pending_disk_prompt.remove(&id);
+                        this.crash_conflicts.remove(&id);
+                        this.overwrite_confirm.insert(id);
                         this.focus_active(window, cx);
                     });
                 }
@@ -2404,11 +2496,26 @@ impl Workspace {
             let compare_text = text.clone();
             let compare_decided = decided.clone();
             let compare_name = name.clone();
-            alert
-                .title(format!("“{name}” changed on disk"))
-                .description(
-                    "Another program saved this file while you have unsaved changes here. Reload discards local edits; Overwrite writes your buffer; Compare opens the disk version in a new tab.",
+            let (title, description, reload_label, keep_label) = if after_crash {
+                (
+                    format!("“{name}” changed on disk since the crash"),
+                    "Malgel recovered unsaved changes to this file, but the file was saved again after Malgel closed. Use Disk Version discards the recovered text; Compare opens the disk version beside it; Overwrite writes the recovered text over the file; Keep Recovered keeps it unsaved.",
+                    "Use Disk Version",
+                    "Keep Recovered",
                 )
+            } else {
+                (
+                    format!("“{name}” changed on disk"),
+                    "Another program saved this file while you have unsaved changes here. Reload discards local edits; Overwrite writes your buffer; Compare opens the disk version in a new tab.",
+                    "Reload",
+                    "Keep",
+                )
+            };
+            // Four buttons with the longer crash labels need the room.
+            let alert = if after_crash { alert.width(px(560.)) } else { alert };
+            alert
+                .title(title)
+                .description(description)
                 .keyboard(true)
                 .on_cancel(move |_, window, cx| {
                     keep_esc(window, cx);
@@ -2419,74 +2526,89 @@ impl Workspace {
                     keep_ok(window, cx);
                     true
                 })
-                .footer(
+                .footer(focus.trap(
                     DialogFooter::new()
                         .justify_end()
-                        .child(
-                            Button::new("reload")
-                                .label("Reload")
-                                .outline()
-                                .on_click(move |_, window, cx| {
-                                    if reload_decided.replace(true) {
-                                        return;
+                        // Never wider than the card: wrap rather than spill.
+                        .flex_wrap()
+                        .gap_2()
+                        .child(focus.secondary(
+                            0,
+                            Button::new("reload").label(reload_label).outline(),
+                            move |window, cx| {
+                                if reload_decided.replace(true) {
+                                    return;
+                                }
+                                window.close_dialog(cx);
+                                let text = reload_text.as_ref().clone();
+                                reload_doc.update(cx, |doc, cx| {
+                                    doc.reload(text, line_ending, window, cx)
+                                });
+                                _ = reload.update(cx, |this, cx| {
+                                    this.pending_disk_prompt.remove(&id);
+                                    this.crash_conflicts.remove(&id);
+                                    this.overwrite_confirm.remove(&id);
+                                    this.focus_active(window, cx);
+                                });
+                            },
+                            window,
+                            cx,
+                        ))
+                        .child(focus.secondary(
+                            1,
+                            Button::new("compare").label("Compare").outline(),
+                            move |window, cx| {
+                                if compare_decided.replace(true) {
+                                    return;
+                                }
+                                window.close_dialog(cx);
+                                // Keep local edits; the disk version opens beside them.
+                                compare_doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
+                                let disk = compare_text.as_ref().clone();
+                                let label = format!("{} (on disk)", compare_name);
+                                _ = compare_ws.update(cx, |this, cx| {
+                                    this.pending_disk_prompt.remove(&id);
+                                    this.crash_conflicts.remove(&id);
+                                    // Saving still asks: the disk is newer.
+                                    this.overwrite_confirm.insert(id);
+                                    this.open_compare_buffer(disk, label, window, cx);
+                                    this.focus_active(window, cx);
+                                });
+                            },
+                            window,
+                            cx,
+                        ))
+                        .child(focus.secondary(
+                            2,
+                            Button::new("overwrite").label("Overwrite").outline(),
+                            move |window, cx| {
+                                if overwrite_decided.replace(true) {
+                                    return;
+                                }
+                                window.close_dialog(cx);
+                                overwrite_doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
+                                _ = overwrite_ws.update(cx, |this, cx| {
+                                    this.pending_disk_prompt.remove(&id);
+                                    this.crash_conflicts.remove(&id);
+                                    this.overwrite_confirm.remove(&id);
+                                    if let Some(path) = &overwrite_path {
+                                        this.write(&overwrite_doc, path, window, cx);
                                     }
-                                    window.close_dialog(cx);
-                                    let text = reload_text.as_ref().clone();
-                                    reload_doc.update(cx, |doc, cx| {
-                                        doc.reload(text, line_ending, window, cx)
-                                    });
-                                    _ = reload.update(cx, |this, cx| {
-                                        this.pending_disk_prompt.remove(&id);
-                                        this.focus_active(window, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("compare")
-                                .label("Compare")
-                                .outline()
-                                .on_click(move |_, window, cx| {
-                                    if compare_decided.replace(true) {
-                                        return;
-                                    }
-                                    window.close_dialog(cx);
-                                    // Keep local edits; open disk snapshot in a new tab for side-by-side review.
-                                    compare_doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
-                                    let disk = compare_text.as_ref().clone();
-                                    let label = format!("{} (on disk)", compare_name);
-                                    _ = compare_ws.update(cx, |this, cx| {
-                                        this.pending_disk_prompt.remove(&id);
-                                        this.open_compare_buffer(disk, label, window, cx);
-                                        this.focus_active(window, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("overwrite")
-                                .label("Overwrite")
-                                .outline()
-                                .on_click(move |_, window, cx| {
-                                    if overwrite_decided.replace(true) {
-                                        return;
-                                    }
-                                    window.close_dialog(cx);
-                                    overwrite_doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
-                                    _ = overwrite_ws.update(cx, |this, cx| {
-                                        this.pending_disk_prompt.remove(&id);
-                                        if let Some(path) = &overwrite_path {
-                                            this.write(&overwrite_doc, path, window, cx);
-                                        }
-                                        this.focus_active(window, cx);
-                                    });
-                                }),
-                        )
-                        .child(
+                                    this.focus_active(window, cx);
+                                });
+                            },
+                            window,
+                            cx,
+                        ))
+                        .child(focus.primary(
                             Button::new("keep")
-                                .label("Keep")
+                                .label(keep_label)
                                 .primary()
                                 .on_click(move |_, window, cx| keep_btn(window, cx)),
-                        ),
-                )
+                            window,
+                            cx,
+                        )),
+                ))
         });
     }
 
@@ -2703,6 +2825,13 @@ impl Workspace {
             term.append("— shell stopped\n", cx);
         });
         self.close_terminal_by_id(id, window, cx);
+    }
+
+    /// Hidden crash for tests of crash recovery (`MALGEL_CRASH_TEST=1`).
+    fn debug_crash(&mut self, _: &DebugCrash, _: &mut Window, _: &mut Context<Self>) {
+        if crate::crash::crash_test_enabled() {
+            panic!("Developer: Crash (test recovery)");
+        }
     }
 
     fn clear_terminal(&mut self, _: &ClearTerminal, _: &mut Window, cx: &mut Context<Self>) {
@@ -5066,6 +5195,13 @@ impl Workspace {
             self.open_disk_conflict(doc, id, name, text, line_ending, stamp, window, cx);
             return;
         }
+        if self.overwrite_confirm.contains(&id)
+            && let Some(path) = doc.read(cx).path().cloned()
+            && path.exists()
+        {
+            self.confirm_overwrite_newer(doc, path, next, window, cx);
+            return;
+        }
         if let Some(path) = doc.read(cx).path().cloned() {
             let known = doc.read(cx).disk_stamp();
             let now = crate::session::DiskStamp::of(&path);
@@ -5097,6 +5233,117 @@ impl Workspace {
             }
             None => self.prompt_save_path(doc, next, window, cx),
         }
+    }
+
+    /// Save over a file the user knows is newer on disk (they kept their
+    /// version when it changed): say so and ask, as VS Code does. Esc or
+    /// Cancel writes nothing.
+    fn confirm_overwrite_newer(
+        &mut self,
+        doc: Entity<DocumentView>,
+        path: PathBuf,
+        next: Option<AfterConfirm>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let name = display_name(Some(&path));
+        let workspace = cx.weak_entity();
+        let focus = self.alert_focus.clone();
+        focus.focus_primary_soon(window, cx);
+        window.open_alert_dialog(cx, move |alert, window, cx| {
+            let overwrite = {
+                let workspace = workspace.clone();
+                let doc = doc.clone();
+                let path = path.clone();
+                let next = next.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    window.close_dialog(cx);
+                    _ = workspace.update(cx, |this, cx| {
+                        if this.write(&doc, &path, window, cx)
+                            && let Some(next) = next.clone()
+                        {
+                            this.run_after_confirm(next, window, cx);
+                        }
+                        this.focus_active(window, cx);
+                    });
+                }
+            };
+            let cancel = {
+                let workspace = workspace.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    window.close_dialog(cx);
+                    _ = workspace.update(cx, |this, cx| this.focus_active(window, cx));
+                }
+            };
+            let compare = {
+                let workspace = workspace.clone();
+                let path = path.clone();
+                let name = name.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    window.close_dialog(cx);
+                    let disk = std::fs::read_to_string(&path).unwrap_or_default();
+                    let label = format!("{name} (on disk)");
+                    _ = workspace.update(cx, |this, cx| {
+                        this.open_compare_buffer(disk, label, window, cx);
+                        this.focus_active(window, cx);
+                    });
+                }
+            };
+            let cancel_ok = cancel.clone();
+            let cancel_esc = cancel.clone();
+            alert
+                .title(format!("“{name}” on disk is newer"))
+                .description(
+                    "The file was changed by another program and you kept your version. \
+                     Overwrite the file on disk with it?",
+                )
+                .keyboard(true)
+                .on_cancel(move |_, window, cx| {
+                    cancel_esc(window, cx);
+                    true
+                })
+                // Enter = the focused default, Cancel: overwriting the newer
+                // file takes a deliberate choice.
+                .on_ok(move |_, window, cx| {
+                    cancel_ok(window, cx);
+                    true
+                })
+                .footer(
+                    focus.trap(
+                        DialogFooter::new()
+                            .justify_end()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(focus.secondary(
+                                0,
+                                Button::new("newer-compare").label("Compare").outline(),
+                                compare,
+                                window,
+                                cx,
+                            ))
+                            .child(focus.secondary(
+                                1,
+                                Button::new("newer-overwrite").label("Overwrite").outline(),
+                                overwrite,
+                                window,
+                                cx,
+                            ))
+                            .child(
+                                focus.primary(
+                                    Button::new("newer-cancel")
+                                        .label("Cancel")
+                                        .primary()
+                                        .on_click(move |_, window, cx| cancel(window, cx)),
+                                    window,
+                                    cx,
+                                ),
+                            ),
+                    ),
+                )
+        });
     }
 
     fn prompt_save_path(
@@ -5254,6 +5501,7 @@ impl Workspace {
     ) -> bool {
         match doc.update(cx, |doc, cx| doc.write_to(path, cx)) {
             Ok(()) => {
+                self.overwrite_confirm.remove(&doc.entity_id());
                 self.save_session(window, cx);
                 true
             }
@@ -8452,6 +8700,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(Self::kill_terminal))
             .on_action(cx.listener(Self::clear_terminal))
+            .on_action(cx.listener(Self::debug_crash))
             .on_action(cx.listener(Self::split_terminal))
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::reload_window))
@@ -10240,6 +10489,32 @@ fn tab_needs_reveal(revealed: Option<(usize, usize)>, now: (usize, usize)) -> bo
     revealed != Some(now)
 }
 
+/// The notice after restoring unsaved changes, naming the documents
+/// (`(id, name, changed on disk since)`); `None` when nothing came back.
+fn recovered_message(recovered: &[(EntityId, String, bool)]) -> Option<String> {
+    let names: Vec<String> = recovered
+        .iter()
+        .map(|(_, name, conflict)| {
+            if *conflict {
+                format!("“{name}” (changed on disk since)")
+            } else {
+                format!("“{name}”")
+            }
+        })
+        .collect();
+    match names.as_slice() {
+        [] => None,
+        [one] => Some(format!("Recovered unsaved changes to {one}.")),
+        [first, second] => Some(format!(
+            "Recovered unsaved changes to {first} and {second}."
+        )),
+        [first, second, rest @ ..] => Some(format!(
+            "Recovered unsaved changes to {first}, {second} and {} more.",
+            rest.len()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -10349,6 +10624,26 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_recovery_notice_names_the_documents() {
+        let id = |n: u64| EntityId::from(n);
+        assert_eq!(recovered_message(&[]), None);
+        assert_eq!(
+            recovered_message(&[(id(1), "a.md".into(), false)]).unwrap(),
+            "Recovered unsaved changes to “a.md”."
+        );
+        assert_eq!(
+            recovered_message(&[(id(1), "a.md".into(), false), (id(2), "b.md".into(), true)])
+                .unwrap(),
+            "Recovered unsaved changes to “a.md” and “b.md” (changed on disk since)."
+        );
+        let many: Vec<_> = (0..5).map(|n| (id(n), format!("f{n}.md"), false)).collect();
+        assert_eq!(
+            recovered_message(&many).unwrap(),
+            "Recovered unsaved changes to “f0.md”, “f1.md” and 3 more."
+        );
+    }
 
     #[test]
     fn a_pdf_keeps_the_keyboard_on_its_own_viewer() {
