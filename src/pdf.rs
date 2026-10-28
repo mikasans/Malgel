@@ -291,6 +291,9 @@ impl Writer<'_> {
             Node::Code(code) if diagram::is_mermaid(code.lang.as_deref()) => {
                 self.diagram(&code.value)
             }
+            Node::Code(code) if crate::math::is_typst_math_fence(code.lang.as_deref()) => {
+                display_math(&crate::math::typst_source(&code.value))
+            }
             Node::Code(code) => match code.lang.as_deref() {
                 Some(lang) if !lang.is_empty() => format!(
                     "#raw(block: true, lang: {}, {})",
@@ -584,7 +587,7 @@ fn math(tex: &str, display: bool) -> String {
         Ok(math) => format!("${math}$"),
         Err(_) => format!(
             "#text(fill: rgb(\"#d1242f\"), raw({}))",
-            string_literal(tex.trim())
+            string_literal(crate::math::shown_source(tex))
         ),
     }
 }

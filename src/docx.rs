@@ -318,6 +318,9 @@ impl Writer<'_> {
             Node::Code(code) if diagram::is_mermaid(code.lang.as_deref()) => {
                 self.diagram(&code.value)
             }
+            Node::Code(code) if math::is_typst_math_fence(code.lang.as_deref()) => {
+                vec![self.display_math(&math::typst_source(&code.value))]
+            }
             Node::Code(code) => vec![code_block(&code.value)],
             Node::Math(math) => vec![self.display_math(&math.value)],
             Node::Table(table) => vec![self.table(table, source)],
@@ -731,7 +734,7 @@ impl Writer<'_> {
                 Ok(png) => {
                     paragraph.add_run(Run::new().add_image(picture(png.png, png.width, png.height)))
                 }
-                Err(_) => paragraph.add_run(mono_run(tex.trim()).color("D1242F")),
+                Err(_) => paragraph.add_run(mono_run(math::shown_source(tex)).color("D1242F")),
             },
         )
     }

@@ -286,6 +286,14 @@ impl Exporter {
                     html,
                 });
             }
+            Node::Code(code) if math::is_typst_math_fence(code.lang.as_deref()) => {
+                let html = self.formula(&math::typst_source(&code.value), MathStyle::Display);
+                out.push(Replacement {
+                    range,
+                    block: true,
+                    html,
+                });
+            }
             Node::Code(_) | Node::InlineCode(_) | Node::Html(_) | Node::Yaml(_) => {}
             Node::Blockquote(_) => match parse_alert(text) {
                 Some((kind, body)) => {
@@ -409,19 +417,19 @@ impl Exporter {
                 let svg = embeddable_svg(&rendered, self.formulas, style);
                 format!(
                     "<{element} class=\"{class}\" role=\"img\" aria-label=\"{}\">{svg}</{element}>",
-                    escape(tex.trim())
+                    escape(math::shown_source(tex))
                 )
             }
             Err(error) => match style {
                 MathStyle::Inline => format!(
                     "<code class=\"math-error\" title=\"{}\">{}</code>",
                     escape(&error),
-                    escape(tex.trim())
+                    escape(math::shown_source(tex))
                 ),
                 MathStyle::Display => format!(
                     "<pre class=\"math-error\" title=\"{}\"><code>{}</code></pre>",
                     escape(&error),
-                    escape(tex.trim())
+                    escape(math::shown_source(tex))
                 ),
             },
         }
@@ -459,12 +467,12 @@ fn clipboard_formula(tex: &str, style: MathStyle, size: f32, element: &str) -> S
             format!(
                 "{open}<img src=\"{}\" alt=\"{}\" style=\"width:{:.1}px;height:{:.1}px{align}\">{close}",
                 data_url(&png.png, "png"),
-                escape(tex.trim()),
+                escape(math::shown_source(tex)),
                 png.width,
                 png.height
             )
         }
-        Err(_) => format!("<code>{}</code>", escape(tex.trim())),
+        Err(_) => format!("<code>{}</code>", escape(math::shown_source(tex))),
     }
 }
 
@@ -556,6 +564,21 @@ mod tests {
         assert!(html.contains("<h1>Hi &lt;there&gt;</h1>"));
         assert!(html.contains("<table>"));
         assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn a_typst_math_fence_exports_as_a_formula() {
+        let html = to_html("```typst-math\nsum_(i=1)^n i\n```\n", "t");
+        assert_eq!(
+            html.matches("class=\"math math-display\"").count(),
+            1,
+            "{html}"
+        );
+        assert!(html.contains("aria-label=\"sum_(i=1)^n i\""), "{html}");
+        assert!(!html.contains('\u{E000}'));
+        let pdf_markup =
+            crate::pdf::to_typst("```typ-math\nx^2\n```\n", "t", None, crate::pdf::Paper::A4).0;
+        assert!(pdf_markup.contains("$ x^2 $"), "{pdf_markup}");
     }
 
     #[test]

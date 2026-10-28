@@ -700,8 +700,8 @@ fn formula_node(tex: &str, style: MathStyle, source: &str) -> MarkdownNode {
             style,
         },
     )
-    .text(tex.trim().to_string())
-    .accessibility_label(format!("Formula: {}", tex.trim()))
+    .text(math::shown_source(tex).to_string())
+    .accessibility_label(format!("Formula: {}", math::shown_source(tex)))
     .markdown(source)
 }
 
@@ -839,7 +839,7 @@ fn math_source(tex: &str, color: Hsla, cx: &App) -> gpui_kit::Div {
     div()
         .font_family(cx.theme().mono_font_family.clone())
         .text_color(color)
-        .child(tex.trim().to_string())
+        .child(math::shown_source(tex).to_string())
 }
 
 /// Display math: `$$` fences, or a paragraph that is only `$$ … $$`.
@@ -863,6 +863,13 @@ impl MarkdownPlugin for BlockMathPlugin {
 
     fn parse(&self, node: &Node, cx: &MarkdownParseContext<'_>) -> Option<MarkdownNode> {
         match node {
+            Node::Code(code) if math::is_typst_math_fence(code.lang.as_deref()) => {
+                Some(formula_node(
+                    &math::typst_source(&code.value),
+                    MathStyle::Display,
+                    cx.node_source(node).unwrap_or(&code.value),
+                ))
+            }
             Node::Math(math) => Some(formula_node(
                 &math.value,
                 MathStyle::Display,

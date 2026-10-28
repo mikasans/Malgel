@@ -74,9 +74,36 @@ pub fn render_png(
     })
 }
 
+/// Marks a formula's source as Typst math rather than LaTeX. It rides in
+/// the source string, so caches, exports and error displays carry it
+/// without a second code path; [`shown_source`] drops it for display.
+const TYPST_MARK: &str = "\u{E000}typst\u{E000}";
+
+/// The fence languages that hold native Typst math: ```typst-math (and
+/// the short ```typ-math), drawn like a `$$` block.
+pub fn is_typst_math_fence(lang: Option<&str>) -> bool {
+    lang.map(str::trim).is_some_and(|lang| {
+        lang.eq_ignore_ascii_case("typst-math") || lang.eq_ignore_ascii_case("typ-math")
+    })
+}
+
+/// A formula source for Typst math `body`, for [`render`] and friends.
+pub fn typst_source(body: &str) -> String {
+    format!("{TYPST_MARK}{body}")
+}
+
+/// The formula as its author wrote it, for display and alt text.
+pub fn shown_source(tex: &str) -> &str {
+    tex.strip_prefix(TYPST_MARK).unwrap_or(tex).trim()
+}
+
 /// Translate the LaTeX formula `tex` to Typst math markup (without the
 /// surrounding dollars).
 pub fn to_typst(tex: &str) -> Result<String, String> {
+    // Typst math written as such (a ```typst-math fence) needs no converter.
+    if let Some(math) = tex.strip_prefix(TYPST_MARK) {
+        return Ok(math.trim().to_string());
+    }
     let tex = tex.trim();
     // The converter closes whatever is left open; say so instead of
     // quietly drawing something else.
@@ -688,6 +715,31 @@ mod tests {
             framed_in("#box(stroke: 0.5pt, inset: 3pt, $x$)", "#fff", 1.),
             "#box(stroke: 1pt + rgb(\"#fff\"), outset: -0.5pt, inset: 3pt, $x$)"
         );
+    }
+
+    #[test]
+    fn typst_math_fences_typeset_natively() {
+        assert!(is_typst_math_fence(Some("typst-math")));
+        assert!(is_typst_math_fence(Some("typ-math")));
+        assert!(!is_typst_math_fence(Some("typst")));
+        assert!(!is_typst_math_fence(None));
+        let source = typst_source("sum_(i=1)^n i = (n(n+1))/2 \"中文\"\n");
+        assert_eq!(shown_source(&source), "sum_(i=1)^n i = (n(n+1))/2 \"中文\"");
+        assert_eq!(
+            to_typst(&source).unwrap(),
+            "sum_(i=1)^n i = (n(n+1))/2 \"中文\""
+        );
+        assert!(render(&source, MathStyle::Display, 16., "#000000ff").is_ok());
+        // Errors name the Typst line, as for LaTeX.
+        let error = render(
+            &typst_source("a\nb +\nunknownthing"),
+            MathStyle::Display,
+            16.,
+            "#000000ff",
+        )
+        .unwrap_err();
+        assert!(error.contains("unknownthing"), "{error}");
+        assert!(error.contains("line 3"), "{error}");
     }
 
     #[test]
