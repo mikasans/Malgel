@@ -2694,7 +2694,13 @@ impl DocumentView {
         let selection = self.editor.read(cx).selected_range();
         match crate::math_delims::convert_edit(&text, selection.clone()) {
             Some(edit) => {
+                // The caret may be far from the part being read (the view
+                // was scrolled, not clicked): stay where the reader is
+                // instead of scrolling to the caret.
+                let offset = self.editor.read(cx).scroll_offset();
                 self.apply(edit, window, cx);
+                self.editor
+                    .update(cx, |editor, cx| editor.set_scroll_offset(offset, cx));
                 if Self::shows_editor(cx) {
                     self.editor
                         .update(cx, |editor, cx| editor.focus(window, cx));

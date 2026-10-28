@@ -778,6 +778,56 @@ wait_for 5 file_is "$WS/notes/brackets.md" "$BRACKETS_ORIG" \
 shot 20c-brackets-undone
 pass "Convert \\[ \\] / \\( \\) math to \$\$ / \$: the preview draws it, one Ctrl+Z restores the original"
 
+# 11c2. Convert keeps the view where the reader scrolled to: the caret is
+#       on line 1, the math is 300 lines down, and the editor must not jump
+#       back to the caret.
+# Lines of different lengths, so a jump changes the picture a lot.
+{ for i in $(seq 1 300); do printf "%$(( i % 37 + 1 ))s\n" "" | tr ' ' 'w'; done
+  printf 'MARK-BOTTOM\n\\[\nx^2\n\\]\n'; } >"$WS/notes/longmath.md"
+sleep 0.8
+xdotool key --clearmodifiers ctrl+p
+sleep 0.6
+xdotool type --delay 40 'longmath'
+sleep 0.6
+xdotool key --clearmodifiers Return
+sleep 1.2
+xdotool mousemove $((bwx + 450)) $((bwy + 400))
+xdotool click --repeat 60 --delay 10 5
+sleep 1.0
+shot 20d-longmath-scrolled
+palette_run 'Convert'
+shot 20e-longmath-converted
+grep -q '^\$\$$' "$WS/notes/longmath.md" && fail "Convert saved longmath.md by itself"
+# The hint bar above the editor goes away, so the text may move up by its
+# height: find the best vertical shift and require the lines to match there.
+same_view() { # same_view <a> <b> <x0> <y0> <w> <h>: exit 0 if b is a shifted a
+  python3 - "$ART_DIR/$1.png" "$ART_DIR/$2.png" "$3" "$4" "$5" "$6" <<'PY'
+from PIL import Image, ImageChops
+import sys
+a = Image.open(sys.argv[1]).convert("L")
+b = Image.open(sys.argv[2]).convert("L")
+x0, y0, w, h = map(int, sys.argv[3:7])
+ref = a.crop((x0, y0 + 80, x0 + w, y0 + h - 80))
+best = min(
+    sum(1 for v in ImageChops.difference(ref, b.crop((x0, y0 + 80 + d, x0 + w, y0 + h - 80 + d))).tobytes() if v > 40)
+    for d in range(-80, 81, 2)
+)
+print(best)
+sys.exit(0 if best < ref.size[0] * ref.size[1] * 0.02 else 1)
+PY
+}
+LONG_DIFF="$(same_view 20d-longmath-scrolled 20e-longmath-converted $((bwx + 330)) $((bwy + 110)) 260 560)" \
+  || fail "Convert scrolled the editor away from where it was (best match $LONG_DIFF px off)"
+pass "Convert keeps the editor scrolled where it was ($LONG_DIFF px changed)"
+# Put things back: undo (the tab is clean again), close it, and drop the
+# file so the Explorer rows the later steps click are where they were.
+xdotool key --clearmodifiers ctrl+z
+sleep 0.4
+xdotool key --clearmodifiers ctrl+w
+sleep 0.6
+rm -f "$WS/notes/longmath.md"
+sleep 1.0
+
 # 11b. A GBK file (no BOM, not UTF-8) opens as GBK, and saving an edit
 #      writes GBK again, not UTF-8 or replacement characters.
 printf '第一行\n' | iconv -t gbk >"$WS/notes/gbk.txt"
