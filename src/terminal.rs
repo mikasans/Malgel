@@ -1720,6 +1720,12 @@ impl Render for TerminalPanel {
         let has_selection = self.selection_span().is_some();
         let selection = self.selection_span();
         let selection_bg = cx.theme().selection;
+        let term_bg = cx.theme().background;
+        // Scrolled back into the history the cursor row may be out of view:
+        // the text field then waits at the grid's bottom left, still taking
+        // the keyboard (typing scrolls back to the cursor).
+        let sink_at_bottom = shell_running && !self.follow_tail;
+        let sink_composing = !self.input.read(cx).value().is_empty();
         // Unique ids per session so split panes do not share hit-testing / focus.
         let eid = cx.entity_id().as_u64();
         // Cell metrics for PTY sizing (mono font advance × line height).
@@ -1932,6 +1938,12 @@ impl Render for TerminalPanel {
                             cx.processor(move |this, range: Range<usize>, _window, _cx| {
                                 let start = range.start;
                                 let cursor = this.cursor_row();
+                                // While a shell runs, the keyboard's text field
+                                // sits on the cursor cell (see `key_sink`).
+                                let sink_row = (shell_running && this.follow_tail)
+                                    .then_some(cursor)
+                                    .flatten();
+                                let composing = !this.input.read(_cx).value().is_empty();
                                 let cursor_cell = this.cursor_cell(_window, _cx);
                                 let (cell_w, cursor_color) = (this.cell.0, colors.fg);
                                 let mut texts = this.row_texts(range.clone());
@@ -1989,6 +2001,18 @@ impl Render for TerminalPanel {
                                                 StyledText::new(text).with_highlights(highlights),
                                             )
                                             .children(frame)
+                                            .children(sink_row.and_then(|(cr, cc)| {
+                                                (cr == ix).then(|| {
+                                                    key_sink(
+                                                        &this.input,
+                                                        Some(cc),
+                                                        cell_w,
+                                                        line_h,
+                                                        composing,
+                                                        term_bg,
+                                                    )
+                                                })
+                                            }))
                                     })
                                     .collect::<Vec<_>>()
                             }),
@@ -1996,6 +2020,16 @@ impl Render for TerminalPanel {
                         .track_scroll(&self.scroll)
                         .size_full(),
                     )
+                    .when(sink_at_bottom, |grid| {
+                        grid.child(key_sink(
+                            &self.input,
+                            None,
+                            self.cell.0,
+                            line_h,
+                            sink_composing,
+                            term_bg,
+                        ))
+                    })
                     // Records the viewport size for PTY resize (cols × rows).
                     .child(
                         canvas(
@@ -2035,45 +2069,88 @@ impl Render for TerminalPanel {
                             )
                     }),
             )
-            // Input row: the command line before a shell runs, the IME
-            // composition line while one does (typed text is forwarded as it
-            // is committed, so it never lingers here).
-            .child(
-                h_flex()
-                    .id(ElementId::NamedInteger("terminal-input-row".into(), eid))
-                    .h(px(36.))
-                    .px_2()
-                    .gap_2()
-                    .items_center()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.focus_input(window, cx);
-                            window.prevent_default();
-                        }),
-                    )
-                    .when(!shell_running, |this| {
-                        this.child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("$"),
+            // Input row: the command line before a shell runs. Once one does,
+            // keys go through the field on the cursor cell instead and the
+            // grid takes the row's height.
+            .when(!shell_running, |panel| {
+                panel.child(
+                    h_flex()
+                        .id(ElementId::NamedInteger("terminal-input-row".into(), eid))
+                        .h(px(36.))
+                        .px_2()
+                        .gap_2()
+                        .items_center()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.focus_input(window, cx);
+                                window.prevent_default();
+                            }),
                         )
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            // Monospace like the output, so typed commands
-                            // line up with what the shell prints.
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .child(Input::new(&self.input).appearance(false)),
-                    ),
-            )
+                        .when(!shell_running, |this| {
+                            this.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("$"),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                // Monospace like the output, so typed commands
+                                // line up with what the shell prints.
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .child(Input::new(&self.input).appearance(false)),
+                        ),
+                )
+            })
     }
 }
+
+/// The text field that takes the keyboard while a shell runs, laid over
+/// the cursor cell (`col`; `None`: the grid's bottom left). Committed text
+/// goes to the program at once, so the field is empty but for an IME
+/// composition: empty, it is shifted left past its clip so its caret never
+/// shows next to the terminal's own cursor; composing, it draws the marked
+/// text (underlined, on the terminal background) right at the cursor, and
+/// the IME's candidate window opens there too.
+fn key_sink(
+    input: &Entity<InputState>,
+    col: Option<usize>,
+    cell_w: Pixels,
+    line_h: Pixels,
+    composing: bool,
+    bg: Hsla,
+) -> gpui_kit::Div {
+    let hide = if composing { px(0.) } else { KEY_SINK_HIDE };
+    let place = div()
+        .absolute()
+        .h(line_h)
+        .w(cell_w * KEY_SINK_CELLS)
+        .overflow_hidden();
+    let place = match col {
+        Some(col) => place.top_0().left(cell_w * col as f32),
+        None => place.bottom_0().left_0(),
+    };
+    place.when(composing, |d| d.bg(bg)).child(
+        div()
+            .absolute()
+            .top_0()
+            .left(-hide)
+            .h(line_h)
+            .w(cell_w * KEY_SINK_CELLS + hide)
+            .child(Input::new(input).appearance(false)),
+    )
+}
+
+/// How far the empty key sink sits left of its clip: past the caret's width.
+const KEY_SINK_HIDE: Pixels = px(6.);
+/// Width of the key sink, in cells: room for a composition.
+const KEY_SINK_CELLS: f32 = 40.;
 
 fn default_shell(load_config: bool) -> CommandBuilder {
     #[cfg(windows)]
