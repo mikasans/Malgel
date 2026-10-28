@@ -48,6 +48,14 @@ jobs:
             libglx-mesa0 libegl1 libegl-mesa0 libgles2 libgbm1 fonts-dejavu-core \
             python3-pil xclip
       - run: scripts/e2e/gui_smoke.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: gui-smoke
+          path: |
+            target/e2e-artifacts/*.png
+            target/e2e-artifacts/*.log
+          if-no-files-found: ignore
 
   # The integrated terminal under load (scripts/e2e/terminal_stress.sh):
   # floods, Ctrl+C/D/Z, vim/less/top, split, resize, kill, shell exit. A job of

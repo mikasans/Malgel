@@ -1521,11 +1521,22 @@ xdotool key --clearmodifiers ctrl+p
 sleep 0.5
 xdotool type --delay 30 'termpaste.md'
 xdotool key --clearmodifiers Return
-sleep 0.8
-xdotool key --clearmodifiers ctrl+v
+# Wait for the editor to be termpaste.md (the window title follows the
+# active document) rather than a fixed sleep: a debug build on CI is slow.
+wait_for 15 xdotool search --name '^termpaste\.md' >/dev/null \
+  || fail "Quick Open did not open termpaste.md"
 sleep 0.3
-xdotool key --clearmodifiers ctrl+s
-wait_for 5 grep -qx 'SMOKECOPY42' "$WS/notes/termpaste.md" \
+# Should the keys still race the editor's focus, select-all + paste
+# replaces whatever landed, so a retry cannot duplicate the text.
+for _ in 1 2 3; do
+  xdotool key --clearmodifiers ctrl+a
+  xdotool key --clearmodifiers ctrl+v
+  sleep 0.5
+  xdotool key --clearmodifiers ctrl+s
+  wait_for 4 grep -qx 'SMOKECOPY42' "$WS/notes/termpaste.md" && break
+done
+shot 49e-term-pasted
+grep -qx 'SMOKECOPY42' "$WS/notes/termpaste.md" \
   || fail "pasted terminal text not saved: '$(head -c 80 "$WS/notes/termpaste.md")'"
 pass "terminal: copied text pastes into the editor unchanged"
 

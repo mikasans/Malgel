@@ -1314,10 +1314,6 @@ mod tests {
         session.snapshot(10_000).lines.join("\n")
     }
 
-    fn rss_kib() -> u64 {
-        crate::perf::rss_kib().unwrap_or(0)
-    }
-
     #[test]
     fn exit_is_detected_and_output_kept() {
         let mut s = PtySession::spawn(sh("echo hello-pty; exit 3"), GridSize::DEFAULT).unwrap();
@@ -1341,10 +1337,11 @@ mod tests {
     fn flood_is_parsed_off_the_ui_thread_with_bounded_memory() {
         // ~39 MB of output; memory must not track the byte count.
         let lines = 5_000_000u64;
-        let before = rss_kib();
         let started = Instant::now();
         let mut s = PtySession::spawn(sh(&format!("seq 1 {lines}")), GridSize::DEFAULT).unwrap();
-        let mut peak = before;
+        // This session's own memory, not the process RSS that every test
+        // running in parallel shares: the grid's lines × columns × cells.
+        let mut peak_lines = 0usize;
         // Simulated UI: snapshot at ~60 fps, never more than one snapshot of
         // work per frame regardless of how much arrived.
         let mut worst_snapshot = Duration::ZERO;
@@ -1357,8 +1354,8 @@ mod tests {
                 worst_snapshot = worst_snapshot.max(t.elapsed());
                 assert!(rows.len() <= 60);
                 assert!(info.line_count <= SCROLLBACK_LINES + GridSize::DEFAULT.rows as usize);
+                peak_lines = peak_lines.max(info.line_count);
             }
-            peak = peak.max(rss_kib());
             assert!(started.elapsed() < Duration::from_secs(120), "flood hung");
             thread::sleep(Duration::from_millis(16));
         }
@@ -1367,16 +1364,21 @@ mod tests {
         let mb_s = bytes as f64 / 1e6 / secs;
         let text = screen_text(&s);
         assert!(text.contains(&lines.to_string()), "tail missing");
-        let grown_mb = peak.saturating_sub(before) as f64 / 1024.0;
+        let grid_mb = (peak_lines
+            * GridSize::DEFAULT.cols as usize
+            * std::mem::size_of::<alacritty_terminal::term::cell::Cell>())
+            as f64
+            / (1024.0 * 1024.0);
         eprintln!(
-            "flood: {:.1} MB in {secs:.2}s = {mb_s:.1} MB/s, rss +{grown_mb:.1} MiB, worst frame fetch {:.2}ms",
+            "flood: {:.1} MB in {secs:.2}s = {mb_s:.1} MB/s, grid peak {peak_lines} lines ≈ {grid_mb:.1} MiB, worst frame fetch {:.2}ms",
             bytes as f64 / 1e6,
             worst_snapshot.as_secs_f64() * 1000.0
         );
         assert!(bytes > 38_000_000);
-        // Scrollback is capped: tens of MB of output, a few MB of grid.
-        // (Process-wide RSS, shared with tests running in parallel: loose.)
-        assert!(grown_mb < 256.0, "rss grew {grown_mb:.1} MiB");
+        // Scrollback is capped: the grid stops at ~10k lines × 80 columns
+        // × 24-byte cells ≈ 23 MiB however much more output arrives.
+        assert!(peak_lines > 1_000, "the flood never filled the grid");
+        assert!(grid_mb < 32.0, "grid grew to {grid_mb:.1} MiB");
         // Debug builds are slow, and after SUSTAINED_FLOOD_AFTER a flood of
         // short lines is held to SUSTAINED_PARSE_LINES_PER_SEC (~3 MB/s of
         // `seq`); release does far better (see report).
