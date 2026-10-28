@@ -250,12 +250,26 @@ pub struct Snapshot {
     pub bracketed_paste: bool,
 }
 
+/// The cursor shape a program asked for with DECSCUSR (`CSI n SP q`):
+/// 0-2 block, 3-4 underline, 5-6 bar. Blinking is not drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Underline,
+    Beam,
+}
+
 /// Shape of the view without copying any text.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ViewInfo {
     pub line_count: usize,
     /// `(view row, column in chars)` when the program shows a cursor.
     pub cursor: Option<(usize, usize)>,
+    /// The cursor's grid column in cells (a wide char takes two), where a
+    /// bar or underline cursor is drawn.
+    pub cursor_cell: usize,
+    pub cursor_shape: CursorShape,
     pub alt_screen: bool,
     pub app_cursor: bool,
 }
@@ -1015,7 +1029,14 @@ fn view_info_term<T>(term: &Term<T>) -> ViewInfo {
     let mode = *term.mode();
     let grid = term.grid();
     let (top, bottom) = view_bounds(term);
-    let cursor = mode.contains(TermMode::SHOW_CURSOR).then(|| {
+    let style = term.cursor_style().shape;
+    let cursor_shape = match style {
+        ansi::CursorShape::Underline => CursorShape::Underline,
+        ansi::CursorShape::Beam => CursorShape::Beam,
+        _ => CursorShape::Block,
+    };
+    let shown = mode.contains(TermMode::SHOW_CURSOR) && style != ansi::CursorShape::Hidden;
+    let cursor = shown.then(|| {
         let Point { line, column } = grid.cursor.point;
         let row = (line.0 - top).max(0) as usize;
         // Column in chars: wide-char spacers are skipped in the row text.
@@ -1032,6 +1053,8 @@ fn view_info_term<T>(term: &Term<T>) -> ViewInfo {
     ViewInfo {
         line_count: (bottom - top + 1).max(0) as usize,
         cursor,
+        cursor_cell: grid.cursor.point.column.0,
+        cursor_shape,
         alt_screen: mode.contains(TermMode::ALT_SCREEN),
         app_cursor: mode.contains(TermMode::APP_CURSOR),
     }
@@ -1760,6 +1783,31 @@ pub fn fuzz_terminal(bytes: &[u8], cols: u16, rows: u16, picks: &[(usize, usize,
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    #[test]
+    fn decscusr_sets_the_cursor_shape_and_hiding_drops_it() {
+        let mut t = term(20, 4, 100);
+        assert_eq!(view_info_term(&t).cursor_shape, CursorShape::Block);
+        for (seq, shape) in [
+            ("\x1b[6 q", CursorShape::Beam),
+            ("\x1b[5 q", CursorShape::Beam),
+            ("\x1b[4 q", CursorShape::Underline),
+            ("\x1b[2 q", CursorShape::Block),
+            ("\x1b[0 q", CursorShape::Block),
+        ] {
+            feed(&mut t, seq);
+            assert_eq!(view_info_term(&t).cursor_shape, shape, "{seq:?}");
+        }
+        // The bar sits at the cell column: a wide char takes two cells.
+        feed(&mut t, "中a");
+        let info = view_info_term(&t);
+        assert_eq!(info.cursor, Some((0, 2)));
+        assert_eq!(info.cursor_cell, 3);
+        feed(&mut t, "\x1b[?25l");
+        assert_eq!(view_info_term(&t).cursor, None);
+        feed(&mut t, "\x1b[?25h");
+        assert!(view_info_term(&t).cursor.is_some());
+    }
 
     #[test]
     fn a_crossed_word_selection_at_a_wide_char_wrap_selects_nothing() {

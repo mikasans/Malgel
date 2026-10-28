@@ -60,7 +60,8 @@ use gpui_kit::{
 use portable_pty::CommandBuilder;
 
 use crate::term_session::{
-    CellColor, CellStyle, GridSize, PtySession, SelectKind, StyledRow, ViewInfo, encode_key,
+    CellColor, CellStyle, CursorShape, GridSize, PtySession, SelectKind, StyledRow, ViewInfo,
+    encode_key,
 };
 
 /// Transcript kept from a stopped / exited shell above the next one.
@@ -272,6 +273,15 @@ impl TerminalPanel {
             this.focus_input(window, cx);
         })
         .detach();
+        // The cursor is drawn filled only while the panel has focus in the
+        // active window: repaint when either changes.
+        let input_focus = input.focus_handle(cx);
+        cx.on_focus_in(&input_focus, window, |_, _, cx| cx.notify())
+            .detach();
+        cx.on_focus_out(&input_focus, window, |_, _, _, cx| cx.notify())
+            .detach();
+        cx.observe_window_activation(window, |_, _, cx| cx.notify())
+            .detach();
         if cx.has_global::<TerminalRegistry>() {
             let weak = cx.weak_entity();
             let registry = cx.global_mut::<TerminalRegistry>();
@@ -974,6 +984,19 @@ impl TerminalPanel {
         out
     }
 
+    /// The cursor's row in view coordinates, its cell column and how it is
+    /// drawn: the program's shape while the panel has focus in the active
+    /// window, an outline otherwise (VS Code's inactive cursor).
+    fn cursor_cell(&self, window: &Window, cx: &App) -> Option<(usize, usize, CursorLook)> {
+        let (row, _) = self.cursor_row()?;
+        let focused = window.is_window_active() && self.contains_focus(window, cx);
+        Some((
+            row,
+            self.view.cursor_cell,
+            cursor_look(self.view.cursor_shape, focused),
+        ))
+    }
+
     /// Cursor row in view coordinates.
     fn cursor_row(&self) -> Option<(usize, usize)> {
         let (row, col) = self.view.cursor?;
@@ -1104,6 +1127,26 @@ fn xterm_rgb(ix: u8, ansi: &[u32; 16]) -> (u8, u8, u8) {
     }
 }
 
+/// How the terminal cursor is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorLook {
+    /// An inverted cell (the text highlights do it).
+    Filled,
+    /// A cell-sized frame: the panel does not have focus.
+    Outline,
+    Underline,
+    Bar,
+}
+
+fn cursor_look(shape: CursorShape, focused: bool) -> CursorLook {
+    match (focused, shape) {
+        (false, _) => CursorLook::Outline,
+        (true, CursorShape::Block) => CursorLook::Filled,
+        (true, CursorShape::Underline) => CursorLook::Underline,
+        (true, CursorShape::Beam) => CursorLook::Bar,
+    }
+}
+
 /// Text and highlight runs for one row, with the cursor (char column) drawn
 /// as an inverted cell. Runs come back sorted and non-overlapping.
 fn row_highlights(
@@ -1168,6 +1211,24 @@ fn row_highlights(
         text.push('\u{00a0}');
     }
     (SharedString::from(text), highlights)
+}
+
+/// An outline, underline or bar cursor over cell `cell` of a row.
+fn cursor_frame(
+    look: CursorLook,
+    cell: usize,
+    cell_w: Pixels,
+    line_h: Pixels,
+    color: Hsla,
+) -> gpui_kit::Div {
+    let frame = div().absolute().left(cell_w * cell as f32).top_0();
+    match look {
+        CursorLook::Outline | CursorLook::Filled => {
+            frame.w(cell_w).h(line_h).border_1().border_color(color)
+        }
+        CursorLook::Underline => frame.top(line_h - px(2.)).w(cell_w).h(px(2.)).bg(color),
+        CursorLook::Bar => frame.w(px(2.)).h(line_h).bg(color),
+    }
 }
 
 /// `highlights` (sorted, disjoint) with `bg` painted under `span`: runs
@@ -1569,6 +1630,8 @@ impl Render for TerminalPanel {
                             cx.processor(move |this, range: Range<usize>, _window, _cx| {
                                 let start = range.start;
                                 let cursor = this.cursor_row();
+                                let cursor_cell = this.cursor_cell(_window, _cx);
+                                let (cell_w, cursor_color) = (this.cell.0, colors.fg);
                                 let mut texts = this.row_texts(range.clone());
                                 texts.resize(range.len(), StyledRow::default());
                                 texts
@@ -1576,10 +1639,27 @@ impl Render for TerminalPanel {
                                     .enumerate()
                                     .map(|(i, line)| {
                                         let ix = start + i;
-                                        let cursor_col = match cursor {
-                                            Some((cr, cc)) if cr == ix => Some(cc),
+                                        // Only a filled cursor is drawn by the
+                                        // text; the others are frames on top.
+                                        let cursor_col = match (cursor, cursor_cell) {
+                                            (Some((cr, cc)), Some((_, _, CursorLook::Filled)))
+                                                if cr == ix =>
+                                            {
+                                                Some(cc)
+                                            }
                                             _ => None,
                                         };
+                                        let frame = cursor_cell.and_then(|(cr, cell, look)| {
+                                            (cr == ix && look != CursorLook::Filled).then(|| {
+                                                cursor_frame(
+                                                    look,
+                                                    cell,
+                                                    cell_w,
+                                                    line_h,
+                                                    cursor_color,
+                                                )
+                                            })
+                                        });
                                         let selected =
                                             selection.and_then(|((r0, c0), (r1, c1))| {
                                                 (r0..=r1).contains(&ix).then(|| {
@@ -1599,12 +1679,14 @@ impl Render for TerminalPanel {
                                                 SharedString::from(format!("term-line-{eid}")),
                                                 ix as u64,
                                             ))
+                                            .relative()
                                             .h(line_h)
                                             .w_full()
                                             .whitespace_nowrap()
                                             .child(
                                                 StyledText::new(text).with_highlights(highlights),
                                             )
+                                            .children(frame)
                                     })
                                     .collect::<Vec<_>>()
                             }),
@@ -1800,6 +1882,21 @@ mod tests {
 
     fn ks(s: &str) -> Keystroke {
         Keystroke::parse(s).unwrap()
+    }
+
+    #[test]
+    fn the_cursor_is_an_outline_without_focus_and_the_programs_shape_with_it() {
+        use super::{CursorLook::*, cursor_look};
+        for shape in [
+            CursorShape::Block,
+            CursorShape::Underline,
+            CursorShape::Beam,
+        ] {
+            assert_eq!(cursor_look(shape, false), Outline);
+        }
+        assert_eq!(cursor_look(CursorShape::Block, true), Filled);
+        assert_eq!(cursor_look(CursorShape::Underline, true), Underline);
+        assert_eq!(cursor_look(CursorShape::Beam, true), Bar);
     }
 
     #[test]

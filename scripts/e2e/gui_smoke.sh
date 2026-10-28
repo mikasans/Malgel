@@ -1837,6 +1837,48 @@ wait_for 8 shells_at_most "$S0" || fail "Kill Terminal left $(shells) shells (ha
 xdotool key --clearmodifiers ctrl+grave
 sleep 0.5
 
+# 21f3. The terminal cursor: the program's DECSCUSR shape while the panel
+#       has focus (a bar after `CSI 6 SP q`), an outline once focus moves to
+#       the editor (VS Code's inactive cursor). Only the terminal's rows are
+#       compared: the status bar's memory/CPU readout changes on its own.
+xdotool key --clearmodifiers ctrl+grave
+sleep 1.0
+xdotool type --delay 20 "clear"
+xdotool key --clearmodifiers Return
+sleep 1.0
+shot 49g8-cursor-block
+read -r SW SH <<<"$(identify -format '%w %h' "$ART_DIR/49g8-cursor-block.png")"
+TERM_ROWS="${SW}x$(( SH * 22 / 100 ))+0+$(( SH * 62 / 100 ))"
+term_differs() { # term_differs <name> <against> <pixels>: shoot until the rows change
+  local saved=$SETTLE i
+  SETTLE=0.3
+  for ((i = 0; i < 20; i++)); do
+    shot "$1"
+    [[ "$(region_differ "$2" "$1" "$TERM_ROWS")" -gt "$3" ]] && break
+  done
+  SETTLE=$saved
+  [[ "$(region_differ "$2" "$1" "$TERM_ROWS")" -gt "$3" ]]
+}
+xdotool type --delay 20 "printf '\\033[6 q'; clear"
+xdotool key --clearmodifiers Return
+term_differs 49g9-cursor-bar 49g8-cursor-block 40 \
+  || fail "the terminal cursor did not turn into a bar after CSI 6 SP q"
+[[ "$(region_differ 49g8-cursor-block 49g9-cursor-bar "$TERM_ROWS")" -lt 3000 ]] \
+  || fail "more than the cursor changed after CSI 6 SP q"
+xdotool type --delay 20 "printf '\\033[0 q'; clear"
+xdotool key --clearmodifiers Return
+term_differs 49g10-cursor-block-again 49g9-cursor-bar 40 \
+  || fail "CSI 0 SP q did not bring the block cursor back"
+[[ "$(region_differ 49g8-cursor-block 49g10-cursor-block-again "$TERM_ROWS")" -lt 40 ]] \
+  || fail "CSI 0 SP q left a different cursor than the first block"
+# Focus to the editor: the block turns into an outline.
+xdotool mousemove $(( SW / 2 )) $(( SH / 4 )) click 1
+term_differs 49g11-cursor-unfocused 49g10-cursor-block-again 40 \
+  || fail "the terminal cursor looked the same with focus in the editor"
+pass "terminal: DECSCUSR draws a bar cursor, CSI 0 SP q the block, and it is an outline without focus"
+xdotool key --clearmodifiers ctrl+grave
+sleep 0.5
+
 # 21g. Settings: every switch is drawn inside the card (the default dialog
 #      width clipped them all), and filtering does not move the card.
 xdotool key --clearmodifiers ctrl+comma
