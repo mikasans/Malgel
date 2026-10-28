@@ -85,7 +85,8 @@ pub fn to_typst(tex: &str) -> Result<String, String> {
     }
     // The converter is written for well-formed input; formulas are converted
     // as they are typed, so never let a half-written one take down a thread.
-    let spaced = space_after_groups(tex);
+    let fenced = paired_bars(tex);
+    let spaced = space_after_groups(&fenced);
     let math = std::panic::catch_unwind(|| tylax::latex_to_typst(&spaced))
         .map_err(|_| "Couldn’t read the formula.".to_string())?;
     // It reports what it can't match as a comment and carries on.
@@ -106,6 +107,168 @@ pub fn to_typst(tex: &str) -> Result<String, String> {
         "#box(stroke: 0.5pt, inset: 3pt,",
     );
     Ok(text_strings(&math))
+}
+
+/// Balanced `|…|`, `\lvert…\rvert`, `\|…\|` and `\lVert…\rVert` become
+/// `\left|…\right|` (and `\left\|…\right\|`), which the converter turns into
+/// Typst's `abs(…)` / `norm(…)`. A bare `|` is a plain symbol in Typst, so
+/// `\min_t |\beta(t)|` set the first bar against `min`. Bars pair up in
+/// order within one group (braces, `\left…\right`); a group with an odd
+/// number of them (set-builder `|`) or sized ones (`\big|`) is left alone.
+fn paired_bars(tex: &str) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Bar {
+        Single,
+        Double,
+        Open(bool),
+        Close(bool),
+    }
+    // (byte range, kind) per group, groups on a stack.
+    let mut stack: Vec<Vec<(std::ops::Range<usize>, Bar)>> = vec![Vec::new()];
+    let mut edits: Vec<(std::ops::Range<usize>, &'static str)> = Vec::new();
+    let mut sized = vec![false];
+    let close = |group: Vec<(std::ops::Range<usize>, Bar)>,
+                 sized: bool,
+                 edits: &mut Vec<(std::ops::Range<usize>, &'static str)>| {
+        if sized {
+            return;
+        }
+        for (kind, open, shut) in [
+            (Bar::Single, r"\left|", r"\right|"),
+            (Bar::Double, r"\left\|", r"\right\|"),
+        ] {
+            let bars: Vec<_> = group.iter().filter(|(_, k)| *k == kind).collect();
+            if bars.len() % 2 == 0 {
+                for (n, (range, _)) in bars.into_iter().enumerate() {
+                    edits.push((range.clone(), if n % 2 == 0 { open } else { shut }));
+                }
+            }
+        }
+        for double in [false, true] {
+            let (open, shut) = if double {
+                (r"\left\|", r"\right\|")
+            } else {
+                (r"\left|", r"\right|")
+            };
+            let mut pending: Vec<std::ops::Range<usize>> = Vec::new();
+            let mut pairs = Vec::new();
+            let mut ok = true;
+            for (range, kind) in &group {
+                match kind {
+                    Bar::Open(d) if *d == double => pending.push(range.clone()),
+                    Bar::Close(d) if *d == double => match pending.pop() {
+                        Some(start) => pairs.push((start, range.clone())),
+                        None => ok = false,
+                    },
+                    _ => {}
+                }
+            }
+            if ok && pending.is_empty() {
+                for (a, b) in pairs {
+                    edits.push((a, open));
+                    edits.push((b, shut));
+                }
+            }
+        }
+    };
+    let bytes = tex.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                let start = i;
+                i += 1;
+                let name_end = bytes[i..]
+                    .iter()
+                    .position(|b| !b.is_ascii_alphabetic())
+                    .map_or(bytes.len(), |n| i + n);
+                if name_end == i {
+                    // `\|`, `\{`, `\\`…: one escaped char.
+                    if i < bytes.len() && bytes[i] == b'|' {
+                        stack.last_mut().unwrap().push((start..i + 1, Bar::Double));
+                    }
+                    i += tex[i..].chars().next().map_or(1, char::len_utf8);
+                    continue;
+                }
+                let name = &tex[i..name_end];
+                i = name_end;
+                match name {
+                    "lvert" => stack.last_mut().unwrap().push((start..i, Bar::Open(false))),
+                    "rvert" => stack
+                        .last_mut()
+                        .unwrap()
+                        .push((start..i, Bar::Close(false))),
+                    "lVert" => stack.last_mut().unwrap().push((start..i, Bar::Open(true))),
+                    "rVert" => stack.last_mut().unwrap().push((start..i, Bar::Close(true))),
+                    "left" | "right" | "middle" | "big" | "Big" | "bigg" | "Bigg" | "bigl"
+                    | "bigr" | "Bigl" | "Bigr" | "biggl" | "biggr" | "Biggl" | "Biggr" => {
+                        // Skip the delimiter that follows, whatever it is.
+                        while i < bytes.len() && bytes[i] == b' ' {
+                            i += 1;
+                        }
+                        let delim_bar = bytes.get(i) == Some(&b'|')
+                            || (bytes.get(i) == Some(&b'\\') && bytes.get(i + 1) == Some(&b'|'));
+                        if delim_bar && !matches!(name, "left" | "right") {
+                            *sized.last_mut().unwrap() = true;
+                        }
+                        if bytes.get(i) == Some(&b'\\') {
+                            i += 1;
+                            let n = bytes[i..]
+                                .iter()
+                                .position(|b| !b.is_ascii_alphabetic())
+                                .unwrap_or(bytes.len() - i);
+                            i += n.max(1).min(bytes.len() - i);
+                        } else if i < bytes.len() {
+                            i += tex[i..].chars().next().map_or(1, char::len_utf8);
+                        }
+                        if name == "left" {
+                            stack.push(Vec::new());
+                            sized.push(false);
+                        } else if name == "right" && stack.len() > 1 {
+                            let group = stack.pop().unwrap();
+                            let was = sized.pop().unwrap();
+                            close(group, was, &mut edits);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            b'{' => {
+                stack.push(Vec::new());
+                sized.push(false);
+            }
+            b'}' if stack.len() > 1 => {
+                let group = stack.pop().unwrap();
+                let was = sized.pop().unwrap();
+                close(group, was, &mut edits);
+            }
+            b'|' => stack.last_mut().unwrap().push((i..i + 1, Bar::Single)),
+            _ => {}
+        }
+        i += 1;
+    }
+    // Unclosed groups (a half-typed formula): leave their bars alone.
+    let outer = stack.swap_remove(0);
+    if stack.is_empty() {
+        close(outer, sized[0], &mut edits);
+    }
+    if edits.is_empty() {
+        return tex.to_string();
+    }
+    edits.sort_by_key(|(range, _)| range.start);
+    let mut out = String::with_capacity(tex.len() + edits.len() * 6);
+    let mut at = 0;
+    for (range, text) in edits {
+        out.push_str(&tex[at..range.start]);
+        out.push_str(text);
+        // `\left|x` must not glue to a following letter: `\right|` before
+        // `x` is fine, but `\left\|` + `v` reads as a command otherwise.
+        out.push(' ');
+        at = range.end;
+    }
+    out.push_str(&tex[at..]);
+    out
 }
 
 /// A space between a closing brace and the command after it: the converter
@@ -525,6 +688,28 @@ mod tests {
             framed_in("#box(stroke: 0.5pt, inset: 3pt, $x$)", "#fff", 1.),
             "#box(stroke: 1pt + rgb(\"#fff\"), outset: -0.5pt, inset: 3pt, $x$)"
         );
+    }
+
+    #[test]
+    fn balanced_bars_become_abs_and_norm() {
+        for (tex, typst) in [
+            (r"\max \min_t |\beta(t)|", "max min_(t) abs(beta (t))"),
+            (r"|a| + |b|", "abs(a) + abs(b)"),
+            (r"|x|^2", "abs(x)^(2)"),
+            (r"\frac{|a|}{|b|}", "frac(abs(a), abs(b))"),
+            (r"\lvert x \rvert", "abs(x)"),
+            (r"\|v\|", "norm(v)"),
+            (r"\| x \|_2", "norm(x)_(2)"),
+            (r"\lVert x\rVert", "norm(x)"),
+            (r"\left| x \right|", "abs(x)"),
+            // A lone set-builder bar stays a bar; sized bars are untouched.
+            (r"\{ x | x > 0 \}", "{ x | x > 0 }"),
+        ] {
+            assert_eq!(to_typst(tex).unwrap(), typst, "{tex}");
+            assert!(checked_typst(tex, MathStyle::Display).is_ok(), "{tex}");
+        }
+        assert_eq!(paired_bars(r"\big| x \big|"), r"\big| x \big|");
+        assert_eq!(paired_bars(r"\text{a|b} |c"), r"\text{a|b} |c");
     }
 
     #[test]
