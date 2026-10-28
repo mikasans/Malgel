@@ -38,7 +38,8 @@ use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
     grid::Dimensions,
-    index::{Column, Line, Point},
+    index::{Column, Line, Point, Side},
+    selection::{Selection, SelectionType},
     sync::FairMutex,
     term::{Config, TermMode, cell::Flags},
     vte::ansi::{self, Color, Handler as _, NamedColor},
@@ -379,10 +380,7 @@ impl PtySession {
             .map_err(|err| format!("Couldn’t write to shell: {err}"))?;
 
         let input = Arc::new(InputQueue::default());
-        let config = Config {
-            scrolling_history: SCROLLBACK_LINES,
-            ..Config::default()
-        };
+        let config = term_config(SCROLLBACK_LINES);
         let term = Term::new(
             config,
             &size,
@@ -524,6 +522,51 @@ impl PtySession {
 
     pub fn mode(&self) -> TermMode {
         *self.ui_lock().mode()
+    }
+
+    /// Start a selection at view `row`; `col` is a char boundary for
+    /// [`SelectKind::Cells`], the char under the pointer otherwise. The
+    /// selection lives in the emulator, anchored to buffer lines: output
+    /// that scrolls or trims history moves it with its text.
+    pub fn select_start(&self, kind: SelectKind, row: usize, col: usize) {
+        let mut term = self.ui_lock();
+        term_select_start(&mut term, kind, row, col);
+        drop(term);
+        self.shared.dirty.store(true, Ordering::Release);
+    }
+
+    /// Move the selection's head (a drag) to view `row` / `col`.
+    pub fn select_update(&self, row: usize, col: usize) {
+        let mut term = self.ui_lock();
+        term_select_update(&mut term, row, col);
+        drop(term);
+        self.shared.dirty.store(true, Ordering::Release);
+    }
+
+    /// Select everything in the view.
+    pub fn select_all(&self) {
+        let mut term = self.ui_lock();
+        term_select_all(&mut term);
+        drop(term);
+        self.shared.dirty.store(true, Ordering::Release);
+    }
+
+    pub fn clear_selection(&self) {
+        let mut term = self.ui_lock();
+        term.selection = None;
+        drop(term);
+        self.shared.dirty.store(true, Ordering::Release);
+    }
+
+    /// The selected text, soft-wrapped rows joined, trailing blanks trimmed.
+    pub fn selection_text(&self) -> Option<String> {
+        term_selection_text(&self.ui_lock())
+    }
+
+    /// The selection in view coordinates: start (row, char) inclusive to
+    /// end (row, char) exclusive, `None` when nothing is selected.
+    pub fn selection_view(&self) -> Option<((usize, usize), (usize, usize))> {
+        term_selection_view(&self.ui_lock())
     }
 
     /// Visible rows: the alternate screen as-is, or for the normal screen the
@@ -970,6 +1013,150 @@ fn snapshot_term<T>(term: &Term<T>, max_lines: usize) -> Snapshot {
     }
 }
 
+fn term_config(scrollback: usize) -> Config {
+    Config {
+        scrolling_history: scrollback,
+        ..Config::default()
+    }
+}
+
+/// How a selection grows, as in VS Code: a drag selects cells, a
+/// double-click words, a triple-click whole lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectKind {
+    Cells,
+    Word,
+    Line,
+}
+
+impl SelectKind {
+    /// Drag, double-click, triple-click (and beyond).
+    pub fn from_click_count(count: usize) -> SelectKind {
+        match count {
+            0 | 1 => SelectKind::Cells,
+            2 => SelectKind::Word,
+            _ => SelectKind::Line,
+        }
+    }
+}
+
+fn is_spacer(flags: Flags) -> bool {
+    flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+}
+
+/// Grid column of char index `ch` on `line` (view text skips wide-char
+/// spacers); `columns()` when past the end.
+fn grid_col_of_char<T>(term: &Term<T>, line: Line, ch: usize) -> usize {
+    let grid = term.grid();
+    let row = &grid[line];
+    let mut seen = 0;
+    for col in 0..grid.columns() {
+        if is_spacer(row[Column(col)].flags) {
+            continue;
+        }
+        if seen == ch {
+            return col;
+        }
+        seen += 1;
+    }
+    grid.columns()
+}
+
+/// Char index (in the view text) of grid column `col` on `line`.
+fn char_of_grid_col<T>(term: &Term<T>, line: Line, col: usize) -> usize {
+    let grid = term.grid();
+    let row = &grid[line];
+    (0..col.min(grid.columns()))
+        .filter(|&c| !is_spacer(row[Column(c)].flags))
+        .count()
+}
+
+/// Grid point and side for a view position (see [`PtySession::select_start`]).
+fn view_point<T>(term: &Term<T>, kind: SelectKind, row: usize, col: usize) -> (Point, Side) {
+    let (top, bottom) = view_bounds(term);
+    let line = Line((top + row.min(i32::MAX as usize) as i32).min(bottom.max(top)));
+    let columns = term.grid().columns();
+    let gcol = grid_col_of_char(term, line, col);
+    match kind {
+        SelectKind::Cells if gcol >= columns => {
+            (Point::new(line, Column(columns - 1)), Side::Right)
+        }
+        SelectKind::Cells => (Point::new(line, Column(gcol)), Side::Left),
+        _ => (Point::new(line, Column(gcol.min(columns - 1))), Side::Left),
+    }
+}
+
+fn term_select_start<T>(term: &mut Term<T>, kind: SelectKind, row: usize, col: usize) {
+    let (point, side) = view_point(term, kind, row, col);
+    let ty = match kind {
+        SelectKind::Cells => SelectionType::Simple,
+        SelectKind::Word => SelectionType::Semantic,
+        SelectKind::Line => SelectionType::Lines,
+    };
+    term.selection = Some(Selection::new(ty, point, side));
+}
+
+fn term_select_update<T>(term: &mut Term<T>, row: usize, col: usize) {
+    let Some(ty) = term.selection.as_ref().map(|s| s.ty) else {
+        return;
+    };
+    let kind = match ty {
+        SelectionType::Semantic => SelectKind::Word,
+        SelectionType::Lines => SelectKind::Line,
+        _ => SelectKind::Cells,
+    };
+    let (point, side) = view_point(term, kind, row, col);
+    if let Some(selection) = term.selection.as_mut() {
+        selection.update(point, side);
+    }
+}
+
+fn term_select_all<T>(term: &mut Term<T>) {
+    let (top, bottom) = view_bounds(term);
+    let last = term.grid().columns() - 1;
+    let mut selection = Selection::new(
+        SelectionType::Simple,
+        Point::new(Line(top), Column(0)),
+        Side::Left,
+    );
+    selection.update(Point::new(Line(bottom), Column(last)), Side::Right);
+    term.selection = Some(selection);
+}
+
+fn term_selection_text<T>(term: &Term<T>) -> Option<String> {
+    let text = term.selection_to_string()?;
+    // A triple-click copies the line, not the line and Enter (pasting it
+    // back into a shell must not run it).
+    let text = text.strip_suffix('\n').unwrap_or(&text);
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn term_selection_view<T>(term: &Term<T>) -> Option<((usize, usize), (usize, usize))> {
+    let range = term.selection.as_ref()?.to_range(term)?;
+    let (top, bottom) = view_bounds(term);
+    if range.end.line < Line(top) || range.start.line > Line(bottom) {
+        return None;
+    }
+    let (start, start_col) = if range.start.line < Line(top) {
+        (Line(top), 0)
+    } else {
+        (
+            range.start.line,
+            char_of_grid_col(term, range.start.line, range.start.column.0),
+        )
+    };
+    let (end, end_col) = if range.end.line > Line(bottom) {
+        (Line(bottom), usize::MAX)
+    } else {
+        (
+            range.end.line,
+            char_of_grid_col(term, range.end.line, range.end.column.0) + 1,
+        )
+    };
+    let row = |line: Line| (line.0 - top) as usize;
+    Some(((row(start), start_col), (row(end), end_col)))
+}
+
 /// Bytes a key press sends to a program in raw (alternate-screen) mode, as
 /// xterm encodes them. `key` is GPUI's key name, `key_char` the typed text.
 pub fn encode_key(
@@ -1307,6 +1494,26 @@ mod tests {
     }
 
     #[test]
+    fn paste_reaches_the_program_bracketed_once_it_enables_2004() {
+        let out = std::env::temp_dir().join(format!("malgel-bp-{}", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        // The program asks for bracketed paste, then records raw input.
+        let script = format!(
+            "stty raw -echo; printf '\\033[?2004hready\\n'; head -c 15 > '{}'",
+            out.display()
+        );
+        let mut s = PtySession::spawn(sh(&script), GridSize::DEFAULT).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || s
+            .mode()
+            .contains(TermMode::BRACKETED_PASTE)));
+        s.paste("a\nb");
+        assert!(wait_until(Duration::from_secs(5), || s.poll_exited()));
+        let got = std::fs::read(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(got, b"\x1b[200~a\rb\x1b[201~".to_vec());
+    }
+
+    #[test]
     fn rows_are_fetched_on_demand_and_clamped() {
         let mut s = PtySession::spawn(sh("seq 1 50; sleep 2"), GridSize::DEFAULT).unwrap();
         assert!(wait_until(Duration::from_secs(5), || s
@@ -1407,5 +1614,178 @@ mod tests {
             encode_key("right", None, true, false, false, false),
             Some(b"\x1b[1;5C".to_vec())
         );
+    }
+}
+
+/// Selection on a headless emulator: no PTY, bytes fed straight to the
+/// parser, so scrolling and history trimming are exact.
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+
+    fn term(cols: u16, rows: u16, scrollback: usize) -> Term<VoidListener> {
+        Term::new(
+            term_config(scrollback),
+            &GridSize { cols, rows },
+            VoidListener,
+        )
+    }
+
+    fn feed(term: &mut Term<VoidListener>, text: &str) {
+        let mut processor: ansi::Processor = ansi::Processor::new();
+        processor.advance(term, text.replace('\n', "\r\n").as_bytes());
+    }
+
+    fn view_rows(term: &Term<VoidListener>) -> Vec<String> {
+        let count = view_info_term(term).line_count;
+        rows_term(term, 0..count)
+    }
+
+    fn row_of(term: &Term<VoidListener>, needle: &str) -> usize {
+        view_rows(term)
+            .iter()
+            .position(|r| r == needle)
+            .unwrap_or_else(|| panic!("{needle} not in view"))
+    }
+
+    #[test]
+    fn drag_selects_cells_between_boundaries() {
+        let mut t = term(40, 5, 100);
+        feed(&mut t, "hello brave world\nsecond line\n");
+        term_select_start(&mut t, SelectKind::Cells, 0, 6);
+        term_select_update(&mut t, 0, 11);
+        assert_eq!(term_selection_text(&t).as_deref(), Some("brave"));
+        assert_eq!(term_selection_view(&t), Some(((0, 6), (0, 11))));
+        // Across rows, backwards: anchor after "second", head at "brave".
+        term_select_start(&mut t, SelectKind::Cells, 1, 6);
+        term_select_update(&mut t, 0, 6);
+        assert_eq!(
+            term_selection_text(&t).as_deref(),
+            Some("brave world\nsecond")
+        );
+        // A click without a drag selects nothing.
+        term_select_start(&mut t, SelectKind::Cells, 0, 3);
+        assert_eq!(term_selection_text(&t), None);
+        assert_eq!(term_selection_view(&t), None);
+    }
+
+    #[test]
+    fn double_click_selects_a_word_triple_click_a_line() {
+        let mut t = term(40, 5, 100);
+        feed(&mut t, "ls -la /tmp/some_dir file.txt\n");
+        term_select_start(&mut t, SelectKind::Word, 0, 14);
+        assert_eq!(term_selection_text(&t).as_deref(), Some("/tmp/some_dir"));
+        // Dragging after a double-click grows by words.
+        term_select_update(&mut t, 0, 24);
+        assert_eq!(
+            term_selection_text(&t).as_deref(),
+            Some("/tmp/some_dir file.txt")
+        );
+        term_select_start(&mut t, SelectKind::Line, 0, 3);
+        assert_eq!(
+            term_selection_text(&t).as_deref(),
+            Some("ls -la /tmp/some_dir file.txt")
+        );
+        assert_eq!(SelectKind::from_click_count(1), SelectKind::Cells);
+        assert_eq!(SelectKind::from_click_count(2), SelectKind::Word);
+        assert_eq!(SelectKind::from_click_count(3), SelectKind::Line);
+    }
+
+    #[test]
+    fn wide_chars_map_view_columns_to_cells() {
+        let mut t = term(40, 5, 100);
+        feed(&mut t, "中文 ok\n");
+        // View chars: 中 文 ' ' o k — the grid has spacer cells between.
+        term_select_start(&mut t, SelectKind::Cells, 0, 1);
+        term_select_update(&mut t, 0, 5);
+        assert_eq!(term_selection_text(&t).as_deref(), Some("文 ok"));
+        assert_eq!(term_selection_view(&t), Some(((0, 1), (0, 5))));
+    }
+
+    #[test]
+    fn selection_follows_its_text_when_output_scrolls() {
+        let mut t = term(20, 5, 1_000);
+        let lines: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        feed(&mut t, &lines);
+        let row = row_of(&t, "line 12");
+        term_select_start(&mut t, SelectKind::Line, row, 0);
+        assert_eq!(term_selection_text(&t).as_deref(), Some("line 12"));
+        // More output pushes the screen into history; the selection stays
+        // on "line 12", not on whatever is at its old row.
+        let more: String = (30..60).map(|i| format!("line {i}\n")).collect();
+        feed(&mut t, &more);
+        assert_eq!(term_selection_text(&t).as_deref(), Some("line 12"));
+        let ((r0, _), (r1, _)) = term_selection_view(&t).unwrap();
+        assert_eq!(r0, row_of(&t, "line 12"));
+        assert_eq!(r1, r0);
+    }
+
+    #[test]
+    fn selection_survives_history_trimming_and_drops_with_its_lines() {
+        // 100 lines of history: older output is dropped first.
+        let mut t = term(20, 5, 100);
+        let lines: String = (0..200).map(|i| format!("row {i}\n")).collect();
+        feed(&mut t, &lines);
+        let count = view_info_term(&t).line_count;
+        assert!(count <= 100 + 5, "view {count} rows");
+        assert!(!view_rows(&t).iter().any(|r| r == "row 50"));
+        let row = row_of(&t, "row 150");
+        term_select_start(&mut t, SelectKind::Line, row, 0);
+        // 30 more lines trim 30 from the top: the selected row's index
+        // moves up by 30, its text does not change.
+        let more: String = (200..230).map(|i| format!("row {i}\n")).collect();
+        feed(&mut t, &more);
+        assert_eq!(term_selection_text(&t).as_deref(), Some("row 150"));
+        let ((r0, _), _) = term_selection_view(&t).unwrap();
+        assert_eq!(r0, row_of(&t, "row 150"));
+        assert_eq!(r0 + 30, row);
+        // Once its line is trimmed away the selection is gone, not moved
+        // onto other text.
+        let flood: String = (230..400).map(|i| format!("row {i}\n")).collect();
+        feed(&mut t, &flood);
+        assert_eq!(term_selection_text(&t), None);
+        assert_eq!(term_selection_view(&t), None);
+    }
+
+    #[test]
+    fn partly_trimmed_selection_keeps_the_part_still_kept() {
+        let mut t = term(20, 5, 100);
+        let lines: String = (0..150).map(|i| format!("r{i}\n")).collect();
+        feed(&mut t, &lines);
+        let a = row_of(&t, "r60");
+        let b = row_of(&t, "r70");
+        term_select_start(&mut t, SelectKind::Line, a, 0);
+        term_select_update(&mut t, b, 0);
+        // Trim up to r64: r60..r64 leave, the rest stays selected.
+        let top: usize = view_rows(&t)[0][1..].parse().unwrap();
+        let more: String = (150..150 + (65 - top)).map(|i| format!("r{i}\n")).collect();
+        feed(&mut t, &more);
+        let text = term_selection_text(&t).unwrap();
+        assert!(text.starts_with("r65"), "{text}");
+        assert!(text.ends_with("r70"), "{text}");
+        assert_eq!(term_selection_view(&t).unwrap().0, (0, 0));
+    }
+
+    #[test]
+    fn select_all_covers_the_view() {
+        let mut t = term(20, 5, 100);
+        feed(&mut t, "a\nb\nc");
+        term_select_all(&mut t);
+        assert_eq!(term_selection_text(&t).as_deref(), Some("a\nb\nc"));
+    }
+
+    #[test]
+    fn bracketed_paste_follows_mode_2004() {
+        let mut t = term(20, 5, 100);
+        assert!(!t.mode().contains(TermMode::BRACKETED_PASTE));
+        feed(&mut t, "\x1b[?2004h");
+        assert!(t.mode().contains(TermMode::BRACKETED_PASTE));
+        assert_eq!(
+            paste_payload("echo 1\necho 2\n", true),
+            b"\x1b[200~echo 1\recho 2\r\x1b[201~".to_vec()
+        );
+        feed(&mut t, "\x1b[?2004l");
+        assert!(!t.mode().contains(TermMode::BRACKETED_PASTE));
     }
 }

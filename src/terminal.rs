@@ -50,6 +50,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants as _},
         h_flex,
         input::{Input, InputEvent, InputState},
+        menu::{ContextMenuExt as _, PopupMenuItem},
         v_flex,
     },
     div,
@@ -59,7 +60,7 @@ use gpui_kit::{
 use portable_pty::CommandBuilder;
 
 use crate::term_session::{
-    CellColor, CellStyle, GridSize, PtySession, StyledRow, ViewInfo, encode_key,
+    CellColor, CellStyle, GridSize, PtySession, SelectKind, StyledRow, ViewInfo, encode_key,
 };
 
 /// Transcript kept from a stopped / exited shell above the next one.
@@ -172,10 +173,21 @@ pub struct TerminalPanel {
     _pump: Option<gpui_kit::Task<()>>,
     /// Stick output viewport to the end while the user has not scrolled up.
     follow_tail: bool,
-    /// Output selection, anchor and head as (row, column) in view rows.
-    selection: Option<(Cell2, Cell2)>,
-    /// The left button went down in the output and has not come up yet.
-    selecting: bool,
+    /// Selection in the transcript of earlier shells (the prelude, which
+    /// never scrolls under a running shell): anchor, head and how it grows.
+    /// A selection in the live session is kept by the emulator instead
+    /// ([`PtySession::select_start`]), anchored to buffer lines.
+    selection: Option<(Cell2, Cell2, SelectKind)>,
+    /// The left button went down in the output and has not come up yet,
+    /// and where that selection lives.
+    selecting: Option<SelTarget>,
+}
+
+/// Which buffer a drag selects in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelTarget {
+    Prelude,
+    Session,
 }
 
 /// A character cell position in view rows: (row, column).
@@ -253,7 +265,7 @@ impl TerminalPanel {
             _pump: None,
             follow_tail: true,
             selection: None,
-            selecting: false,
+            selecting: None,
         }
     }
 
@@ -326,6 +338,9 @@ impl TerminalPanel {
         self.prelude.clear();
         self.selection = None;
         if let Some(session) = &self.session {
+            session.clear_selection();
+        }
+        if let Some(session) = &self.session {
             session.clear();
             self.view = session.view_info();
         } else {
@@ -336,17 +351,46 @@ impl TerminalPanel {
         cx.notify();
     }
 
-    /// Ordered selection bounds, `None` when nothing (or an empty span) is
-    /// selected.
-    fn selection_span(&self) -> Option<(Cell2, Cell2)> {
-        let (a, b) = self.selection?;
-        let (start, end) = if a <= b { (a, b) } else { (b, a) };
-        (start != end).then_some((start, end))
+    /// Rows above the live session's first row in view coordinates.
+    fn session_offset(&self) -> usize {
+        if self.view.alt_screen {
+            0
+        } else {
+            self.prelude.len()
+        }
     }
 
-    /// The selected text: whole rows between the ends, trailing blanks
-    /// trimmed per row (VS Code).
+    /// Ordered selection bounds in view rows (end column exclusive), `None`
+    /// when nothing (or an empty span) is selected.
+    fn selection_span(&self) -> Option<(Cell2, Cell2)> {
+        if let Some((a, b, kind)) = self.selection {
+            let texts = |row: usize| {
+                self.row_texts(row..row + 1)
+                    .pop()
+                    .map(|r| r.text)
+                    .unwrap_or_default()
+            };
+            let (start, end) = expand_selection(a, b, kind, texts);
+            return (start != end).then_some((start, end));
+        }
+        let ((r0, c0), (r1, c1)) = self.session.as_ref()?.selection_view()?;
+        let off = self.session_offset();
+        Some(((r0 + off, c0), (r1 + off, c1)))
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        if let Some(session) = &self.session {
+            session.clear_selection();
+        }
+    }
+
+    /// The selected text (VS Code): rows between the ends, trailing blanks
+    /// trimmed per row; in the live session soft-wrapped rows join up.
     fn selected_text(&self) -> Option<String> {
+        if self.selection.is_none() {
+            return self.session.as_ref()?.selection_text();
+        }
         let ((r0, c0), (r1, c1)) = self.selection_span()?;
         let rows = self.row_texts(r0..r1 + 1);
         let mut out = String::new();
@@ -376,9 +420,101 @@ impl TerminalPanel {
         }
     }
 
-    /// Output cell under window position `pos` (column rounded to the
-    /// nearest boundary, so a drag selects the characters it passes).
-    fn cell_at(&self, pos: Point<Pixels>) -> Option<Cell2> {
+    /// Select everything in view (the context menu's Select All).
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        let rows = self.total_rows();
+        if self.session_offset() == 0
+            && let Some(session) = &self.session
+        {
+            self.selection = None;
+            session.select_all();
+        } else if rows > 0 {
+            if let Some(session) = &self.session {
+                session.clear_selection();
+            }
+            self.selection = Some(((0, 0), (rows - 1, usize::MAX), SelectKind::Cells));
+        }
+        cx.notify();
+    }
+
+    /// Mouse down in the output: start a selection of `kind` (click count)
+    /// at `pos`, or with Shift extend the current one.
+    fn begin_selection(&mut self, pos: Point<Pixels>, kind: SelectKind, extend: bool) {
+        let Some((row, col)) = self.cell_at(pos, kind) else {
+            self.clear_selection();
+            self.selecting = None;
+            return;
+        };
+        let off = self.session_offset();
+        if extend && let Some(target) = self.current_target() {
+            self.selecting = Some(target);
+            self.update_selection_to(row, col);
+            return;
+        }
+        if row >= off
+            && let Some(session) = &self.session
+        {
+            self.selection = None;
+            session.select_start(kind, row - off, col);
+            self.selecting = Some(SelTarget::Session);
+        } else {
+            if let Some(session) = &self.session {
+                session.clear_selection();
+            }
+            self.selection = Some(((row, col), (row, col), kind));
+            self.selecting = Some(SelTarget::Prelude);
+        }
+    }
+
+    fn current_target(&self) -> Option<SelTarget> {
+        if self.selection.is_some() {
+            Some(SelTarget::Prelude)
+        } else if self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.selection_view().is_some())
+        {
+            Some(SelTarget::Session)
+        } else {
+            None
+        }
+    }
+
+    /// Drag: move the selection's head to the cell under `pos`.
+    fn drag_selection(&mut self, pos: Point<Pixels>) {
+        let kind = match self.selection {
+            Some((_, _, kind)) => kind,
+            None => SelectKind::Cells,
+        };
+        if let Some((row, col)) = self.cell_at(pos, kind) {
+            self.update_selection_to(row, col);
+        }
+    }
+
+    fn update_selection_to(&mut self, row: usize, col: usize) {
+        let off = self.session_offset();
+        match self.selecting {
+            Some(SelTarget::Prelude) => {
+                if let Some((anchor, _, kind)) = self.selection {
+                    self.selection = Some((anchor, (row, col), kind));
+                }
+            }
+            Some(SelTarget::Session) => {
+                if let Some(session) = &self.session {
+                    // The live session cannot select into the transcript
+                    // above it: clamp to its first cell.
+                    let (r, c) = if row < off { (0, 0) } else { (row - off, col) };
+                    session.select_update(r, c);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Output cell under window position `pos`. For a drag the column is
+    /// rounded to the nearest boundary, so it selects the characters it
+    /// passes; a double / triple click takes the character under it.
+    fn cell_at(&self, pos: Point<Pixels>, kind: SelectKind) -> Option<Cell2> {
         let rows = self.total_rows();
         if rows == 0 {
             return None;
@@ -393,7 +529,12 @@ impl TerminalPanel {
         let y = f32::from(pos.y - bounds.origin.y - offset.y);
         let x = f32::from(pos.x - bounds.origin.x - offset.x);
         let row = ((y / line_h).floor().max(0.) as usize).min(rows - 1);
-        let col = (x / cell_w).round().max(0.) as usize;
+        let cells = (x / cell_w).max(0.);
+        let col = if kind == SelectKind::Cells {
+            cells.round()
+        } else {
+            cells.floor()
+        } as usize;
         Some((row, col))
     }
 
@@ -435,6 +576,8 @@ impl TerminalPanel {
         }
         self._pump = None;
         self.view = ViewInfo::default();
+        self.selection = None;
+        self.selecting = None;
         cap_prelude(&mut self.prelude);
     }
 
@@ -603,7 +746,10 @@ impl TerminalPanel {
             for line in text.trim_end_matches('\n').split('\n') {
                 self.prelude.push(SharedString::from(line.to_string()));
             }
-            cap_prelude(&mut self.prelude);
+            let dropped = cap_prelude(&mut self.prelude);
+            if dropped > 0 {
+                self.selection = self.selection.and_then(|sel| shift_selection(sel, dropped));
+            }
         }
         if self.follow_tail {
             self.scroll_to_end();
@@ -979,10 +1125,83 @@ fn overlay_background(
     out
 }
 
-fn cap_prelude(prelude: &mut Vec<SharedString>) {
+/// Drop the oldest transcript lines past [`MAX_PRELUDE_LINES`]; returns how
+/// many went.
+fn cap_prelude(prelude: &mut Vec<SharedString>) -> usize {
     let excess = prelude.len().saturating_sub(MAX_PRELUDE_LINES);
     if excess > 0 {
         prelude.drain(..excess);
+    }
+    excess
+}
+
+/// A transcript selection after `dropped` lines left the top: rows move up
+/// with their text; an end that left is clamped to the first kept cell, and
+/// a selection wholly in the dropped lines is gone.
+fn shift_selection(
+    sel: (Cell2, Cell2, SelectKind),
+    dropped: usize,
+) -> Option<(Cell2, Cell2, SelectKind)> {
+    let (a, b, kind) = sel;
+    if a.0.max(b.0) < dropped {
+        return None;
+    }
+    let shift = |(r, c): Cell2| {
+        if r < dropped {
+            (0, 0)
+        } else {
+            (r - dropped, c)
+        }
+    };
+    Some((shift(a), shift(b), kind))
+}
+
+/// Characters that end a word for a double-click (alacritty's default
+/// semantic escape characters, so the transcript and the live session
+/// agree).
+const WORD_SEPARATORS: &str = ",│`|:\"' ()[]{}<>\t";
+
+/// Char range of the word (or run of separators / blanks) at char `col`.
+fn word_span(text: &str, col: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    if col >= chars.len() {
+        return (col, col + 1);
+    }
+    let is_word = |c: char| !WORD_SEPARATORS.contains(c);
+    let kind = is_word(chars[col]);
+    let mut start = col;
+    while start > 0 && is_word(chars[start - 1]) == kind && (kind || chars[start - 1] == chars[col])
+    {
+        start -= 1;
+    }
+    let mut end = col + 1;
+    while end < chars.len() && is_word(chars[end]) == kind && (kind || chars[end] == chars[col]) {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// Ordered selection between `anchor` and `head`, grown to whole words or
+/// lines for a double / triple click. `text` gives a row's text.
+fn expand_selection(
+    anchor: Cell2,
+    head: Cell2,
+    kind: SelectKind,
+    text: impl Fn(usize) -> String,
+) -> (Cell2, Cell2) {
+    let (start, end) = if anchor <= head {
+        (anchor, head)
+    } else {
+        (head, anchor)
+    };
+    match kind {
+        SelectKind::Cells => (start, end),
+        SelectKind::Word => {
+            let (s0, _) = word_span(&text(start.0), start.1);
+            let (_, e1) = word_span(&text(end.0), end.1);
+            ((start.0, s0), (end.0, e1))
+        }
+        SelectKind::Line => ((start.0, 0), (end.0, text(end.0).chars().count().max(1))),
     }
 }
 
@@ -1020,6 +1239,7 @@ impl Render for TerminalPanel {
             cx.theme().background,
         );
         let row_count = self.total_rows().max(1);
+        let menu_focus = self.input.focus_handle(cx);
 
         v_flex()
             .id(ElementId::NamedInteger("terminal-panel".into(), eid))
@@ -1028,6 +1248,22 @@ impl Render for TerminalPanel {
             .border_t_1()
             .border_color(cx.theme().border)
             .track_focus(&self.focus_handle)
+            .on_action(
+                cx.listener(|this, _: &crate::actions::TerminalCopy, _, cx| {
+                    this.copy_selection(cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::TerminalPaste, _, cx| {
+                    this.paste_clipboard(cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::TerminalSelectAll, _, cx| {
+                    this.select_all(cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &crate::actions::TerminalClear, _, cx| this.clear(cx)))
             .child(
                 h_flex()
                     .id(ElementId::NamedInteger("terminal-header".into(), eid))
@@ -1169,10 +1405,16 @@ impl Render for TerminalPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            this.follow_tail = true;
-                            // Start a selection (a plain click clears it).
-                            this.selection = this.cell_at(event.position).map(|c| (c, c));
-                            this.selecting = true;
+                            // Start a selection (a plain click clears it);
+                            // double-click selects a word, triple a line,
+                            // Shift+click extends. Following the tail is left
+                            // alone: selecting while scrolled up must not
+                            // jump to the end.
+                            this.begin_selection(
+                                event.position,
+                                SelectKind::from_click_count(event.click_count),
+                                event.modifiers.shift,
+                            );
                             this.focus_input(window, cx);
                             // Otherwise the panel's own tracked focus takes the
                             // click after us (bubble phase) and typed text has
@@ -1182,27 +1424,25 @@ impl Render for TerminalPanel {
                         }),
                     )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                        if !this.selecting || event.pressed_button != Some(MouseButton::Left) {
+                        if this.selecting.is_none()
+                            || event.pressed_button != Some(MouseButton::Left)
+                        {
                             return;
                         }
-                        if let (Some((anchor, _)), Some(head)) =
-                            (this.selection, this.cell_at(event.position))
-                        {
-                            this.selection = Some((anchor, head));
-                            cx.notify();
-                        }
+                        this.drag_selection(event.position);
+                        cx.notify();
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
-                            this.selecting = false;
+                            this.selecting = None;
                             cx.notify();
                         }),
                     )
                     .on_mouse_up_out(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
-                            this.selecting = false;
+                            this.selecting = None;
                             cx.notify();
                         }),
                     )
@@ -1282,7 +1522,31 @@ impl Render for TerminalPanel {
                         .top_0()
                         .left_0()
                         .size_full(),
-                    ),
+                    )
+                    // VS Code's terminal context menu: Copy (only with a
+                    // selection), Paste, Select All, Clear. Ctrl+C stays ^C.
+                    .context_menu(move |menu, _, _| {
+                        menu.action_context(menu_focus.clone())
+                            .item(
+                                PopupMenuItem::new("Copy")
+                                    .disabled(!has_selection)
+                                    .action(Box::new(crate::actions::TerminalCopy)),
+                            )
+                            .item(
+                                PopupMenuItem::new("Paste")
+                                    .disabled(!shell_running)
+                                    .action(Box::new(crate::actions::TerminalPaste)),
+                            )
+                            .separator()
+                            .item(
+                                PopupMenuItem::new("Select All")
+                                    .action(Box::new(crate::actions::TerminalSelectAll)),
+                            )
+                            .item(
+                                PopupMenuItem::new("Clear")
+                                    .action(Box::new(crate::actions::TerminalClear)),
+                            )
+                    }),
             )
             // Input row: the command line before a shell runs, the IME
             // composition line while one does (typed text is forwarded as it

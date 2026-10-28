@@ -1449,6 +1449,86 @@ assert r >= 4.5, r
 PY
 pass "Tokyo Moon line numbers read at >= 4.5:1"
 
+# 21e. Terminal selection: drag across a word of output, Ctrl+Shift+C copies
+#      exactly it; Ctrl+C with that selection still interrupts the shell
+#      (it is ^C, not Copy); new output does not move the selection off its
+#      text; the right-click menu opens; the copied text pastes into a file.
+printf '' >"$WS/notes/termpaste.md"
+xdotool key --clearmodifiers ctrl+grave
+sleep 2.0
+# A green background marks the cells to drag across (the typed command
+# line itself is not colored, so only the output row matches).
+xdotool type --delay 30 "clear; printf '\\033[42mSMOKECOPY42\\033[0m tail\\n'"
+xdotool key --clearmodifiers Return
+sleep 1.5
+shot 49a-term-output
+read -r TX0 TX1 TY < <(python3 - "$ART_DIR/49a-term-output.png" <<'PY'
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("RGB")
+w, h = im.size
+pts = [(x, y) for y in range(int(h * 0.45), h, 1) for x in range(0, w, 1)
+       if (lambda p: p[1] > 90 and p[1] > p[0] + 40 and p[1] > p[2] + 25)(im.getpixel((x, y)))]
+assert len(pts) > 200, f"no green output cells ({len(pts)})"
+xs = sorted(p[0] for p in pts); ys = sorted(p[1] for p in pts)
+# The densest band: the green run is one row of cells.
+y0, y1 = ys[len(ys) // 10], ys[len(ys) * 9 // 10]
+print(xs[2] + 2, xs[-3] - 2, (y0 + y1) // 2)
+PY
+) || fail "could not find the green terminal output"
+printf '' | xclip -selection clipboard
+xdotool mousemove "$TX0" "$TY" mousedown 1
+xdotool mousemove $(( (TX0 + TX1) / 2 )) "$TY"
+sleep 0.1
+xdotool mousemove "$TX1" "$TY"
+sleep 0.2
+xdotool mouseup 1
+sleep 0.4
+xdotool key --clearmodifiers ctrl+shift+c
+sleep 0.4
+GOT="$(xclip -o -selection clipboard 2>/dev/null || true)"
+shot 49b-term-selected
+[[ "$GOT" == "SMOKECOPY42" ]] || fail "terminal drag + Ctrl+Shift+C copied '${GOT:0:80}' ($TX0..$TX1,$TY)"
+pass "terminal: drag-select + Ctrl+Shift+C copies the selected output"
+# Ctrl+C with output selected is ^C: the sleep never reaches `touch`.
+rm -f "$WS/sigint-missed"
+xdotool type --delay 30 "sleep 3; touch '$WS/sigint-missed'"
+xdotool key --clearmodifiers Return
+sleep 0.8
+xdotool key --clearmodifiers ctrl+c
+sleep 3.5
+[[ ! -e "$WS/sigint-missed" ]] || fail "Ctrl+C in the terminal did not interrupt (it copied?)"
+# More output arrived since the drag; the selection is still on its word.
+printf '' | xclip -selection clipboard
+xdotool key --clearmodifiers ctrl+shift+c
+sleep 0.4
+GOT="$(xclip -o -selection clipboard 2>/dev/null || true)"
+[[ "$GOT" == "SMOKECOPY42" ]] || fail "selection moved after new output: '${GOT:0:80}'"
+pass "terminal: Ctrl+C still interrupts; the selection stays on its text"
+shot 49c-term-before-menu
+xdotool mousemove "$TX0" "$TY" click 3
+sleep 0.6
+shot 49d-term-context-menu
+[[ "$(pixels_differ 49c-term-before-menu 49d-term-context-menu)" -gt 1500 ]] \
+  || fail "right-click in the terminal opened no menu"
+xdotool key --clearmodifiers Escape
+sleep 0.3
+pass "terminal: right-click opens the Copy / Paste menu"
+# Paste what the terminal copied into a document and save it.
+xdotool key --clearmodifiers ctrl+grave
+sleep 0.5
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'termpaste.md'
+xdotool key --clearmodifiers Return
+sleep 0.8
+xdotool key --clearmodifiers ctrl+v
+sleep 0.3
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 grep -qx 'SMOKECOPY42' "$WS/notes/termpaste.md" \
+  || fail "pasted terminal text not saved: '$(head -c 80 "$WS/notes/termpaste.md")'"
+pass "terminal: copied text pastes into the editor unchanged"
+
 # 22. Ctrl+Q → Don't save: dialog, disk unchanged, then the app exits.
 #     Last so later steps are not stranded without a process.
 printf 'quit-disk\n' >"$WS/notes/quit-final.md"
