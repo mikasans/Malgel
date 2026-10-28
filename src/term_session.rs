@@ -46,10 +46,19 @@ use alacritty_terminal::{
 };
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 
-/// Lines of scrollback the emulator keeps (VS Code's default is 1000; we keep
-/// more because Copy reads the whole buffer). Bounded: ~100 cols × 24 B/cell
-/// × 5000 ≈ 12 MB worst case per session.
-pub const SCROLLBACK_LINES: usize = 5_000;
+/// Lines of scrollback the emulator keeps by default (VS Code's default is
+/// 1000; we keep more because Copy reads the whole buffer). Settings can
+/// change it (`terminal_scrollback`) within [`MIN_SCROLLBACK_LINES`] ..
+/// [`MAX_SCROLLBACK_LINES`]. Bounded: ~100 cols × 24 B/cell × 10k ≈ 24 MB
+/// worst case per session; the oldest lines are dropped first.
+pub const SCROLLBACK_LINES: usize = 10_000;
+pub const MIN_SCROLLBACK_LINES: usize = 100;
+pub const MAX_SCROLLBACK_LINES: usize = 100_000;
+
+/// A scrollback setting clamped to what the emulator is allowed to keep.
+pub fn clamp_scrollback(lines: usize) -> usize {
+    lines.clamp(MIN_SCROLLBACK_LINES, MAX_SCROLLBACK_LINES)
+}
 /// Bytes per PTY read. Also bounds how long the reader holds the terminal
 /// lock for one parse, which the UI thread may wait out for a frame: 16 KiB
 /// of `yes` is 8k line feeds, ~3ms (64 KiB held it ~13ms, longer on a
@@ -359,8 +368,18 @@ pub struct PtySession {
 }
 
 impl PtySession {
-    /// Spawn `cmd` on a new PTY of `size`.
+    /// Spawn `cmd` on a new PTY of `size` with the default scrollback.
+    #[cfg(test)]
     pub fn spawn(cmd: CommandBuilder, size: GridSize) -> Result<PtySession, String> {
+        Self::spawn_with(cmd, size, SCROLLBACK_LINES)
+    }
+
+    /// Spawn `cmd` keeping `scrollback` lines of history (clamped).
+    pub fn spawn_with(
+        cmd: CommandBuilder,
+        size: GridSize,
+        scrollback: usize,
+    ) -> Result<PtySession, String> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(pty_size(size))
@@ -380,7 +399,7 @@ impl PtySession {
             .map_err(|err| format!("Couldn’t write to shell: {err}"))?;
 
         let input = Arc::new(InputQueue::default());
-        let config = term_config(SCROLLBACK_LINES);
+        let config = term_config(scrollback);
         let term = Term::new(
             config,
             &size,
@@ -522,6 +541,15 @@ impl PtySession {
 
     pub fn mode(&self) -> TermMode {
         *self.ui_lock().mode()
+    }
+
+    /// Change how many lines of history are kept; shrinking drops the
+    /// oldest at once (and any selection that lived only there).
+    pub fn set_scrollback(&self, lines: usize) {
+        let mut term = self.ui_lock();
+        term.set_options(term_config(lines));
+        drop(term);
+        self.shared.dirty.store(true, Ordering::Release);
     }
 
     /// Start a selection at view `row`; `col` is a char boundary for
@@ -1015,7 +1043,7 @@ fn snapshot_term<T>(term: &Term<T>, max_lines: usize) -> Snapshot {
 
 fn term_config(scrollback: usize) -> Config {
     Config {
-        scrolling_history: scrollback,
+        scrolling_history: clamp_scrollback(scrollback),
         ..Config::default()
     }
 }
@@ -1765,6 +1793,22 @@ mod selection_tests {
         assert!(text.starts_with("r65"), "{text}");
         assert!(text.ends_with("r70"), "{text}");
         assert_eq!(term_selection_view(&t).unwrap().0, (0, 0));
+    }
+
+    #[test]
+    fn scrollback_setting_is_clamped_and_shrinks_live() {
+        assert_eq!(clamp_scrollback(0), MIN_SCROLLBACK_LINES);
+        assert_eq!(clamp_scrollback(10_000), 10_000);
+        assert_eq!(clamp_scrollback(usize::MAX), MAX_SCROLLBACK_LINES);
+        let mut t = term(20, 5, 1_000);
+        let lines: String = (0..800).map(|i| format!("{i}\n")).collect();
+        feed(&mut t, &lines);
+        assert!(view_info_term(&t).line_count > 700);
+        t.set_options(term_config(200));
+        let rows = view_rows(&t);
+        assert!(rows.len() <= 200 + 5, "{} rows", rows.len());
+        // The newest lines are the ones kept.
+        assert_eq!(rows.iter().rev().find(|r| !r.is_empty()).unwrap(), "799");
     }
 
     #[test]

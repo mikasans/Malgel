@@ -107,6 +107,10 @@ pub struct Settings {
     /// Terminal panel height in pixels after the user dragged its divider;
     /// `None`: a third of the window (VS Code).
     pub terminal_panel_height: Option<f32>,
+    /// Lines of history each terminal keeps; the oldest are dropped past
+    /// it. Clamped to 100 ..= 100 000 (VS Code's
+    /// `terminal.integrated.scrollback`).
+    pub terminal_scrollback: usize,
 
     /// Hide everything but the text, dimming all but the current paragraph.
     /// Lasts until turned off or Malgel quits.
@@ -133,6 +137,7 @@ impl Default for Settings {
             centered_layout: false,
             terminal_shell_config: true,
             terminal_panel_height: None,
+            terminal_scrollback: crate::term_session::SCROLLBACK_LINES,
             file_sidebar: false,
             outline_sidebar: false,
             problems_panel: false,
@@ -280,6 +285,14 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn terminal_scrollback_defaults_and_reads_from_json() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.terminal_scrollback, 10_000);
+        let s: Settings = serde_json::from_str(r#"{"terminal_scrollback": 2500}"#).unwrap();
+        assert_eq!(s.terminal_scrollback, 2500);
     }
 
     #[test]

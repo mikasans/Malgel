@@ -181,6 +181,8 @@ pub struct TerminalPanel {
     /// The left button went down in the output and has not come up yet,
     /// and where that selection lives.
     selecting: Option<SelTarget>,
+    /// Scrollback the running session was given (follows Settings).
+    scrollback: usize,
 }
 
 /// Which buffer a drag selects in.
@@ -266,6 +268,7 @@ impl TerminalPanel {
             follow_tail: true,
             selection: None,
             selecting: None,
+            scrollback: crate::term_session::SCROLLBACK_LINES,
         }
     }
 
@@ -764,7 +767,8 @@ impl TerminalPanel {
         if let Some(cwd) = &self.cwd {
             cmd.cwd(cwd);
         }
-        match PtySession::spawn(cmd, size) {
+        self.scrollback = crate::themes::AppSettings::get(cx).terminal_scrollback;
+        match PtySession::spawn_with(cmd, size, self.scrollback) {
             Ok(session) => self.session = Some(session),
             Err(err) => {
                 self.append(&format!("{err}\n"), cx);
@@ -806,6 +810,11 @@ impl TerminalPanel {
         };
         if let Some(size) = wanted {
             session.resize(size);
+        }
+        let scrollback = crate::themes::AppSettings::get(cx).terminal_scrollback;
+        if scrollback != self.scrollback {
+            self.scrollback = scrollback;
+            session.set_scrollback(scrollback);
         }
         let exited = session.poll_exited();
         if !exited {
