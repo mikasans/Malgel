@@ -2133,8 +2133,44 @@ wait_window() { # wait_window <log>: sets WIN once the app's window maps
     sleep 0.1
   done
   [[ -n "$WIN" ]] || fail "no window appeared ($1)"
-  xdotool windowfocus "$WIN" 2>/dev/null || true
-  sleep 1.0
+  # On a loaded machine the window maps well before it has the keyboard or
+  # its editor exists, and keys typed then are lost. Wait for X focus on the
+  # window, then for the first frames to settle (two shots that differ by no
+  # more than a blinking caret), before anything is typed.
+  local i SETTLE=0.2
+  for ((i = 0; i < 50; i++)); do
+    timeout 1 xdotool windowfocus --sync "$WIN" 2>/dev/null || true
+    [[ "$(xdotool getwindowfocus 2>/dev/null)" == "$WIN" ]] && break
+    sleep 0.1
+  done
+  # Without a window manager X may report the focus on another window of
+  # the app (or none) although keys arrive: note it and let typed_landed
+  # judge whether the typing got through.
+  [[ "$(xdotool getwindowfocus 2>/dev/null)" == "$WIN" ]] \
+    || echo "note: X focus is on $(xdotool getwindowfocus 2>/dev/null), not $WIN ($1)"
+  for ((i = 0; i < 20; i++)); do
+    shot .settle-a
+    sleep 0.3
+    shot .settle-b
+    [[ "$(colours .settle-b)" -gt 8 && "$(pixels_differ .settle-a .settle-b)" -lt 1500 ]] && break
+  done
+}
+# typed_landed <text>: type into the focused editor and wait until the frame
+# changes, so a crash step never runs before its text reached the buffer.
+# Nothing changed means nothing landed; that is the only case it retypes.
+typed_landed() {
+  local SETTLE=0.2
+  shot .type-before
+  xdotool type --delay 30 "$1"
+  if wait_for 5 frame_moved_since_type; then return 0; fi
+  timeout 1 xdotool windowfocus --sync "$WIN" 2>/dev/null || true
+  xdotool key --clearmodifiers ctrl+End
+  xdotool type --delay 30 "$1"
+  wait_for 5 frame_moved_since_type || fail "typing '$1' never reached the editor"
+}
+frame_moved_since_type() {
+  shot .type-after
+  [[ "$(pixels_differ .type-before .type-after)" -ge 150 ]]
 }
 printf 'crash-disk\n' >"$WS/notes/crash.md"
 MALGEL_CRASH_TEST=1 env -u DBUS_SESSION_BUS_ADDRESS "$BIN" --new-instance "$WS" "$WS/notes/crash.md" \
@@ -2142,8 +2178,7 @@ MALGEL_CRASH_TEST=1 env -u DBUS_SESSION_BUS_ADDRESS "$BIN" --new-instance "$WS" 
 APP_PID=$!
 wait_window "$ART_DIR/app-crash.log"
 xdotool key --clearmodifiers ctrl+End
-xdotool type --delay 30 'CRASH_UNSAVED_77'
-sleep 0.3
+typed_landed 'CRASH_UNSAVED_77'
 shot 51a-crash-before
 xdotool key --clearmodifiers ctrl+shift+p
 sleep 0.5
@@ -2183,8 +2218,7 @@ MALGEL_CRASH_TEST=1 env -u DBUS_SESSION_BUS_ADDRESS "$BIN" --new-instance "$WS" 
 APP_PID=$!
 wait_window "$ART_DIR/app-crash2.log"
 xdotool key --clearmodifiers ctrl+End
-xdotool type --delay 30 'SECOND_EDIT_88'
-sleep 0.3
+typed_landed 'SECOND_EDIT_88'
 xdotool key --clearmodifiers ctrl+shift+p
 sleep 0.5
 xdotool type --delay 30 'Developer: Crash'
@@ -2252,8 +2286,7 @@ MALGEL_CRASH_TEST=1 env -u DBUS_SESSION_BUS_ADDRESS "$BIN" --new-instance "$WS" 
 APP_PID=$!
 wait_window "$ART_DIR/app-crash3.log"
 xdotool key --clearmodifiers ctrl+End
-xdotool type --delay 30 'GBK77'
-sleep 0.3
+typed_landed 'GBK77'
 xdotool key --clearmodifiers ctrl+shift+p
 sleep 0.5
 xdotool type --delay 30 'Developer: Crash'
