@@ -162,10 +162,16 @@ impl Settings {
     }
 
     fn load_from(path: &Path) -> Self {
-        let mut settings = std::fs::read_to_string(path)
+        std::fs::read_to_string(path)
             .ok()
             .and_then(|json| parse_own(&json))
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .normalized()
+    }
+
+    /// Out-of-range values clamped, as every load does.
+    fn normalized(mut self) -> Self {
+        let settings = &mut self;
         settings.font_size = clamp_font_size(settings.font_size);
         settings.recent_files.truncate(RECENT_LIMIT);
         let folder = settings.image_folder.trim().trim_matches(['/', '\\']);
@@ -174,17 +180,54 @@ impl Settings {
         } else {
             folder.to_string()
         };
-        settings
+        self
     }
 
-    /// Persist settings. Failures are not fatal: preferences simply are not
-    /// remembered.
-    pub fn save(&self) {
-        if let Some(path) = settings_path() {
-            self.save_to(&path);
+    /// Save an in-app change from `base` to `self` without losing hand
+    /// edits: the file is re-read and only the keys that differ between
+    /// `base` and `self` are written into it; every other key (and any key
+    /// Malgel does not know) stays as it is on disk. Returns the settings
+    /// now in effect (the file's, with the edit applied) and the text
+    /// written, if any.
+    pub fn save_edit(&self, base: &Settings) -> (Settings, Option<String>) {
+        match settings_path() {
+            Some(path) => self.save_edit_to(&path, base),
+            None => (self.clone(), None),
         }
     }
 
+    fn save_edit_to(&self, path: &Path, base: &Settings) -> (Settings, Option<String>) {
+        let on_disk = std::fs::read_to_string(path).ok();
+        let file = on_disk
+            .as_deref()
+            .filter(|json| parse_own(json).is_some())
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+        let (Some(serde_json::Value::Object(mut file)), Ok(old), Ok(new)) =
+            (file, serde_json::to_value(base), serde_json::to_value(self))
+        else {
+            // Not ours (or missing): written whole, a foreign file backed up.
+            self.save_to(path);
+            return (self.clone(), std::fs::read_to_string(path).ok());
+        };
+        if let Some(new) = new.as_object() {
+            for (key, value) in new {
+                if old.get(key) != Some(value) {
+                    file.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        let file = serde_json::Value::Object(file);
+        let merged = serde_json::from_value::<Settings>(file.clone())
+            .map_or_else(|_| self.clone(), Settings::normalized);
+        let Ok(json) = serde_json::to_string_pretty(&file) else {
+            return (merged, None);
+        };
+        let _ = std::fs::write(path, &json);
+        (merged, Some(json))
+    }
+
+    /// Persist all of the settings (a foreign or broken file is backed up
+    /// first). Failures are not fatal: preferences simply are not remembered.
     fn save_to(&self, path: &Path) {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -264,6 +307,26 @@ pub fn zoom_percent(font_size: f32) -> u32 {
     ((size / DEFAULT_FONT_SIZE) * 100.).round() as u32
 }
 
+/// The settings file's text, if there is one.
+pub fn read_file() -> Option<String> {
+    std::fs::read_to_string(settings_path()?).ok()
+}
+
+/// A hand-edited settings file, as the running app applies it: `Err` with
+/// a message when it cannot be (bad JSON, or not Malgel's settings).
+pub fn parse_edit(json: &str) -> Result<Settings, String> {
+    if let Err(err) = serde_json::from_str::<serde_json::Value>(json) {
+        return Err(format!("settings.json is not valid JSON ({err})"));
+    }
+    match parse_own(json) {
+        Some(settings) => Ok(settings.normalized()),
+        None => match serde_json::from_str::<Settings>(json) {
+            Err(err) => Err(format!("settings.json has a bad value ({err})")),
+            Ok(_) => Err("settings.json names no Malgel setting".to_string()),
+        },
+    }
+}
+
 fn settings_path() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("settings.json"))
 }
@@ -329,6 +392,66 @@ mod tests {
         );
         assert!(parse_own(&std::fs::read_to_string(&path).unwrap()).is_some());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_in_app_change_keeps_keys_edited_by_hand_meanwhile() {
+        let dir = std::env::temp_dir().join(format!(
+            "malgel-settings-edit-{}",
+            crate::session::new_recovery_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let base = Settings::default();
+        base.save_to(&path);
+        // While the app runs, a hand edit changes one key and adds one
+        // Malgel does not know.
+        let mut file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        file["terminal_scrollback"] = 4321.into();
+        file["my_note"] = "keep me".into();
+        std::fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+        // The app toggles another key from its (stale) copy.
+        let mut edited = base.clone();
+        edited.soft_wrap = !base.soft_wrap;
+        let (now, written) = edited.save_edit_to(&path, &base);
+        assert_eq!(
+            now.terminal_scrollback, 4321,
+            "the hand edit is kept in effect"
+        );
+        assert_eq!(now.soft_wrap, edited.soft_wrap);
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["terminal_scrollback"], 4321);
+        assert_eq!(on_disk["my_note"], "keep me");
+        assert_eq!(on_disk["soft_wrap"], edited.soft_wrap);
+        assert_eq!(
+            written.as_deref(),
+            std::fs::read_to_string(&path).ok().as_deref()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_hand_edit_that_does_not_parse_says_why() {
+        assert!(
+            parse_edit(r#"{"soft_wrap": tru"#)
+                .unwrap_err()
+                .contains("not valid JSON")
+        );
+        assert!(
+            parse_edit(r#"{"soft_wrap": 3}"#)
+                .unwrap_err()
+                .contains("bad value")
+        );
+        assert!(
+            parse_edit(r#"{"theme": "x"}"#)
+                .unwrap_err()
+                .contains("no Malgel setting")
+        );
+        let ok = parse_edit(r#"{"terminal_scrollback": 900, "font_size": 99}"#).unwrap();
+        assert_eq!(ok.terminal_scrollback, 900);
+        assert_eq!(ok.font_size, MAX_FONT_SIZE, "clamped like a load");
     }
 
     #[test]

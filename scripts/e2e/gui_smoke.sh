@@ -1728,6 +1728,45 @@ xdotool key --clearmodifiers Escape
 sleep 0.5
 pass "Settings: switches inside the card; the card stays put while filtering"
 
+# 21h. settings.json edited by hand while the app runs: applied live, kept by
+#      the next in-app change, and a broken edit is refused with a message.
+SJ="$HOME/.config/malgel/settings.json"
+shot 49j-before-hand-edit
+python3 - "$SJ" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["file_sidebar"] = not d.get("file_sidebar", True)
+d["terminal_scrollback"] = 4321
+json.dump(d, open(p, "w"), indent=2)
+PY
+sleep 2.5
+shot 49k-after-hand-edit
+[[ "$(pixels_differ 49j-before-hand-edit 49k-after-hand-edit)" -gt 1000 ]] \
+  || fail "a hand edit of settings.json (file_sidebar) was not applied live"
+xdotool key --clearmodifiers alt+z
+sleep 1.2
+grep -q '"terminal_scrollback": 4321' "$SJ" \
+  || fail "an in-app toggle overwrote the hand-edited terminal_scrollback: $(grep scrollback "$SJ")"
+xdotool key --clearmodifiers alt+z
+sleep 0.8
+python3 - "$SJ" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["file_sidebar"] = not d["file_sidebar"]
+json.dump(d, open(p, "w"), indent=2)
+PY
+sleep 2.5
+cp "$SJ" "$ART_DIR/settings-good.json"
+printf '{"soft_wrap": tru' >"$SJ"
+wait_for 6 grep -q "settings.json is not valid JSON" "$ART_DIR/app.log" \
+  || fail "a broken settings.json edit said nothing"
+shot 49l-settings-broken
+cp "$ART_DIR/settings-good.json" "$SJ"
+sleep 2
+pass "settings.json: hand edits apply live and survive in-app changes; a broken one is reported"
+
 # 22. Ctrl+Q → Don't save: dialog, disk unchanged, then the app exits.
 #     Last so later steps are not stranded without a process.
 printf 'quit-disk\n' >"$WS/notes/quit-final.md"

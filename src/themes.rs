@@ -31,13 +31,25 @@ impl AppSettings {
     }
 
     /// Change the settings, persist them, and re-apply the appearance.
+    /// Only the keys `f` changed are written: the file is re-read first, so
+    /// a hand edit made while the app runs is kept (and takes effect).
     pub fn update(cx: &mut App, f: impl FnOnce(&mut Settings)) {
-        let mut settings = Self::get(cx).clone();
+        let base = Self::get(cx).clone();
+        let mut settings = base.clone();
         f(&mut settings);
         settings.font_size = clamp_font_size(settings.font_size);
-        if &settings == Self::get(cx) {
+        if settings == base {
             return;
         }
+        let (settings, written) = settings.save_edit(&base);
+        if let Some(json) = written {
+            cx.set_global(SeenSettingsFile(Some(json)));
+        }
+        Self::set(settings, cx);
+    }
+
+    /// Make `settings` current, re-applying the theme when it changed.
+    fn set(settings: Settings, cx: &mut App) {
         let appearance_changed = {
             let current = Self::get(cx);
             current.appearance != settings.appearance
@@ -45,11 +57,67 @@ impl AppSettings {
                 || current.dark_theme != settings.dark_theme
                 || current.font_size != settings.font_size
         };
-        settings.save();
         cx.set_global(AppSettings(settings));
         if appearance_changed {
             apply(None, cx);
         }
+        cx.refresh_windows();
+    }
+}
+
+/// The settings file's text as Malgel last read or wrote it, so the watcher
+/// reacts only to changes made elsewhere.
+struct SeenSettingsFile(Option<String>);
+
+impl Global for SeenSettingsFile {}
+
+/// How often the settings file is checked for hand edits.
+const SETTINGS_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Re-apply settings.json live when it is edited outside the app (as VS
+/// Code does); a file that does not parse leaves the settings as they are
+/// and says why.
+fn watch_settings_file(cx: &mut App) {
+    cx.set_global(SeenSettingsFile(crate::settings::read_file()));
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(SETTINGS_POLL).await;
+            let text = cx
+                .background_executor()
+                .spawn(async { crate::settings::read_file() })
+                .await;
+            let changed =
+                cx.update(|cx| cx.global::<SeenSettingsFile>().0 != text && text.is_some());
+            if !changed {
+                continue;
+            }
+            cx.update(|cx| {
+                let json = text.clone().unwrap_or_default();
+                cx.set_global(SeenSettingsFile(text));
+                match crate::settings::parse_edit(&json) {
+                    Ok(settings) => {
+                        if &settings != AppSettings::get(cx) {
+                            AppSettings::set(settings, cx);
+                        }
+                    }
+                    Err(message) => {
+                        notify_all(format!("{message}. Keeping the current settings."), cx)
+                    }
+                }
+            });
+        }
+    })
+    .detach();
+}
+
+fn notify_all(message: String, cx: &mut App) {
+    use gpui_kit::component::{WindowExt as _, notification::Notification};
+    eprintln!("malgel: {message}");
+    for window in cx.windows() {
+        let message = message.clone();
+        let _ = window.update(cx, |_, window, cx| {
+            window.push_notification(Notification::error(message), cx);
+        });
     }
 }
 
@@ -62,6 +130,9 @@ pub fn init(settings: Settings, cx: &mut App) {
     }
     cx.set_global(AppSettings(settings));
     apply(None, cx);
+    if !cfg!(test) {
+        watch_settings_file(cx);
+    }
 }
 
 /// Apply the preferred themes, appearance and interface size.
