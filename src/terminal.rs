@@ -1178,6 +1178,8 @@ struct TermColors {
     fg: Hsla,
     bg: Hsla,
     ansi: [u32; 16],
+    /// Minimum text/background contrast ratio; 1 leaves colours alone.
+    min_contrast: f32,
 }
 
 const VSCODE_DARK_ANSI: [u32; 16] = [
@@ -1190,10 +1192,11 @@ const VSCODE_LIGHT_ANSI: [u32; 16] = [
 ];
 
 impl TermColors {
-    fn new(dark: bool, fg: Hsla, bg: Hsla) -> Self {
+    fn new(dark: bool, fg: Hsla, bg: Hsla, min_contrast: f32) -> Self {
         Self {
             fg,
             bg,
+            min_contrast,
             ansi: if dark {
                 VSCODE_DARK_ANSI
             } else {
@@ -1220,6 +1223,7 @@ impl TermColors {
             let bg = (style.bg != CellColor::Default).then(|| self.resolve(style.bg, self.bg));
             (self.resolve(style.fg, self.fg), bg)
         };
+        let fg = ensure_contrast(fg, bg.unwrap_or(self.bg), self.min_contrast);
         HighlightStyle {
             color: Some(if style.dim { fg.opacity(0.6) } else { fg }),
             background_color: bg,
@@ -1233,6 +1237,88 @@ impl TermColors {
             ..HighlightStyle::default()
         }
     }
+}
+
+/// WCAG relative luminance of an sRGB colour.
+fn luminance(rgb: [f32; 3]) -> f32 {
+    let channel = |v: f32| {
+        if v <= 0.039_28 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(rgb[0]) + 0.7152 * channel(rgb[1]) + 0.0722 * channel(rgb[2])
+}
+
+fn contrast_ratio(a: f32, b: f32) -> f32 {
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// Text colour `fg`, moved toward black or white until it reaches `ratio`
+/// against `bg` (xterm.js `ensureContrastRatio`, VS Code's
+/// minimumContrastRatio): each step takes 10% of the way left, the
+/// direction away from the background first, the other one when that
+/// cannot get there, keeping whichever came out better. Hue is kept as far
+/// as the ratio allows; a colour that already passes is returned as is.
+fn ensure_contrast(fg: Hsla, bg: Hsla, ratio: f32) -> Hsla {
+    if ratio <= 1.0 {
+        return fg;
+    }
+    let to_rgb = |c: Hsla| {
+        let c = c.to_rgb();
+        [c.r, c.g, c.b]
+    };
+    let (fg_rgb, bg_rgb) = (to_rgb(fg), to_rgb(bg));
+    let bg_l = luminance(bg_rgb);
+    if contrast_ratio(luminance(fg_rgb), bg_l) >= ratio {
+        return fg;
+    }
+    let walk = |toward_black: bool| {
+        let mut c = fg_rgb.map(|v| (v * 255.0).round());
+        let mut best = contrast_ratio(luminance(c.map(|v| v / 255.0)), bg_l);
+        for _ in 0..64 {
+            if best >= ratio {
+                break;
+            }
+            let done = if toward_black {
+                c.iter().all(|&v| v <= 0.0)
+            } else {
+                c.iter().all(|&v| v >= 255.0)
+            };
+            if done {
+                break;
+            }
+            for v in &mut c {
+                *v = if toward_black {
+                    (*v - (*v * 0.1).ceil()).max(0.0)
+                } else {
+                    (*v + ((255.0 - *v) * 0.1).ceil()).min(255.0)
+                };
+            }
+            best = contrast_ratio(luminance(c.map(|v| v / 255.0)), bg_l);
+        }
+        (c.map(|v| v / 255.0), best)
+    };
+    let darker_first = luminance(fg_rgb) < bg_l;
+    let (first, first_ratio) = walk(darker_first);
+    let chosen = if first_ratio >= ratio {
+        first
+    } else {
+        let (second, second_ratio) = walk(!darker_first);
+        if first_ratio > second_ratio {
+            first
+        } else {
+            second
+        }
+    };
+    let rgba = gpui_kit::Rgba {
+        r: chosen[0],
+        g: chosen[1],
+        b: chosen[2],
+        a: fg.a,
+    };
+    rgba.into()
 }
 
 fn rgb_hsla(r: u8, g: u8, b: u8) -> Hsla {
@@ -1655,6 +1741,7 @@ impl Render for TerminalPanel {
             cx.theme().is_dark(),
             cx.theme().foreground,
             cx.theme().background,
+            crate::themes::AppSettings::get(cx).terminal_contrast(),
         );
         let row_count = self.total_rows().max(1);
         let menu_focus = self.input.focus_handle(cx);
@@ -2097,6 +2184,62 @@ mod tests {
 
     fn ks(s: &str) -> Keystroke {
         Keystroke::parse(s).unwrap()
+    }
+
+    fn ratio_of(fg: Hsla, bg: Hsla) -> f32 {
+        let rgb = |c: Hsla| {
+            let c = c.to_rgb();
+            [c.r, c.g, c.b]
+        };
+        contrast_ratio(luminance(rgb(fg)), luminance(rgb(bg)))
+    }
+
+    #[test]
+    fn terminal_text_keeps_the_minimum_contrast() {
+        let white = rgb_hsla(0xff, 0xff, 0xff);
+        let black = rgb_hsla(0, 0, 0);
+        let light = TermColors::new(false, black, white, 4.5);
+        // `printf '\e[4Xm\e[37m'`: white on red, blue, magenta and white
+        // in the light palette were ~1:1 to 1.5:1.
+        for bg in [1u8, 4, 5, 7] {
+            let style = CellStyle {
+                fg: CellColor::Indexed(7),
+                bg: CellColor::Indexed(bg),
+                ..CellStyle::PLAIN
+            };
+            let h = light.highlight(&style);
+            let (fg, bg_color) = (h.color.unwrap(), h.background_color.unwrap());
+            let ratio = ratio_of(fg, bg_color);
+            assert!(ratio >= 4.5, "37 on 4{bg}: {ratio}");
+            // Off at 1: the palette colour as it was.
+            let off = TermColors {
+                min_contrast: 1.0,
+                ..light
+            }
+            .highlight(&style);
+            assert!(ratio_of(off.color.unwrap(), bg_color) < 1.6, "4{bg}");
+        }
+        // Text that already stands out keeps its exact colour.
+        let dark_bg = rgb_hsla(0x1e, 0x1e, 0x1e);
+        let dark = TermColors::new(true, rgb_hsla(0xcc, 0xcc, 0xcc), dark_bg, 4.5);
+        for fg in [
+            CellColor::Default,
+            CellColor::Indexed(2),
+            CellColor::Indexed(3),
+        ] {
+            let style = CellStyle {
+                fg,
+                ..CellStyle::PLAIN
+            };
+            assert_eq!(
+                dark.highlight(&style).color,
+                Some(dark.resolve(fg, dark.fg)),
+                "{fg:?}"
+            );
+        }
+        // Grey on grey goes to whichever end gets further.
+        let mid = rgb_hsla(0x77, 0x77, 0x77);
+        assert!(ratio_of(ensure_contrast(mid, mid, 4.5), mid) >= 4.5);
     }
 
     #[test]

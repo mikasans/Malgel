@@ -1998,6 +1998,75 @@ sleep 3.5
 ALT="$(od -An -c "$WS/alt-bytes" | tr -d ' \n')"
 [[ "$ALT" == *'033[A'* || "$ALT" == *'033OA'* ]] || fail "alternate scroll: the wheel sent '$ALT', not ↑"
 pass "terminal: SGR mouse reports (click, wheel, right click) and alternate-screen wheel arrows"
+# 21f6. Minimum contrast (VS Code's terminal.integrated.minimumContrastRatio,
+#       4.5 by default): in the light theme white (37) on red, blue, magenta
+#       and white backgrounds was ~1:1; each row's text must reach 4.5:1
+#       against the background it is drawn on.
+xdotool type --delay 15 "clear; for b in 41 44 45 47; do printf '\\033[%s;37m white-on-%s \\033[0m\\n' \$b \$b; done"
+xdotool key --clearmodifiers Return
+term_is_light() { # term_is_light <shot>: the terminal rows' background is light
+  python3 - "$ART_DIR/$1.png" "$TERM_ROWS" <<'PY'
+from PIL import Image
+import re, sys
+im = Image.open(sys.argv[1]).convert("RGB")
+w, h, x, y = map(int, re.match(r"(\d+)x(\d+)\+(\d+)\+(\d+)", sys.argv[2]).groups())
+px = im.crop((x, y, x + w, y + h)).resize((64, 16)).getdata()
+sys.exit(0 if sorted(sum(p) / 3 for p in px)[len(px) // 2] > 160 else 1)
+PY
+}
+TOGGLED=0
+for _ in 1 2; do
+  shot 49g14-term-contrast
+  term_is_light 49g14-term-contrast && break
+  palette_run 'Toggle light and dark'
+  TOGGLED=$(( TOGGLED + 1 ))
+done
+term_is_light 49g14-term-contrast || fail "could not switch the terminal to the light theme"
+CONTRAST="$(python3 - "$ART_DIR/49g14-term-contrast.png" <<'PY'
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("RGB")
+w, h = im.size
+px = im.load()
+def lum(c):
+    def ch(v):
+        v /= 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    return 0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2])
+def ratio(a, b):
+    la, lb = lum(a), lum(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+out = []
+# VS Code Light ANSI 41 / 44 / 45 / 47 backgrounds.
+for name, bg in (("41", (0xcd, 0x31, 0x31)), ("44", (0x04, 0x51, 0xa5)),
+                 ("45", (0xbc, 0x05, 0xbc)), ("47", (0x55, 0x55, 0x55))):
+    near = lambda p: all(abs(p[i] - bg[i]) <= 3 for i in range(3))
+    rows = {}
+    for y in range(h // 3, h):
+        n = sum(1 for x in range(0, w, 2) if near(px[x, y]))
+        if n > 40:
+            rows[y] = n
+    if not rows:
+        out.append(f"{name}:none")
+        continue
+    # The background run's rows and columns; the text is what is not bg.
+    ys = sorted(rows)
+    xs = [x for x in range(0, w, 1) if near(px[x, ys[len(ys) // 2]])]
+    x0, x1 = min(xs), max(xs)
+    best = max(ratio(px[x, y], bg) for y in ys for x in range(x0, x1 + 1))
+    out.append(f"{name}:{best:.2f}")
+print(" ".join(out))
+PY
+)"
+echo "  contrast (light theme, white on 41 44 45 47): $CONTRAST"
+for item in $CONTRAST; do
+  r="${item#*:}"
+  [[ "$r" != none ]] || fail "terminal contrast: no ${item%%:*} background row found ($CONTRAST)"
+  python3 -c "import sys; sys.exit(0 if float('$r') >= 4.5 else 1)" \
+    || fail "terminal contrast: white on ${item%%:*} is only $r:1 in the light theme ($CONTRAST)"
+done
+(( TOGGLED % 2 == 0 )) || palette_run 'Toggle light and dark'
+pass "terminal: white on red/blue/magenta/white reaches 4.5:1 in the light theme"
 xdotool key --clearmodifiers ctrl+grave
 sleep 0.5
 

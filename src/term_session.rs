@@ -296,7 +296,7 @@ pub struct CellStyle {
 }
 
 impl CellStyle {
-    const PLAIN: CellStyle = CellStyle {
+    pub(crate) const PLAIN: CellStyle = CellStyle {
         fg: CellColor::Default,
         bg: CellColor::Default,
         bold: false,

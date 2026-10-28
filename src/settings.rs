@@ -111,6 +111,11 @@ pub struct Settings {
     /// it. Clamped to 100 ..= 100 000 (VS Code's
     /// `terminal.integrated.scrollback`).
     pub terminal_scrollback: usize,
+    /// Terminal text is lightened or darkened until it stands out from its
+    /// background by this ratio (VS Code's
+    /// `terminal.integrated.minimumContrastRatio`, 4.5 = WCAG AA); 1 = off.
+    /// Read through [`Settings::terminal_contrast`] (clamped to 1 ..= 21).
+    pub terminal_minimum_contrast_ratio: f32,
 
     /// Hide everything but the text, dimming all but the current paragraph.
     /// Lasts until turned off or Malgel quits.
@@ -138,6 +143,7 @@ impl Default for Settings {
             terminal_shell_config: true,
             terminal_panel_height: None,
             terminal_scrollback: crate::term_session::SCROLLBACK_LINES,
+            terminal_minimum_contrast_ratio: DEFAULT_TERMINAL_CONTRAST,
             file_sidebar: false,
             outline_sidebar: false,
             problems_panel: false,
@@ -291,6 +297,21 @@ fn backup_path(path: &Path) -> Option<PathBuf> {
             PathBuf::from(name)
         })
         .find(|candidate| !candidate.exists())
+}
+
+/// VS Code's default `minimumContrastRatio`.
+pub const DEFAULT_TERMINAL_CONTRAST: f32 = 4.5;
+
+impl Settings {
+    /// The terminal's minimum contrast ratio, 1 (off) ..= 21 (black/white).
+    pub fn terminal_contrast(&self) -> f32 {
+        let ratio = self.terminal_minimum_contrast_ratio;
+        if ratio.is_finite() {
+            ratio.clamp(1.0, 21.0)
+        } else {
+            DEFAULT_TERMINAL_CONTRAST
+        }
+    }
 }
 
 pub fn clamp_font_size(size: f32) -> f32 {
@@ -492,6 +513,21 @@ mod tests {
         assert_eq!(s.terminal_scrollback, 10_000);
         let s: Settings = serde_json::from_str(r#"{"terminal_scrollback": 2500}"#).unwrap();
         assert_eq!(s.terminal_scrollback, 2500);
+    }
+
+    #[test]
+    fn terminal_contrast_defaults_to_vs_code_and_one_turns_it_off() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.terminal_contrast(), 4.5);
+        let off: Settings =
+            serde_json::from_str(r#"{"terminal_minimum_contrast_ratio": 1}"#).unwrap();
+        assert_eq!(off.terminal_contrast(), 1.0);
+        let wild: Settings =
+            serde_json::from_str(r#"{"terminal_minimum_contrast_ratio": 99}"#).unwrap();
+        assert_eq!(wild.terminal_contrast(), 21.0);
+        let low: Settings =
+            serde_json::from_str(r#"{"terminal_minimum_contrast_ratio": 0}"#).unwrap();
+        assert_eq!(low.terminal_contrast(), 1.0);
     }
 
     #[test]
