@@ -167,7 +167,9 @@ fn is_app_chord(keys: &Keystroke) -> bool {
         && !m.alt
         && matches!(
             keys.key.as_str(),
-            "`" | "p" | "q" | "tab" | "pageup" | "pagedown" | ","
+            // `~` and `%`: X11's Ctrl+Shift+` (New Terminal) and
+            // Ctrl+Shift+5 (Split Terminal), shift dropped for symbols.
+            "`" | "~" | "%" | "p" | "q" | "tab" | "pageup" | "pagedown" | ","
         )
 }
 
@@ -1841,6 +1843,8 @@ mod tests {
             "ctrl-p",
             "ctrl-tab",
             "ctrl-shift-`",
+            "ctrl-~",
+            "ctrl-%",
             "ctrl-q",
         ] {
             assert!(is_app_chord(&ks(chord)), "{chord}");

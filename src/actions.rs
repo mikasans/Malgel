@@ -337,6 +337,8 @@ pub fn bind_keys(cx: &mut App) {
         // No key-context: palette tip resolution (same as Toggle Side Bar).
         KeyBinding::new("ctrl-`", SummonTerminal, None),
         KeyBinding::new("ctrl-shift-`", NewTerminal, None),
+        // X11 reports Ctrl+Shift+` as Ctrl+~ (shift is dropped for symbols).
+        KeyBinding::new("ctrl-~", NewTerminal, None),
         // VS Code: Split Terminal (Ctrl+Shift+5; X11 may report it as Ctrl+%).
         KeyBinding::new("ctrl-shift-5", SplitTerminal, None),
         KeyBinding::new("ctrl-%", SplitTerminal, None),

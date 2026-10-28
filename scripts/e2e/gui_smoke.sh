@@ -1807,6 +1807,33 @@ sleep 0.5
 [[ ! -s "$WS/pty-bytes" ]] \
   || fail "scrollback keys reached the program: $(od -An -c "$WS/pty-bytes" | head -2)"
 pass "terminal: Shift+PgUp / Ctrl+Shift+Up / Shift+Home / Shift+End scroll; no bytes reach the program"
+# 21f2. Ctrl+Shift+` opens a new terminal from the editor and from inside a
+#       terminal (X11 reports the chord as Ctrl+~, which the shell must not
+#       swallow). Each terminal is one shell, a child of the app.
+shells() { pgrep -P "$APP_PID" | wc -l; }
+# Checked when called, not once when wait_for's arguments are expanded.
+shells_at_least() { [[ "$(shells)" -ge "$1" ]]; }
+shells_at_most() { [[ "$(shells)" -le "$1" ]]; }
+S0=$(shells)
+xdotool key --clearmodifiers ctrl+shift+grave
+wait_for 8 shells_at_least $(( S0 + 1 )) \
+  || fail "Ctrl+Shift+\` from the editor opened no new terminal ($S0 -> $(shells) shells)"
+sleep 1.0
+xdotool key --clearmodifiers ctrl+shift+grave
+wait_for 8 shells_at_least $(( S0 + 2 )) \
+  || fail "Ctrl+Shift+\` inside the terminal opened no new terminal ($S0 -> $(shells) shells)"
+shot 49g2-term-new-tabs
+pass "terminal: Ctrl+Shift+\` opens a new terminal from the editor and from a terminal"
+# Back to the state 21g expects: the two new terminals gone, editor focused.
+for _ in 1 2; do
+  xdotool key --clearmodifiers ctrl+shift+p
+  sleep 0.5
+  xdotool type --delay 30 'Kill Terminal'
+  sleep 0.4
+  xdotool key --clearmodifiers Return
+  sleep 0.8
+done
+wait_for 8 shells_at_most "$S0" || fail "Kill Terminal left $(shells) shells (had $S0)"
 xdotool key --clearmodifiers ctrl+grave
 sleep 0.5
 
