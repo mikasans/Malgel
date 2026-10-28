@@ -158,23 +158,13 @@ impl Settings {
     /// Load settings, falling back to defaults when the file is missing or
     /// unreadable. Out-of-range values are clamped.
     pub fn load() -> Self {
-        let Some(path) = settings_path() else {
-            return Self::default();
-        };
-        // Another editor's settings.json in the same folder (e.g. Zed-style
-        // `{"font_size":14,"theme":…}`) must not become Malgel's UI size —
-        // serde would keep font_size and fill the rest from Default, so a
-        // cold open would show ~80% of [`DEFAULT_FONT_SIZE`] (17.5).
-        let mut settings = std::fs::read_to_string(&path)
+        settings_path().map_or_else(Self::default, |path| Self::load_from(&path))
+    }
+
+    fn load_from(path: &Path) -> Self {
+        let mut settings = std::fs::read_to_string(path)
             .ok()
-            .and_then(|json| {
-                let value: serde_json::Value = serde_json::from_str(&json).ok()?;
-                let obj = value.as_object()?;
-                if !obj.contains_key("appearance") && !obj.contains_key("layout") {
-                    return None;
-                }
-                serde_json::from_value::<Settings>(value).ok()
-            })
+            .and_then(|json| parse_own(&json))
             .unwrap_or_default();
         settings.font_size = clamp_font_size(settings.font_size);
         settings.recent_files.truncate(RECENT_LIMIT);
@@ -190,11 +180,22 @@ impl Settings {
     /// Persist settings. Failures are not fatal: preferences simply are not
     /// remembered.
     pub fn save(&self) {
-        let Some(path) = settings_path() else {
-            return;
-        };
+        if let Some(path) = settings_path() {
+            self.save_to(&path);
+        }
+    }
+
+    fn save_to(&self, path: &Path) {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
+        }
+        // A file we could not read as ours (another editor's, or a typo in
+        // a hand edit) is kept beside ours rather than silently replaced.
+        if let Ok(old) = std::fs::read_to_string(path)
+            && parse_own(&old).is_none()
+            && let Some(backup) = backup_path(path)
+        {
+            let _ = std::fs::write(backup, old);
         }
         if let Ok(json) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(path, json);
@@ -208,6 +209,45 @@ impl Settings {
         self.recent_files.insert(0, path);
         self.recent_files.truncate(RECENT_LIMIT);
     }
+}
+
+/// Keys other editors' `settings.json` share with ours: on their own they
+/// do not make a file Malgel's.
+const SHARED_KEYS: [&str; 2] = ["font_size", "theme"];
+
+/// `json` as Malgel settings, or `None` when it is not ours. Another
+/// editor's settings.json in the same folder (e.g. Zed-style
+/// `{"font_size":14,"theme":…}`) must not become Malgel's UI size — serde
+/// would keep font_size and fill the rest from Default. A file is ours when
+/// it names at least one Malgel key beyond those shared ones, so a
+/// hand-written `{"terminal_scrollback":500}` counts.
+fn parse_own(json: &str) -> Option<Settings> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let obj = value.as_object()?;
+    let ours = serde_json::to_value(Settings::default()).ok()?;
+    let ours = ours.as_object()?;
+    let has_own_key = obj
+        .keys()
+        .any(|key| ours.contains_key(key) && !SHARED_KEYS.contains(&key.as_str()));
+    if !has_own_key {
+        return None;
+    }
+    serde_json::from_value::<Settings>(value).ok()
+}
+
+/// The first free `settings.json.bak`, `.bak.1` … `.bak.9`.
+fn backup_path(path: &Path) -> Option<PathBuf> {
+    (0..10)
+        .map(|n| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(if n == 0 {
+                ".bak".to_string()
+            } else {
+                format!(".bak.{n}")
+            });
+            PathBuf::from(name)
+        })
+        .find(|candidate| !candidate.exists())
 }
 
 pub fn clamp_font_size(size: f32) -> f32 {
@@ -254,6 +294,42 @@ pub fn config_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hand_written_file_with_one_of_our_keys_loads_and_survives_a_save() {
+        let dir = std::env::temp_dir().join(format!(
+            "malgel-settings-{}",
+            crate::session::new_recovery_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"terminal_scrollback":500}"#).unwrap();
+        let settings = Settings::load_from(&path);
+        assert_eq!(settings.terminal_scrollback, 500);
+        settings.save_to(&path);
+        assert_eq!(Settings::load_from(&path).terminal_scrollback, 500);
+        assert!(!dir.join("settings.json.bak").exists(), "ours: no backup");
+
+        // Another editor's file: defaults, and the save keeps a copy.
+        let foreign = r#"{"font_size":14,"theme":"One Dark"}"#;
+        std::fs::write(&path, foreign).unwrap();
+        let settings = Settings::load_from(&path);
+        assert_eq!(settings.font_size, Settings::default().font_size);
+        settings.save_to(&path);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("settings.json.bak")).unwrap(),
+            foreign
+        );
+        // A broken hand edit is backed up too, beside the first backup.
+        std::fs::write(&path, r#"{"terminal_scrollback": 5"#).unwrap();
+        Settings::load_from(&path).save_to(&path);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("settings.json.bak.1")).unwrap(),
+            r#"{"terminal_scrollback": 5"#
+        );
+        assert!(parse_own(&std::fs::read_to_string(&path).unwrap()).is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn missing_fields_use_defaults() {
