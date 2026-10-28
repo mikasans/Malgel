@@ -72,6 +72,8 @@ pub enum FileTreeEvent {
     /// The space below the entries was double-clicked: VS Code's Explorer
     /// makes a new file in the folder the tree is showing.
     NewFileInRoot,
+    /// An operation failed; the message is ready for an error toast.
+    Failed(String),
 }
 
 /// Files or folders cut or copied in the tree, waiting for a paste. `cut`
@@ -617,7 +619,7 @@ impl FileTree {
                 }
             }
             Err(err) => window.push_notification(
-                Notification::info(format!("Couldn’t create “{name}”: {err}")),
+                Notification::error(format!("Couldn’t create {name}: {}.", plain_io_error(&err))),
                 cx,
             ),
         }
@@ -707,13 +709,14 @@ impl FileTree {
         let Some(name) = sanitize_entry_name(new_name) else {
             let message = if new_name.trim().len() > MAX_NAME_BYTES {
                 format!(
-                    "Couldn’t rename: the name is {} bytes long; the limit is {MAX_NAME_BYTES}.",
+                    "Couldn’t rename {}: the new name is {} bytes long; the limit is {MAX_NAME_BYTES}.",
+                    display_name(path),
                     new_name.trim().len()
                 )
             } else {
                 "That name isn’t usable.".to_string()
             };
-            window.push_notification(Notification::info(message), cx);
+            window.push_notification(Notification::error(message), cx);
             return;
         };
         if path.file_name().and_then(|name| name.to_str()) == Some(name.as_str()) {
@@ -736,9 +739,14 @@ impl FileTree {
                     to: target,
                 });
             }
-            Err(err) => {
-                window.push_notification(Notification::info(format!("Couldn’t rename: {err}")), cx)
-            }
+            Err(err) => window.push_notification(
+                Notification::error(format!(
+                    "Couldn’t rename {}: {}.",
+                    display_name(path),
+                    plain_io_error(&err)
+                )),
+                cx,
+            ),
         }
     }
 
@@ -862,8 +870,14 @@ impl FileTree {
                         from: source,
                         to: dest,
                     }),
-                    Err(err) => window
-                        .push_notification(Notification::info(format!("Couldn’t move: {err}")), cx),
+                    Err(err) => window.push_notification(
+                        Notification::error(format!(
+                            "Couldn’t move {}: {}.",
+                            display_name(&source),
+                            plain_io_error(&err)
+                        )),
+                        cx,
+                    ),
                 }
             }
             self.clipboard = None;
@@ -1101,10 +1115,9 @@ impl FileTree {
     /// within the explorer), then re-list and report the outcome.
     fn apply_moves(&mut self, sources: Vec<PathBuf>, target_dir: &Path, cx: &mut Context<Self>) {
         let mut moved = 0usize;
-        let mut failed = 0usize;
+        let mut failures: Vec<String> = Vec::new();
         for source in sources {
             let Some(name) = source.file_name() else {
-                failed += 1;
                 continue;
             };
             let dest = target_dir.join(name);
@@ -1114,7 +1127,10 @@ impl FileTree {
             }
             // A folder can't go inside itself or one of its descendants.
             if source.is_dir() && target_dir.starts_with(&source) {
-                failed += 1;
+                failures.push(format!(
+                    "Couldn’t move {}: a folder can’t go inside itself.",
+                    display_name(&source)
+                ));
                 continue;
             }
             match move_path(&source, &dest) {
@@ -1125,14 +1141,22 @@ impl FileTree {
                         to: dest,
                     });
                 }
-                Err(_) => failed += 1,
+                Err(err) => failures.push(format!(
+                    "Couldn’t move {}: {}.",
+                    display_name(&source),
+                    plain_io_error(&err)
+                )),
             }
         }
         if moved > 0 {
             self.refresh(cx);
         }
-        if moved == 0 && failed > 0 {
-            cx.emit(FileTreeEvent::Copied { copied: 0, failed });
+        if let Some(first) = failures.first() {
+            let message = match failures.len() {
+                1 => first.clone(),
+                n => format!("{first} ({} more couldn’t be moved.)", n - 1),
+            };
+            cx.emit(FileTreeEvent::Failed(message));
         }
     }
 
@@ -1910,6 +1934,29 @@ fn sanitize_name(name: &str) -> Option<PathBuf> {
     usable.then(|| path.to_path_buf())
 }
 
+/// An I/O error in words for a toast ("Couldn't rename x: <this>."):
+/// the common causes in plain language, anything else as the system says.
+fn plain_io_error(err: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    // ENAMETOOLONG on Linux and macOS.
+    let too_long = matches!(err.raw_os_error(), Some(36 | 63) if cfg!(unix));
+    match err.kind() {
+        _ if too_long => "the name is too long for this disk".to_string(),
+        ErrorKind::InvalidFilename => "the name is too long or not allowed here".to_string(),
+        ErrorKind::PermissionDenied => {
+            "you don’t have permission to change this folder".to_string()
+        }
+        ErrorKind::AlreadyExists => "something with that name is already there".to_string(),
+        ErrorKind::NotFound => {
+            "it is no longer there (moved or deleted outside Malgel?)".to_string()
+        }
+        ErrorKind::ReadOnlyFilesystem => "the disk is read-only".to_string(),
+        ErrorKind::StorageFull => "the disk is full".to_string(),
+        ErrorKind::DirectoryNotEmpty => "a folder with that name is already there".to_string(),
+        _ => err.to_string(),
+    }
+}
+
 /// What inline rename selects in `name`: a file's stem (not `.md`; all of
 /// a dotfile like `.env`), a folder's whole name. Byte offsets.
 fn rename_selection(name: &str, is_dir: bool) -> std::ops::Range<usize> {
@@ -2140,6 +2187,18 @@ mod tests {
         assert_eq!(rename_selection(".env", false), 0..4);
         assert_eq!(rename_selection("notes.v2", true), 0..8);
         assert_eq!(rename_selection("文档.md", false), 0..6);
+    }
+
+    #[test]
+    fn file_errors_read_plainly() {
+        use super::plain_io_error;
+        use std::io::{Error, ErrorKind};
+        assert!(plain_io_error(&ErrorKind::PermissionDenied.into()).contains("permission"));
+        assert!(plain_io_error(&ErrorKind::AlreadyExists.into()).contains("already there"));
+        assert!(plain_io_error(&ErrorKind::NotFound.into()).contains("no longer there"));
+        #[cfg(unix)]
+        assert!(plain_io_error(&Error::from_raw_os_error(36)).contains("too long"));
+        assert_eq!(plain_io_error(&Error::other("odd")), "odd");
     }
 
     #[test]

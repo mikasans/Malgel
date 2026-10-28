@@ -912,6 +912,9 @@ impl Workspace {
                         };
                         window.push_notification(Notification::info(message), cx);
                     }
+                    FileTreeEvent::Failed(message) => {
+                        window.push_notification(Notification::error(message.clone()), cx);
+                    }
                     FileTreeEvent::Moved { from, to } => {
                         this.retarget_moved(from, to, window, cx);
                     }
