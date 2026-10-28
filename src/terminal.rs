@@ -1142,13 +1142,24 @@ impl TerminalPanel {
 
     /// Cursor row in view coordinates.
     fn cursor_row(&self) -> Option<(usize, usize)> {
-        let (row, col) = self.view.cursor?;
+        self.view.cursor.map(|cell| self.view_cell(cell))
+    }
+
+    /// Where the keyboard's text field sits while a shell runs: the cursor
+    /// cell, even while the program hides the cursor (`tput civis`, top),
+    /// so the focused field never leaves the tree and keys never fall
+    /// through to the editor.
+    fn sink_cell(&self) -> (usize, usize) {
+        self.view_cell(self.view.caret)
+    }
+
+    fn view_cell(&self, (row, col): (usize, usize)) -> (usize, usize) {
         let offset = if self.view.alt_screen {
             0
         } else {
             self.prelude.len()
         };
-        Some((row + offset, col))
+        (row + offset, col)
     }
 }
 
@@ -1973,9 +1984,8 @@ impl Render for TerminalPanel {
                                 let cursor = this.cursor_row();
                                 // While a shell runs, the keyboard's text field
                                 // sits on the cursor cell (see `key_sink`).
-                                let sink_row = (shell_running && this.follow_tail)
-                                    .then_some(cursor)
-                                    .flatten();
+                                let sink_row =
+                                    (shell_running && this.follow_tail).then(|| this.sink_cell());
                                 let composing = !this.input.read(_cx).value().is_empty();
                                 let cursor_cell = this.cursor_cell(_window, _cx);
                                 let (cell_w, cursor_color) = (this.cell.0, colors.fg);

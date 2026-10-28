@@ -2090,6 +2090,42 @@ MENU_LEFT="$(region_differ 49g15-term-before-menu 49g17-term-menu-typed "$TERM_R
 [[ "$MENU_LEFT" -gt 0 ]] || fail "the key typed with the menu open did not reach the shell"
 xdotool key --clearmodifiers BackSpace
 pass "terminal: one wheel notch is one mouse report; typing closes the context menu"
+# 21f8. A program that hides the cursor (`tput civis`, top, htop) keeps the
+#       keyboard: every key still goes to the shell, none to the document
+#       open in the editor (the key field used to follow the visible cursor
+#       out of the tree), and `tput cnorm` brings the caret back.
+TITLE_BEFORE="$(xdotool getwindowname "$WIN" 2>/dev/null)"
+rm -f "$WS/civis-hi" "$WS/top-q"
+xdotool type --delay 20 "clear; tput civis"
+xdotool key --clearmodifiers Return
+sleep 0.8
+shot 49g18-term-civis
+xdotool type --delay 20 "echo hi >'$WS/civis-hi'"
+xdotool key --clearmodifiers Return
+wait_for 5 test -s "$WS/civis-hi" \
+  || fail "with the cursor hidden, typed 'echo hi' never reached the shell"
+[[ "$(cat "$WS/civis-hi")" == hi ]] || fail "the shell got '$(cat "$WS/civis-hi")', not 'echo hi'"
+if command -v top >/dev/null; then
+  xdotool type --delay 20 "top"
+  xdotool key --clearmodifiers Return
+  sleep 1.5
+  xdotool type --delay 30 "q"
+  sleep 0.8
+  xdotool type --delay 20 "echo q >'$WS/top-q'"
+  xdotool key --clearmodifiers Return
+  wait_for 5 test -s "$WS/top-q" || fail "q did not quit top (or what followed missed the shell)"
+fi
+[[ "$(xdotool getwindowname "$WIN" 2>/dev/null)" == "$TITLE_BEFORE" ]] \
+  || fail "keys typed into the hidden-cursor terminal reached the editor (title '$(xdotool getwindowname "$WIN")')"
+xdotool type --delay 20 "clear; tput civis"
+xdotool key --clearmodifiers Return
+sleep 0.8
+shot 49g19-term-civis-clear
+xdotool type --delay 20 "clear; tput cnorm"
+xdotool key --clearmodifiers Return
+term_differs 49g20-term-cnorm 49g19-term-civis-clear 40 \
+  || fail "tput cnorm did not bring the terminal caret back"
+pass "terminal: with the cursor hidden (tput civis, top) keys reach only the shell; tput cnorm shows the caret"
 xdotool key --clearmodifiers ctrl+grave
 sleep 0.5
 

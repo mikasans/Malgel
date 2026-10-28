@@ -266,6 +266,10 @@ pub struct ViewInfo {
     pub line_count: usize,
     /// `(view row, column in chars)` when the program shows a cursor.
     pub cursor: Option<(usize, usize)>,
+    /// `(view row, column in chars)` of the cursor even while the program
+    /// hides it (`tput civis`, top, htop): the keyboard's text field stays
+    /// there so keys keep going to the terminal.
+    pub caret: (usize, usize),
     /// The cursor's grid column in cells (a wide char takes two), where a
     /// bar or underline cursor is drawn.
     pub cursor_cell: usize,
@@ -1174,7 +1178,7 @@ fn view_info_term<T>(term: &Term<T>) -> ViewInfo {
         _ => CursorShape::Block,
     };
     let shown = mode.contains(TermMode::SHOW_CURSOR) && style != ansi::CursorShape::Hidden;
-    let cursor = shown.then(|| {
+    let caret = {
         let Point { line, column } = grid.cursor.point;
         let row = (line.0 - top).max(0) as usize;
         // Column in chars: wide-char spacers are skipped in the row text.
@@ -1187,10 +1191,11 @@ fn view_info_term<T>(term: &Term<T>) -> ViewInfo {
             })
             .count();
         (row, col)
-    });
+    };
     ViewInfo {
         line_count: (bottom - top + 1).max(0) as usize,
-        cursor,
+        cursor: shown.then_some(caret),
+        caret,
         cursor_cell: grid.cursor.point.column.0,
         cursor_shape,
         alt_screen: mode.contains(TermMode::ALT_SCREEN),
@@ -2052,6 +2057,12 @@ mod selection_tests {
         assert_eq!(info.cursor_cell, 3);
         feed(&mut t, "\x1b[?25l");
         assert_eq!(view_info_term(&t).cursor, None);
+        // Hidden, the cursor still has a place: the key field stays there.
+        assert_eq!(view_info_term(&t).caret, (0, 2));
+        feed(&mut t, "\x1b[1;1H\x1b[?1049h\x1b[3;5H");
+        assert_eq!(view_info_term(&t).cursor, None);
+        assert_eq!(view_info_term(&t).caret, (2, 4), "alt screen, hidden");
+        feed(&mut t, "\x1b[?1049l");
         feed(&mut t, "\x1b[?25h");
         assert!(view_info_term(&t).cursor.is_some());
     }
