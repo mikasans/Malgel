@@ -27,13 +27,6 @@ pub struct Hit {
     pub text: String,
 }
 
-/// VS Code's smart case: a query with no uppercase letter matches either case,
-/// one that has an uppercase letter matches exactly. That way `smoke` finds
-/// `SMOKE`, while `SMOKE` finds only the shouty one.
-pub fn case_sensitive(query: &str) -> bool {
-    query.chars().any(char::is_uppercase)
-}
-
 /// Where `query` starts in `line`, comparing without case. Returns the index
 /// of the first matching character, so the caller can point at the column.
 fn find_ignoring_case(line: &str, query: &str) -> Option<usize> {
@@ -75,8 +68,9 @@ pub struct FindFlags {
 }
 
 /// A compiled Find in Files query: the editor's own matcher
-/// ([`SearchQuery`], so both find the same text), with the smart-case rule
-/// on top when Match Case is off and the query is not a regex.
+/// ([`SearchQuery`], so both find the same text). Like the editor's Find
+/// (and VS Code, whose `search.smartCase` is off by default), case is
+/// ignored unless Match Case is on, whatever letters the query has.
 #[derive(Clone, Debug, Default)]
 pub struct Find {
     query: Option<SearchQuery>,
@@ -86,7 +80,7 @@ impl Find {
     /// `Err` with the parser's message when `text` is not a valid regex.
     pub fn new(text: &str, flags: FindFlags) -> Result<Self, String> {
         let options = SearchOptions {
-            case_sensitive: flags.match_case || (!flags.regex && case_sensitive(text)),
+            case_sensitive: flags.match_case,
             whole_word: flags.whole_word,
             regex: flags.regex,
         };
@@ -129,7 +123,7 @@ impl Find {
     }
 }
 
-/// A literal query with smart case: what a typed query means with every
+/// A literal query ignoring case: what a typed query means with every
 /// toggle off.
 impl From<&str> for Find {
     fn from(text: &str) -> Self {
@@ -308,7 +302,7 @@ fn read_loaded(path: &std::path::Path) -> Result<crate::document::LoadedText, Un
 }
 
 /// How many occurrences of `find` the files hold, and in how many files,
-/// with the same smart-case rule Replace uses. Uncapped: this is what a
+/// with the same case rule Replace uses. Uncapped: this is what a
 /// Replace All is about to change.
 pub fn count_in_files(files: &[PathBuf], find: impl Into<Find>) -> (usize, usize) {
     let find = find.into();
@@ -425,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lowercase_query_matches_either_case_and_an_uppercase_one_does_not() {
+    fn a_query_matches_either_case_whatever_its_letters() {
         let text = "first SMOKE\nsecond smoke\nthird has none\n";
         assert_eq!(
             search_text(text, "smoke", 10),
@@ -434,9 +428,10 @@ mod tests {
                 (2, 8, "second smoke".to_string())
             ]
         );
+        // No smart case: the editor's Find ignores case until Aa is on.
         assert_eq!(
             search_text(text, "SMOKE", 10),
-            [(1, 7, "first SMOKE".to_string())]
+            search_text(text, "smoke", 10)
         );
         assert!(search_text(text, "smoke", 0).is_empty());
         assert!(search_text(text, "", 10).is_empty());
@@ -532,7 +527,7 @@ mod tests {
         assert_eq!(found.hits.iter().filter(|hit| hit.path == big).count(), 10);
         assert!(found.limited);
         assert_eq!(count_lines("Fn a\nfn b\nnone\n", "fn"), 2);
-        assert_eq!(count_lines("Fn a\nfn b\n", "Fn"), 1);
+        assert_eq!(count_lines("Fn a\nfn b\n", "Fn"), 2);
         assert_eq!(match_bytes("src/M099.rs", "m09"), Some(4..7));
         assert_eq!(match_bytes("ab", "B"), Some(1..2));
         assert_eq!(match_bytes("éa", "A"), Some(2..3));
@@ -557,7 +552,7 @@ mod tests {
             })
             .collect();
         assert_eq!(count_in_files(&files, "alpha"), (8, 4));
-        assert_eq!(count_in_files(&files, "Alpha"), (4, 4));
+        assert_eq!(count_in_files(&files, "Alpha"), (8, 4), "no smart case");
         let replaced = replace_in_files(&files, "alpha", "gamma");
         assert_eq!((replaced.occurrences, replaced.written.len()), (8, 4));
         assert_eq!(replaced.skipped, 0);
@@ -566,11 +561,20 @@ mod tests {
     }
 
     #[test]
-    fn replace_in_text_respects_smart_case() {
+    fn replace_in_text_ignores_case_like_the_editor_find() {
         let (out, n) = replace_in_text("Foo foo FOO", "foo", "bar");
         assert_eq!(n, 3);
         assert_eq!(out, "bar bar bar");
+        // An uppercase letter does not switch on Match Case (no smart case):
+        // the editor's Find finds all three too.
         let (out, n) = replace_in_text("Foo foo FOO", "Foo", "Bar");
+        assert_eq!(n, 3);
+        assert_eq!(out, "Bar Bar Bar");
+        let case = FindFlags {
+            match_case: true,
+            ..Default::default()
+        };
+        let (out, n) = replace_in_text("Foo foo FOO", Find::new("Foo", case).unwrap(), "Bar");
         assert_eq!(n, 1);
         assert_eq!(out, "Bar foo FOO");
     }
@@ -593,7 +597,7 @@ mod tests {
         let (out, n) = replace_in_text(text, &find, "bar($2, $1)");
         assert_eq!(n, 2);
         assert_eq!(out, "a = bar(y, x);\nb = bar(dd, cc);\nfoo()\n");
-        // Whole word, and Match Case over smart case.
+        // Whole word, and Match Case.
         let word = FindFlags {
             whole_word: true,
             ..Default::default()
