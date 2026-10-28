@@ -1950,6 +1950,24 @@ xdotool mousemove $(( SW / 2 )) $(( SH / 4 )) click 1
 term_differs 49g11-cursor-unfocused 49g10-cursor-block-again 40 \
   || fail "the terminal cursor looked the same with focus in the editor"
 pass "terminal: DECSCUSR draws a bar cursor, CSI 0 SP q the block, and it is an outline without focus"
+# 21f4. Tabs line up: the rows printed with tabs look exactly like the same
+#       rows with the spaces typed out (the '\t' cell was drawn as a glyph
+#       of its own width, pushing the rest of the row off its column).
+xdotool mousemove $(( SW / 2 )) $(( SH * 72 / 100 )) click 1
+sleep 0.5
+xdotool type --delay 20 "clear; printf 'a\\tX\\nabc\\tX\\nabcd\\tX\\n12345678\\tX\\n'"
+xdotool key --clearmodifiers Return
+sleep 1.0
+shot 49g12-term-tabs
+xdotool type --delay 20 "clear; printf 'a       X\\nabc     X\\nabcd    X\\n12345678        X\\n'"
+xdotool key --clearmodifiers Return
+sleep 1.0
+shot 49g13-term-spaces
+TABS_DIFF="$(region_differ 49g12-term-tabs 49g13-term-spaces "$TERM_ROWS")"
+# Only the typed command line differs (its text is longer for the spaces).
+[[ "$TABS_DIFF" -lt 4000 ]] || fail "tab stops do not line up with spaces ($TABS_DIFF px)"
+pass "terminal: tabs stop at every 8th column like the spaces they stand for"
+# 21f5. Mouse reporting: a full-screen program that asked for the mouse
 xdotool key --clearmodifiers ctrl+grave
 sleep 0.5
 

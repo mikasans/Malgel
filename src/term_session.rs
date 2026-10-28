@@ -942,7 +942,12 @@ fn row_text<T>(term: &Term<T>, line: Line) -> (String, bool) {
         {
             continue;
         }
-        text.push(cell.c);
+        // A tab leaves '\t' in the cell where it started and moves the
+        // cursor to the next stop; the cells it skips are blanks. Drawn as
+        // a space, every cell keeps its column (a '\t' glyph would be
+        // shaped at some other width and shift the rest of the row).
+        let ch = shown_char(cell.c);
+        text.push(ch);
         if let Some(extra) = cell.zerowidth() {
             text.extend(extra.iter());
         }
@@ -970,14 +975,14 @@ fn styled_row<T>(term: &Term<T>, line: Line) -> StyledRow {
             continue;
         }
         let start = text.len();
-        text.push(cell.c);
+        text.push(shown_char(cell.c));
         if let Some(extra) = cell.zerowidth() {
             text.extend(extra.iter());
         }
         let end = text.len();
         let style = cell_style(cell);
         let visible_bg = style.bg != CellColor::Default || style.is_inverse_default();
-        if cell.c != ' ' || visible_bg {
+        if ch != ' ' || visible_bg {
             keep = end;
         }
         if style == CellStyle::PLAIN {
@@ -999,7 +1004,13 @@ fn styled_row<T>(term: &Term<T>, line: Line) -> StyledRow {
 fn row_is_blank<T>(term: &Term<T>, line: Line) -> bool {
     let grid = term.grid();
     let row = &grid[line];
-    (0..grid.columns()).all(|c| row[Column(c)].c == ' ')
+    (0..grid.columns()).all(|c| shown_char(row[Column(c)].c) == ' ')
+}
+
+/// What a cell shows: a tab's cell is blank. (Copying keeps the tab:
+/// selections go through the emulator's own text, which writes '\t'.)
+fn shown_char(c: char) -> char {
+    if c == '\t' { ' ' } else { c }
 }
 
 /// Lowest line worth showing on the normal screen: the cursor line or the
@@ -1895,6 +1906,27 @@ mod selection_tests {
     fn wide_chars_map_view_columns_to_cells() {
         let mut t = term(40, 5, 100);
         feed(&mut t, "中文 ok\n");
+        #[test]
+        fn tabs_line_up_at_every_eighth_column() {
+            let mut t = term(40, 6, 100);
+            feed(&mut t, "a\tX\r\nabc\tX\r\nabcd\tX\r\n12345678\tX\r\n");
+            let columns: Vec<_> = (0..4)
+                .map(|line| {
+                    let row = styled_row(&t, Line(line));
+                    assert!(!row.text.contains('\t'), "{:?}", row.text);
+                    row.text.chars().position(|c| c == 'X')
+                })
+                .collect();
+            assert_eq!(columns, [Some(8), Some(8), Some(8), Some(16)]);
+            assert_eq!(
+                row_text(&t, Line(0)).0.chars().position(|c| c == 'X'),
+                Some(8)
+            );
+            // A row holding only a tab is blank.
+            feed(&mut t, "\t");
+            assert!(row_is_blank(&t, Line(4)));
+        }
+
         // View chars: 中 文 ' ' o k — the grid has spacer cells between.
         term_select_start(&mut t, SelectKind::Cells, 0, 1);
         term_select_update(&mut t, 0, 5);
