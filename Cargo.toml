@@ -164,7 +164,9 @@ debug = false
 lto = "thin"
 codegen-units = 1
 opt-level = 3
-strip = true
+# Keep function names (not line tables) so a crash report's backtrace says
+# where it was; the panic's own file:line is logged as well.
+strip = "debuginfo"
 
 # gpui-base 0.7.0: fold chevrons only armed their click handlers when painted
 # (hover / current line / folded), and EditorState exposed no Fold / Unfold API.

@@ -5,6 +5,22 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=packaging/windows/malgel.ico");
 
+    // The commit, for log lines and crash reports (absent outside a git
+    // checkout, e.g. a crates.io build).
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty());
+    if let Some(sha) = sha {
+        println!("cargo:rustc-env=MALGEL_GIT_SHA={sha}");
+    }
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads");
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

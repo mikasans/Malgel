@@ -172,6 +172,14 @@ fn log_level(value: Option<&str>) -> log::LevelFilter {
 fn main() {
     crate::perf::init();
     crate::crash::install_panic_hook();
+    // Which build wrote what follows (crash reports quote the log).
+    if let Some(log) = crate::logfile::RotatingLog::app() {
+        log.write_line(&format!(
+            "[{}] start {}",
+            crate::logfile::timestamp(),
+            crate::logfile::build_label()
+        ));
+    }
     let _ = log::set_boxed_logger(Box::new(StdErrLogger {
         quiet: std::env::var_os("RUST_LOG").is_none(),
     }));

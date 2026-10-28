@@ -154,9 +154,19 @@ pub fn install_panic_hook() {
         let name = thread.name().unwrap_or("unnamed");
         let backtrace = std::backtrace::Backtrace::force_capture();
         if let Some(log) = crate::logfile::RotatingLog::app() {
+            let location = info
+                .location()
+                .map_or_else(|| "unknown location".to_string(), |l| l.to_string());
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic".into());
             log.write_line(&format!(
-                "[{}] PANIC on thread '{name}': {info} — {written} unsaved document(s) written to recovery\n{backtrace}",
-                crate::logfile::timestamp()
+                "[{}] PANIC on thread '{name}' at {location}: {message} — {} — {written} unsaved document(s) written to recovery\n{backtrace}",
+                crate::logfile::timestamp(),
+                crate::logfile::build_label(),
             ));
         }
         previous(info);
