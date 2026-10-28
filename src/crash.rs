@@ -8,12 +8,15 @@
 //!   recovery write.
 //! - The hook also appends the panic, its thread and a backtrace to the
 //!   rotating log ([`crate::logfile`]).
+//! - Background work (renders, listings, the terminal's reader) runs under
+//!   [`isolate`]: a panic there is logged and that one job is dropped; the
+//!   app keeps running.
 //! - `MALGEL_CRASH_TEST=1` adds a hidden "Developer: Crash (test recovery)"
 //!   command that panics on the UI thread, for tests of all of the above.
 
 use std::{
     collections::BTreeMap,
-    panic,
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
@@ -160,6 +163,23 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// Run background work so that a panic in it costs only this job: the
+/// panic is logged (by the hook) and `None` comes back.
+pub fn isolate<T>(what: &str, work: impl FnOnce() -> T) -> Option<T> {
+    match panic::catch_unwind(AssertUnwindSafe(work)) {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic".into());
+            log::error!("{what} panicked and was stopped: {message}");
+            None
+        }
+    }
+}
+
 /// The hidden crash command is offered (tests of crash recovery only).
 pub fn crash_test_enabled() -> bool {
     std::env::var_os("MALGEL_CRASH_TEST").is_some_and(|v| v == "1")
@@ -236,5 +256,15 @@ mod tests {
         drop(guard);
         assert_eq!(reg.flush_into(&dir), 1);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn isolate_turns_a_panic_into_none() {
+        assert_eq!(isolate("ok job", || 7), Some(7));
+        let out: Option<u8> = isolate("bad job", || panic!("boom"));
+        assert_eq!(out, None);
+        let s = String::from("中");
+        let out = isolate("slicing", || s[0..1].len());
+        assert_eq!(out, None);
     }
 }

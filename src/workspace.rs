@@ -2080,12 +2080,17 @@ impl Workspace {
             let task = cx.background_executor().spawn(async move {
                 let bytes = std::fs::read(&read_path)
                     .map_err(|err| format!("Couldn\u{2019}t read it. {err}"))?;
-                if pdf {
-                    crate::pdf_view::PdfDocument::from_bytes(bytes).map(MediaLoad::Pdf)
-                } else {
-                    crate::image_view::load_image(&read_path, bytes)
-                        .map(|(image, width, height)| MediaLoad::Image(image, width, height))
-                }
+                // A decoder panic on a broken file is an error for that
+                // file, not a dead worker thread.
+                crate::crash::isolate("image / PDF decode", || {
+                    if pdf {
+                        crate::pdf_view::PdfDocument::from_bytes(bytes).map(MediaLoad::Pdf)
+                    } else {
+                        crate::image_view::load_image(&read_path, bytes)
+                            .map(|(image, width, height)| MediaLoad::Image(image, width, height))
+                    }
+                })
+                .unwrap_or_else(|| Err("Couldn\u{2019}t decode it.".to_string()))
             });
             let placeholder = self.place_loading(&path, placement, window, cx);
             cx.spawn_in(window, async move |this, cx| {
@@ -2313,30 +2318,35 @@ impl Workspace {
             return;
         }
         let task = cx.background_executor().spawn(async move {
-            let mut changes = Vec::new();
-            for (id, path, known, saved_hash) in targets {
-                let stamp = DiskStamp::of(&path);
-                if stamp == known {
-                    continue;
-                }
-                let change = match stamp {
-                    None if known.is_some() => DiskChange::Missing,
-                    None => continue,
-                    Some(_) => match document::load(&path) {
-                        Ok(loaded) if content_hash(&loaded.text) == saved_hash => {
-                            DiskChange::Touched(stamp)
-                        }
-                        Ok(loaded) => DiskChange::Changed {
-                            text: loaded.text,
-                            line_ending: loaded.line_ending,
-                            stamp,
+            // The file watcher's work: a panic reading one file skips this
+            // poll, the next one tries again.
+            crate::crash::isolate("disk change check", || {
+                let mut changes = Vec::new();
+                for (id, path, known, saved_hash) in targets {
+                    let stamp = DiskStamp::of(&path);
+                    if stamp == known {
+                        continue;
+                    }
+                    let change = match stamp {
+                        None if known.is_some() => DiskChange::Missing,
+                        None => continue,
+                        Some(_) => match document::load(&path) {
+                            Ok(loaded) if content_hash(&loaded.text) == saved_hash => {
+                                DiskChange::Touched(stamp)
+                            }
+                            Ok(loaded) => DiskChange::Changed {
+                                text: loaded.text,
+                                line_ending: loaded.line_ending,
+                                stamp,
+                            },
+                            Err(_) => continue,
                         },
-                        Err(_) => continue,
-                    },
-                };
-                changes.push((id, change));
-            }
-            changes
+                    };
+                    changes.push((id, change));
+                }
+                changes
+            })
+            .unwrap_or_default()
         });
         cx.spawn_in(window, async move |this, cx| {
             let changes = task.await;

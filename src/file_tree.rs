@@ -309,10 +309,15 @@ impl FileTree {
             .collect();
         let show_hidden = self.show_hidden;
         let listing = cx.background_executor().spawn(async move {
-            folders
-                .into_iter()
-                .filter_map(|folder| list(&folder, show_hidden).map(|entries| (folder, entries)))
-                .collect::<HashMap<_, _>>()
+            crate::crash::isolate("folder listing", || {
+                folders
+                    .into_iter()
+                    .filter_map(|folder| {
+                        list(&folder, show_hidden).map(|entries| (folder, entries))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default()
         });
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let listings = listing.await;

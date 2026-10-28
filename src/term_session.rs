@@ -424,14 +424,33 @@ impl PtySession {
             let shared = shared.clone();
             thread::Builder::new()
                 .name("malgel-pty-reader".into())
-                .spawn(move || reader_loop(reader, poll_fd, shared))
+                .spawn(move || {
+                    // A parser panic ends this session (shown as exited),
+                    // not the app.
+                    let guard = shared.clone();
+                    if crate::crash::isolate("terminal reader", || {
+                        reader_loop(reader, poll_fd, shared)
+                    })
+                    .is_none()
+                    {
+                        guard.eof.store(true, Ordering::Release);
+                        guard.dirty.store(true, Ordering::Release);
+                    }
+                })
                 .map_err(|err| format!("Couldn’t start reader: {err}"))?;
         }
         {
             let input = input.clone();
             thread::Builder::new()
                 .name("malgel-pty-writer".into())
-                .spawn(move || writer_loop(writer, input))
+                .spawn(move || {
+                    let guard = input.clone();
+                    if crate::crash::isolate("terminal writer", || writer_loop(writer, input))
+                        .is_none()
+                    {
+                        guard.close();
+                    }
+                })
                 .map_err(|err| format!("Couldn’t start writer: {err}"))?;
         }
 

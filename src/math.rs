@@ -211,7 +211,12 @@ pub fn checked_typst(tex: &str, style: MathStyle) -> Result<String, String> {
 }
 
 fn layout(tex: &str, style: MathStyle, font_size: f32, color: &str) -> Result<Page, String> {
-    typeset(&equation(&to_typst(tex)?, style), font_size, color)
+    // Formulas are laid out as they are typed: a compiler panic on one
+    // costs that formula, never the preview thread.
+    crate::crash::isolate("math layout", || {
+        typeset(&equation(&to_typst(tex)?, style), font_size, color)
+    })
+    .unwrap_or_else(|| Err("Couldn’t lay out the formula.".into()))
 }
 
 fn typeset(body: &str, font_size: f32, color: &str) -> Result<Page, String> {

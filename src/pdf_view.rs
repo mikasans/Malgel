@@ -601,7 +601,15 @@ impl PdfView {
         let interpreter_settings = doc.interpreter_settings.clone();
         let render_settings = doc.render_settings.clone();
         let task = cx.background_executor().spawn(async move {
-            PdfDocument::render_page_bytes(bytes, indices, interpreter_settings, render_settings)
+            crate::crash::isolate("PDF page render", || {
+                PdfDocument::render_page_bytes(
+                    bytes,
+                    indices,
+                    interpreter_settings,
+                    render_settings,
+                )
+            })
+            .unwrap_or_default()
         });
         cx.spawn(async move |this, cx| {
             let outcome = task.await;

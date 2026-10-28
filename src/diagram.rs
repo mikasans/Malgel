@@ -138,6 +138,13 @@ pub struct Diagram {
 /// Render `source` with `theme`. `id` scopes the diagram's styles and
 /// markers, and must differ between diagrams sharing an HTML page.
 pub fn render(source: &str, theme: &DiagramTheme, id: &str) -> Result<Diagram, String> {
+    // A diagram is rendered as it is typed: a renderer panic on a
+    // half-written one costs that diagram, never the thread.
+    crate::crash::isolate("Mermaid render", || render_unguarded(source, theme, id))
+        .unwrap_or_else(|| Err("The diagram renderer failed on this diagram.".into()))
+}
+
+fn render_unguarded(source: &str, theme: &DiagramTheme, id: &str) -> Result<Diagram, String> {
     static ENGINE: LazyLock<Engine> = LazyLock::new(Engine::new);
     let presentation = Presentation::new()
         .with_theme(theme.host_theme()?)
