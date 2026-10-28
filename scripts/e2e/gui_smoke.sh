@@ -558,15 +558,37 @@ xdotool key --clearmodifiers F2
 shot 10-rename-prompt
 [[ "$(pixels_differ 09-explorer-focus 10-rename-prompt)" -gt 1000 ]] \
   || fail "F2 did not open the rename prompt"
-xdotool key --clearmodifiers ctrl+a
-xdotool type --delay 40 'renamed.md'
+# F2 selects the stem (VS Code): typing replaces "README", keeping ".md".
+xdotool type --delay 40 'renamed'
 xdotool key --clearmodifiers Return
 sleep 0.8
 shot 11-after-rename
-wait_for 5 test -f "$WS/renamed.md" || fail "F2 in the Explorer did not rename the file on disk"
+wait_for 5 test -f "$WS/renamed.md" || fail "F2 + typing 'renamed' did not make renamed.md (stem not selected?): $(ls "$WS")"
 [[ ! -e "$WS/README.md" ]] || fail "the old name is still on disk after the rename"
 wait_for 5 grep -q 'SMOKE' "$WS/renamed.md" || fail "the renamed file lost its contents"
-pass "F2 in the Explorer renames the picked file on disk"
+pass "F2 in the Explorer selects the stem and renames the file on disk"
+
+# 6b. A name the filesystem refuses (over 255 bytes) must not lose the file:
+#     a toast says why, the file stays, and its tab keeps its path.
+before_files="$(ls -A "$WS" | sort)"
+xdotool key --clearmodifiers F2
+sleep 0.5
+xdotool type --delay 2 "$(printf 'x%.0s' $(seq 1 300))"
+shot 11b-long-name-typed
+xdotool key --clearmodifiers Return
+sleep 0.8
+shot 11c-long-name-refused
+[[ -f "$WS/renamed.md" ]] && grep -q 'SMOKE' "$WS/renamed.md" \
+  || fail "renaming to a 300-byte name lost the file: $(ls -A "$WS")"
+[[ "$(ls -A "$WS" | sort)" == "$before_files" ]] || fail "a refused rename changed the folder: $(ls -A "$WS")"
+W_NOW=$(xdotool search --pid "$APP_PID" --onlyvisible --name . 2>/dev/null | head -1)
+[[ "$(xdotool getwindowname "$W_NOW" 2>/dev/null)" == *renamed.md* ]] \
+  || fail "after a refused rename the window title is '$(xdotool getwindowname "$W_NOW" 2>/dev/null)'"
+[[ "$(region_differ 11-after-rename 11c-long-name-refused 520x200+1080+800)" -gt 300 ]] \
+  || fail "a refused rename showed no message"
+xdotool key --clearmodifiers Escape
+sleep 0.3
+pass "a 300-byte rename is refused with a message; the file and its tab are unchanged"
 
 # 7. Close the editor showing a second file, then bring it back with
 #    Ctrl+Shift+T, the way VS Code's Reopen Closed Editor does.

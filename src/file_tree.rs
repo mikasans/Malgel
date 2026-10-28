@@ -635,7 +635,7 @@ impl FileTree {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name.clone()));
         self._rename_sub = Some(cx.subscribe_in(
             &input,
             window,
@@ -654,9 +654,15 @@ impl FileTree {
         }
         let focus = input.read(cx).focus_handle(cx);
         focus.focus(window, cx);
-        // Select all so typing replaces the name (stem selection is a later polish).
-        window.dispatch_action(Box::new(gpui_kit::component::input::SelectAll), cx);
-        let _ = is_dir;
+        // As VS Code: a file's name without its extension is selected, a
+        // folder's whole name. Done once the box is focused and laid out (a
+        // selection made before then was lost, leaving only a caret).
+        let selection = rename_selection(&name, is_dir);
+        let select = input.clone();
+        window.defer(cx, move |window, cx| {
+            focus.focus(window, cx);
+            select.update(cx, |state, cx| state.set_selected_range(selection, cx));
+        });
         cx.notify();
     }
 
@@ -699,7 +705,15 @@ impl FileTree {
         cx: &mut Context<Self>,
     ) {
         let Some(name) = sanitize_entry_name(new_name) else {
-            window.push_notification(Notification::info("That name isn’t usable."), cx);
+            let message = if new_name.trim().len() > MAX_NAME_BYTES {
+                format!(
+                    "Couldn’t rename: the name is {} bytes long; the limit is {MAX_NAME_BYTES}.",
+                    new_name.trim().len()
+                )
+            } else {
+                "That name isn’t usable.".to_string()
+            };
+            window.push_notification(Notification::info(message), cx);
             return;
         };
         if path.file_name().and_then(|name| name.to_str()) == Some(name.as_str()) {
@@ -1896,32 +1910,117 @@ fn sanitize_name(name: &str) -> Option<PathBuf> {
     usable.then(|| path.to_path_buf())
 }
 
-/// The name typed into Rename: one entry, no folders and no stepping up.
+/// What inline rename selects in `name`: a file's stem (not `.md`; all of
+/// a dotfile like `.env`), a folder's whole name. Byte offsets.
+fn rename_selection(name: &str, is_dir: bool) -> std::ops::Range<usize> {
+    match name.rfind('.') {
+        Some(dot) if !is_dir && dot > 0 => 0..dot,
+        _ => 0..name.len(),
+    }
+}
+
+/// The longest file or folder name most filesystems take (ext4, APFS,
+/// NTFS count 255 bytes or UTF-16 units; bytes is the stricter).
+const MAX_NAME_BYTES: usize = 255;
+
+/// The name typed into Rename: one entry, no folders and no stepping up,
+/// and short enough for the filesystem.
 fn sanitize_entry_name(name: &str) -> Option<String> {
     let trimmed = name.trim();
-    let usable =
-        !trimmed.is_empty() && trimmed != "." && trimmed != ".." && !trimmed.contains(['/', '\\']);
+    let usable = !trimmed.is_empty()
+        && trimmed != "."
+        && trimmed != ".."
+        && !trimmed.contains(['/', '\\'])
+        && trimmed.len() <= MAX_NAME_BYTES;
     usable.then(|| trimmed.to_string())
 }
 
-/// Move `source` to `dest`, falling back to copy + delete when the rename
-/// crosses filesystems.
+/// Move `source` to `dest` (which must not exist). Only a rename that
+/// crosses filesystems falls back to copy + delete, and the source is
+/// deleted only once the copy at `dest` is complete. Any other failure
+/// (a name too long, no permission ...) leaves everything as it was.
 fn move_path(source: &Path, dest: &Path) -> std::io::Result<()> {
-    if std::fs::rename(source, dest).is_ok() {
-        return Ok(());
+    move_path_using(source, dest, |from, to| std::fs::rename(from, to))
+}
+
+fn move_path_using(
+    source: &Path,
+    dest: &Path,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if dest.symlink_metadata().is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("“{}” already exists", display_name(dest)),
+        ));
     }
-    let target = dest.parent().ok_or_else(|| {
-        std::io::Error::new(
+    match rename(source, dest) {
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {}
+        result => return result,
+    }
+    if source.is_dir() && dest.starts_with(source) {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "destination has no parent",
-        )
-    })?;
-    copy_entry(source, target)?;
+            "cannot move a folder into itself",
+        ));
+    }
+    let copied = if source.is_dir() {
+        copy_dir_all(source, dest)
+    } else {
+        std::fs::copy(source, dest).map(|_| ())
+    }
+    .and_then(|()| {
+        if same_content(source, dest)? {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "the copy does not match the original",
+            ))
+        }
+    });
+    if let Err(err) = copied {
+        // Only what this move created goes; the source is untouched.
+        let _ = if dest.is_dir() {
+            std::fs::remove_dir_all(dest)
+        } else {
+            std::fs::remove_file(dest)
+        };
+        return Err(err);
+    }
     if source.is_dir() {
         std::fs::remove_dir_all(source)
     } else {
         std::fs::remove_file(source)
     }
+}
+
+/// Whether `copy` holds the same entries, with the same file sizes, as
+/// `original`.
+fn same_content(original: &Path, copy: &Path) -> std::io::Result<bool> {
+    let (a, b) = (original.metadata()?, copy.metadata()?);
+    if a.is_dir() != b.is_dir() {
+        return Ok(false);
+    }
+    if !a.is_dir() {
+        return Ok(a.len() == b.len());
+    }
+    let names = |dir: &Path| -> std::io::Result<Vec<std::ffi::OsString>> {
+        let mut names = std::fs::read_dir(dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    };
+    let entries = names(original)?;
+    if entries != names(copy)? {
+        return Ok(false);
+    }
+    for name in entries {
+        if !same_content(&original.join(&name), &copy.join(&name))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Copy `src` into the `target` folder, recursing into directories.
@@ -1932,6 +2031,13 @@ fn copy_entry(src: &Path, target: &Path) -> std::io::Result<()> {
     let dst = target.join(name);
     if src == dst {
         return Ok(());
+    }
+    if dst.symlink_metadata().is_ok() {
+        // std::fs::copy would silently replace a file of the same name.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("“{}” already exists", display_name(&dst)),
+        ));
     }
     if src.is_dir() {
         // Copying a folder into itself (or a folder below it) would recurse.
@@ -1988,6 +2094,98 @@ fn list(folder: &Path, show_hidden: bool) -> Option<Vec<Entry>> {
 
 #[cfg(test)]
 mod tests {
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "malgel-tree-{tag}-{}",
+            crate::session::new_recovery_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_rename_the_filesystem_refuses_deletes_nothing() {
+        use super::{move_path, sanitize_entry_name};
+        let dir = scratch("long-name");
+        let file = dir.join("note.md");
+        std::fs::write(&file, "keep me").unwrap();
+        let folder = dir.join("folder");
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join("sub/child.md"), "child").unwrap();
+        let long = "x".repeat(300);
+        assert_eq!(sanitize_entry_name(&long), None, "pre-checked");
+        // Even past the pre-check, the failed rename keeps the source.
+        assert!(move_path(&file, &dir.join(&long)).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me");
+        assert!(move_path(&folder, &dir.join(&long)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("sub/child.md")).unwrap(),
+            "child"
+        );
+        // 85 CJK characters are 255 bytes: allowed, and the rename works.
+        let cjk = "文".repeat(85);
+        assert_eq!(sanitize_entry_name(&cjk).as_deref(), Some(cjk.as_str()));
+        assert_eq!(sanitize_entry_name(&"文".repeat(86)), None);
+        move_path(&file, &dir.join(&cjk)).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join(&cjk)).unwrap(), "keep me");
+        assert!(!file.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn inline_rename_selects_a_files_stem_and_a_folders_name() {
+        use super::rename_selection;
+        assert_eq!(rename_selection("README.md", false), 0..6);
+        assert_eq!(rename_selection("archive.tar.gz", false), 0..11);
+        assert_eq!(rename_selection(".env", false), 0..4);
+        assert_eq!(rename_selection("notes.v2", true), 0..8);
+        assert_eq!(rename_selection("文档.md", false), 0..6);
+    }
+
+    #[test]
+    fn a_move_never_replaces_an_existing_entry() {
+        use super::{copy_entry, move_path};
+        let dir = scratch("exists");
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        std::fs::write(dir.join("a.md"), "a").unwrap();
+        std::fs::write(dir.join("other/a.md"), "other").unwrap();
+        assert!(move_path(&dir.join("a.md"), &dir.join("other/a.md")).is_err());
+        assert!(copy_entry(&dir.join("a.md"), &dir.join("other")).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("a.md")).unwrap(), "a");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("other/a.md")).unwrap(),
+            "other"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_move_across_filesystems_copies_to_the_destination_then_deletes() {
+        use super::move_path_using;
+        let cross = |_: &std::path::Path, _: &std::path::Path| -> std::io::Result<()> {
+            Err(std::io::ErrorKind::CrossesDevices.into())
+        };
+        let dir = scratch("exdev");
+        let folder = dir.join("folder");
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join("sub/child.md"), "child").unwrap();
+        move_path_using(&folder, &dir.join("moved"), cross).unwrap();
+        assert!(!folder.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("moved/sub/child.md")).unwrap(),
+            "child"
+        );
+        // Any other rename error: nothing is copied or deleted.
+        let denied = |_: &std::path::Path, _: &std::path::Path| -> std::io::Result<()> {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        };
+        let moved = dir.join("moved");
+        assert!(move_path_using(&moved, &dir.join("again"), denied).is_err());
+        assert!(moved.join("sub/child.md").exists());
+        assert!(!dir.join("again").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     use super::*;
 
     #[test]
