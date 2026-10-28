@@ -1770,23 +1770,13 @@ impl Workspace {
         if self.nav_history.last() == Some(&path) {
             return;
         }
-        self.nav_history.truncate(self.nav_index + 1);
-        self.nav_history.push(path);
-        if self.nav_history.len() > 50 {
-            self.nav_history.remove(0);
-        }
-        self.nav_index = self.nav_history.len().saturating_sub(1);
+        self.nav_index = push_navigation(&mut self.nav_history, self.nav_index, path);
     }
 
     /// Remember a closed editor's file and tab position for Reopen Closed
     /// Editor, newest last. A path that is already in the list moves to the end.
     fn remember_closed(&mut self, path: PathBuf, ix: usize) {
-        self.closed_documents
-            .retain(|(remembered, _)| remembered != &path);
-        self.closed_documents.push((path, ix));
-        if self.closed_documents.len() > 20 {
-            self.closed_documents.remove(0);
-        }
+        push_closed(&mut self.closed_documents, path, ix);
     }
 
     fn focus_active(&self, window: &mut Window, cx: &mut App) {
@@ -10558,6 +10548,30 @@ fn recovered_message(recovered: &[(EntityId, String, bool)]) -> Option<String> {
     }
 }
 
+/// Back/forward history entries kept (Alt+← / Alt+→).
+const NAV_HISTORY_LIMIT: usize = 50;
+/// Closed editors remembered for Reopen Closed Editor.
+const CLOSED_EDITORS_LIMIT: usize = 20;
+
+/// Add `path` after `index` (dropping the forward tail), keeping the newest
+/// [`NAV_HISTORY_LIMIT`]; returns the new index.
+fn push_navigation(history: &mut Vec<PathBuf>, index: usize, path: PathBuf) -> usize {
+    history.truncate(index + 1);
+    history.push(path);
+    let excess = history.len().saturating_sub(NAV_HISTORY_LIMIT);
+    history.drain(..excess);
+    history.len().saturating_sub(1)
+}
+
+/// Remember a closed editor, newest last, without duplicates, keeping the
+/// newest [`CLOSED_EDITORS_LIMIT`].
+fn push_closed(closed: &mut Vec<(PathBuf, usize)>, path: PathBuf, ix: usize) {
+    closed.retain(|(remembered, _)| remembered != &path);
+    closed.push((path, ix));
+    let excess = closed.len().saturating_sub(CLOSED_EDITORS_LIMIT);
+    closed.drain(..excess);
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -10685,6 +10699,39 @@ mod tests {
         assert_eq!(
             recovered_message(&many).unwrap(),
             "Recovered unsaved changes to “f0.md”, “f1.md” and 3 more."
+        );
+    }
+
+    #[test]
+    fn navigation_and_closed_editor_histories_are_capped() {
+        let mut history = Vec::new();
+        let mut index = 0;
+        for n in 0..(NAV_HISTORY_LIMIT + 25) {
+            index = push_navigation(&mut history, index, PathBuf::from(format!("f{n}")));
+        }
+        assert_eq!(history.len(), NAV_HISTORY_LIMIT);
+        assert_eq!(index, NAV_HISTORY_LIMIT - 1);
+        // The oldest went; the newest is current.
+        assert_eq!(history[0], PathBuf::from("f25"));
+        assert_eq!(
+            history[index],
+            PathBuf::from(format!("f{}", NAV_HISTORY_LIMIT + 24))
+        );
+        // Going back and visiting something new drops the forward tail.
+        let index = push_navigation(&mut history, 10, PathBuf::from("new"));
+        assert_eq!((history.len(), index), (12, 11));
+
+        let mut closed = Vec::new();
+        for n in 0..(CLOSED_EDITORS_LIMIT + 5) {
+            push_closed(&mut closed, PathBuf::from(format!("c{n}")), n);
+        }
+        push_closed(&mut closed, PathBuf::from("c10"), 0);
+        assert_eq!(closed.len(), CLOSED_EDITORS_LIMIT);
+        assert_eq!(closed[0].0, PathBuf::from("c5"), "oldest dropped first");
+        assert_eq!(
+            closed.last().unwrap().0,
+            PathBuf::from("c10"),
+            "re-closed moves last"
         );
     }
 

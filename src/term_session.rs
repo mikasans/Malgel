@@ -141,6 +141,9 @@ struct InputQueue {
     ready: Condvar,
 }
 
+/// Bytes queued for the shell before more input is dropped (16 MiB).
+const MAX_PENDING_INPUT: usize = 16 * 1024 * 1024;
+
 impl InputQueue {
     fn push(&self, bytes: &[u8]) {
         if bytes.is_empty() {
@@ -150,7 +153,16 @@ impl InputQueue {
             if state.closed {
                 return;
             }
-            state.pending.extend(bytes);
+            // A program that stops reading must not make a paste grow
+            // memory without bound: what does not fit is dropped.
+            let room = MAX_PENDING_INPUT.saturating_sub(state.pending.len());
+            if bytes.len() > room {
+                log::warn!(
+                    "terminal input queue full: dropped {} byte(s)",
+                    bytes.len() - room
+                );
+            }
+            state.pending.extend(&bytes[..bytes.len().min(room)]);
             self.ready.notify_one();
         }
     }
@@ -1408,6 +1420,28 @@ mod tests {
         // `seq`); release does far better (see report).
         assert!(mb_s > 1.0, "throughput {mb_s:.1} MB/s");
         assert!(worst_snapshot < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn the_input_queue_is_capped_and_keeps_what_fits() {
+        let queue = InputQueue::default();
+        queue.push(&vec![b'a'; MAX_PENDING_INPUT - 3]);
+        queue.push(b"bcdef");
+        assert_eq!(queue.pending_len(), MAX_PENDING_INPUT);
+        let tail: Vec<u8> = queue
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .rev()
+            .take(4)
+            .copied()
+            .collect();
+        assert_eq!(tail, b"dcba", "the first bytes that fit are kept, in order");
+        // Ctrl+C still gets through a full queue (it replaces it).
+        queue.interrupt(&[0x03]);
+        assert_eq!(queue.pending_len(), 1);
     }
 
     #[test]
