@@ -837,7 +837,11 @@ sleep 0.6
 xdotool type --delay 40 'gbk.txt'
 sleep 0.6
 xdotool key --clearmodifiers Return
-sleep 1.0
+# On a loaded runner the tab can take a while: type only once its title is up
+# (CI 40712758691 typed into nothing and saved the file unchanged).
+wait_for 15 xdotool search --name '^gbk\.txt' >/dev/null \
+  || fail "Quick Open did not open gbk.txt (window: $(xdotool getactivewindow getwindowname 2>/dev/null))"
+sleep 0.5
 shot 20b-gbk-open
 xdotool key --clearmodifiers ctrl+End
 xdotool type --delay 40 'OK'
@@ -1446,7 +1450,8 @@ xdotool key --clearmodifiers ctrl+p
 sleep 0.5
 xdotool type --delay 30 'bigfind.rs'
 xdotool key --clearmodifiers Return
-sleep 1.5
+wait_for 15 xdotool search --name '^bigfind\.rs' >/dev/null || fail "Quick Open did not open bigfind.rs"
+sleep 0.5
 xdotool key --clearmodifiers ctrl+Home
 xdotool key --clearmodifiers ctrl+f
 sleep 0.4
@@ -1513,7 +1518,8 @@ xdotool key --clearmodifiers ctrl+p
 sleep 0.5
 xdotool type --delay 30 'cursors.txt'
 xdotool key --clearmodifiers Return
-sleep 1.0
+wait_for 15 xdotool search --name '^cursors\.txt' >/dev/null || fail "Quick Open did not open cursors.txt"
+sleep 0.5
 xdotool key --clearmodifiers ctrl+Home
 xdotool key --clearmodifiers ctrl+alt+Down
 sleep 0.2
@@ -1583,7 +1589,8 @@ xdotool key --clearmodifiers ctrl+p
 sleep 0.5
 xdotool type --delay 30 'cursors.txt'
 xdotool key --clearmodifiers Return
-sleep 1.0
+wait_for 15 xdotool search --name '^cursors\.txt' >/dev/null || fail "Quick Open did not open cursors.txt"
+sleep 0.5
 xdotool key --clearmodifiers ctrl+Home
 xdotool key --clearmodifiers ctrl+d
 sleep 0.15
