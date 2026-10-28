@@ -2765,16 +2765,14 @@ impl DocumentView {
             .update(cx, |editor, cx| editor.focus(window, cx));
     }
 
-    /// Ctrl+D: select the word at the caret, then move to its next match.
+    /// Ctrl+D (VS Code's Add Selection to Next Find Match): select the word
+    /// at the caret, then add a selection on each next match. Typing edits
+    /// every selection as one undo step; Escape goes back to one cursor.
     pub fn select_next_occurrence(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.editor.read(cx).value().to_string();
-        let selection = self.editor.read(cx).selected_range();
-        if let Some(next) = format::next_occurrence(&text, selection) {
-            self.editor.update(cx, |editor, cx| {
-                editor.set_selected_range(next, cx);
-                editor.focus(window, cx);
-            });
-        }
+        self.editor.update(cx, |editor, cx| {
+            editor.add_selection_to_next_find_match(cx);
+            editor.focus(window, cx);
+        });
     }
 
     /// Ctrl+Shift+K: delete the lines the selection touches.

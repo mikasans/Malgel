@@ -111,10 +111,6 @@ fn edit_ops(text: &str, a: usize, b: usize, op: u8) -> Result<(), TestCaseError>
     if let Some(edit) = edit {
         check_edit(text, &edit)?;
     }
-    if let Some(next) = format::next_occurrence(text, selection_in(text, a, b)) {
-        prop_assert!(next.end <= text.len() && text.is_char_boundary(next.start));
-        prop_assert!(text.is_char_boundary(next.end));
-    }
     let _ = format::whole_line(text, caret);
     let _ = format::format_document(text);
     let _ = smart_edit::image_markdown(text, caret, "img/a b.png", "alt");

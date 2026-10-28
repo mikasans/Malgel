@@ -460,6 +460,21 @@ pub fn bind_keys(cx: &mut App) {
             gpui_kit::component::input::Redo,
             Some(INPUT_CONTEXT),
         ),
+        // VS Code's Add Cursor Above / Below (Windows keys; the library has
+        // Shift+Alt+↑/↓ on Linux, which still works). A desktop that takes
+        // Ctrl+Alt+arrows for workspaces keeps them.
+        #[cfg(target_os = "linux")]
+        KeyBinding::new(
+            "ctrl-alt-up",
+            gpui_kit::base::input::AddCursorAbove,
+            Some(INPUT_CONTEXT),
+        ),
+        #[cfg(target_os = "linux")]
+        KeyBinding::new(
+            "ctrl-alt-down",
+            gpui_kit::base::input::AddCursorBelow,
+            Some(INPUT_CONTEXT),
+        ),
         // VS Code Replace: Ctrl+H (Win/Linux), Cmd+Option+F (macOS).
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new(
@@ -494,8 +509,8 @@ pub fn bind_keys(cx: &mut App) {
         // pair does not fight either.
         // VS Code's Toggle Line Comment.
         KeyBinding::new("secondary-/", ToggleLineComment, None),
-        // VS Code's Add Selection To Next Find Match (one selection here: it
-        // moves to the next match) and Delete Line.
+        // VS Code's Add Selection To Next Find Match (each press adds a
+        // selection; typing edits them all) and Delete Line.
         KeyBinding::new("secondary-d", SelectNextOccurrence, None),
         KeyBinding::new("secondary-shift-k", DeleteLine, None),
         KeyBinding::new("alt-up", MoveLineUp, None),

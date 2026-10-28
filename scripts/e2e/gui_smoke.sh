@@ -1410,6 +1410,42 @@ xdotool key --clearmodifiers Escape
 sleep 0.3
 pass "Find: regex 2 matches, Replace All bar(\$2, \$1) is one undo step, '(' is an error not a crash"
 
+# 21a1d. Ctrl+D (VS Code's Add Selection to Next Find Match): the word, then
+#        each next match; typing edits every one, one Ctrl+Z undoes it, and
+#        typing over one selection also undoes in one step.
+printf 'foo bar foo\nfoo\n' >"$WS/notes/multi.md"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'multi.md'
+xdotool key --clearmodifiers Return
+sleep 1.0
+xdotool key --clearmodifiers ctrl+Home
+xdotool key --clearmodifiers ctrl+d
+xdotool type --delay 30 'abc'
+xdotool key --clearmodifiers ctrl+z
+xdotool key --clearmodifiers ctrl+s
+sleep 0.5
+[[ "$(cat "$WS/notes/multi.md")" == $'foo bar foo\nfoo' ]] \
+  || fail "typing over a selection did not undo in one step: '$(cat "$WS/notes/multi.md")'"
+xdotool key --clearmodifiers ctrl+Home
+for _ in 1 2 3; do xdotool key --clearmodifiers ctrl+d; sleep 0.15; done
+shot 43l-ctrl-d-three
+xdotool type --delay 30 'x'
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 grep -q 'x bar x' "$WS/notes/multi.md" \
+  || fail "Ctrl+D x3 + typing gave '$(cat "$WS/notes/multi.md")'"
+[[ "$(cat "$WS/notes/multi.md")" == $'x bar x\nx' ]] || fail "Ctrl+D x3 + typing gave '$(cat "$WS/notes/multi.md")'"
+xdotool key --clearmodifiers Escape
+xdotool key --clearmodifiers ctrl+z
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 grep -q 'foo bar foo' "$WS/notes/multi.md" \
+  || fail "one Ctrl+Z did not undo the multi-cursor edit: '$(cat "$WS/notes/multi.md")'"
+xdotool key --clearmodifiers ctrl+w
+sleep 0.3
+xdotool key --clearmodifiers ctrl+w
+sleep 0.4
+pass "Ctrl+D adds a selection per match; typing edits all; one Ctrl+Z undoes; typed-over selection undoes whole"
+
 # 21a2. After scrolling (Ctrl+End in the 12k-line file) a line-number click
 #       still selects: click the last line's number and copy it.
 xdotool key --clearmodifiers ctrl+p
@@ -1494,7 +1530,8 @@ echo "gap: md text@$XMD txt text@$XTXT"
   || fail "plain-text gutter gap differs from Markdown (md $XMD, txt $XTXT)"
 pass "plain text keeps the Markdown gutter-to-text gap"
 
-# 21a4. Ctrl+D selects the word, then its next match; with nothing selected
+# 21a4. Ctrl+D selects the word, then adds its next match (both are typed
+#       over, as in VS Code); with nothing selected
 #       Ctrl+C copies the whole line and Ctrl+V puts it in above; Ctrl+Shift+K
 #       deletes the line.
 printf 'alpha one\nbeta\nalpha two\n' >"$WS/notes/lines.md"
@@ -1511,23 +1548,24 @@ sleep 0.2
 xdotool type --delay 30 'Z'
 xdotool key --clearmodifiers ctrl+s
 sleep 0.8
-[[ "$(cat "$WS/notes/lines.md")" == $'alpha one\nbeta\nZ two' ]] \
-  || fail "Ctrl+D twice did not select the next match: $(tr '\n' '|' <"$WS/notes/lines.md")"
+[[ "$(cat "$WS/notes/lines.md")" == $'Z one\nbeta\nZ two' ]] \
+  || fail "Ctrl+D twice did not add the next match: $(tr '\n' '|' <"$WS/notes/lines.md")"
+xdotool key --clearmodifiers Escape
 xdotool key --clearmodifiers ctrl+Home
 xdotool key --clearmodifiers ctrl+c
 sleep 0.2
 xdotool key --clearmodifiers ctrl+v
 xdotool key --clearmodifiers ctrl+s
 sleep 0.8
-[[ "$(cat "$WS/notes/lines.md")" == $'alpha one\nalpha one\nbeta\nZ two' ]] \
+[[ "$(cat "$WS/notes/lines.md")" == $'Z one\nZ one\nbeta\nZ two' ]] \
   || fail "empty-selection copy/paste did not duplicate the line above: $(tr '\n' '|' <"$WS/notes/lines.md")"
 xdotool key --clearmodifiers ctrl+Home
 xdotool key --clearmodifiers ctrl+shift+k
 xdotool key --clearmodifiers ctrl+s
 sleep 0.8
-[[ "$(cat "$WS/notes/lines.md")" == $'alpha one\nbeta\nZ two' ]] \
+[[ "$(cat "$WS/notes/lines.md")" == $'Z one\nbeta\nZ two' ]] \
   || fail "Ctrl+Shift+K did not delete the line: $(tr '\n' '|' <"$WS/notes/lines.md")"
-pass "Ctrl+D next occurrence, whole-line copy/paste, Ctrl+Shift+K"
+pass "Ctrl+D adds the next occurrence, whole-line copy/paste, Ctrl+Shift+K"
 
 # 21b. External edit while dirty: Ctrl+S must not clobber the on-disk line.
 #     The conflict alert must take keyboard focus: typing must not reach the

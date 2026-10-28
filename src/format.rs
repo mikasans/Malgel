@@ -278,34 +278,6 @@ pub fn paste_line_above(text: &str, caret: usize, line: &str) -> Edit {
     }
 }
 
-/// Ctrl+D: with no selection, select the word at the caret; with one, move
-/// it to the next occurrence of the same text after it, wrapping to the
-/// top. `None` when there is no word or no other occurrence.
-pub fn next_occurrence(text: &str, selection: Range<usize>) -> Option<Range<usize>> {
-    let len = text.len();
-    let (start, end) = (selection.start.min(len), selection.end.min(len));
-    if start == end {
-        let is_word = |ch: char| ch.is_alphanumeric() || ch == '_';
-        let before = text[..start]
-            .char_indices()
-            .rev()
-            .take_while(|(_, ch)| is_word(*ch))
-            .last()
-            .map_or(start, |(at, _)| at);
-        let after = text[start..]
-            .char_indices()
-            .find(|(_, ch)| !is_word(*ch))
-            .map_or(len, |(at, _)| start + at);
-        return (before < after).then_some(before..after);
-    }
-    let needle = &text[start..end];
-    let found = text[end..]
-        .find(needle)
-        .map(|at| end + at)
-        .or_else(|| text[..start].find(needle))?;
-    Some(found..found + needle.len())
-}
-
 /// How a language comments out a line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommentStyle {
@@ -727,23 +699,6 @@ mod tests {
         assert_eq!(apply(text, delete_lines(text, 1..5)).0, "three");
         assert_eq!(apply(text, delete_lines(text, 0..4)).0, "two\nthree");
         assert_eq!(apply(text, delete_lines(text, 9..9)).0, "one\ntwo");
-    }
-
-    #[test]
-    fn ctrl_d_selects_the_word_then_the_next_match_wrapping() {
-        use super::next_occurrence;
-        let text = "foo bar foo_x foo";
-        assert_eq!(next_occurrence(text, 1..1), Some(0..3));
-        assert_eq!(next_occurrence(text, 0..3), Some(8..11));
-        assert_eq!(next_occurrence(text, 8..11), Some(14..17));
-        assert_eq!(next_occurrence(text, 14..17), Some(0..3), "wraps");
-        assert_eq!(
-            next_occurrence(text, 3..3),
-            Some(0..3),
-            "caret right after a word"
-        );
-        assert_eq!(next_occurrence("a  b", 2..2), None);
-        assert_eq!(next_occurrence("only", 0..4), None);
     }
 
     #[test]
