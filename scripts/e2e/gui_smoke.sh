@@ -1359,6 +1359,57 @@ xdotool key --clearmodifiers ctrl+w
 sleep 0.4
 pass "Find: Enter selects and fills the current match; Esc leaves the caret on it (line 12)"
 
+# 21a1c. Regex Find / Replace (VS Code's .*): Alt+R turns the regex on,
+#        `foo\((\w+), ?(\w+)\)` matches both calls, Replace All with
+#        `bar($2, $1)` swaps the arguments in one edit, one Ctrl+Z puts it
+#        all back, and an unfinished pattern `(` is an error, not a crash.
+printf 'x = foo(a, b);\ny = foo(cc,dd);\nfoo()\n' >"$WS/notes/regex.md"
+REGEX_ORIG="$(cat "$WS/notes/regex.md")"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 30 'regex.md'
+xdotool key --clearmodifiers Return
+sleep 1.0
+xdotool key --clearmodifiers ctrl+h
+sleep 0.5
+xdotool key --clearmodifiers ctrl+a
+xdotool key --clearmodifiers alt+r
+xdotool type --delay 30 'foo\((\w+), ?(\w+)\)'
+sleep 0.5
+shot 43i-find-regex
+xdotool key --clearmodifiers Tab
+xdotool key --clearmodifiers ctrl+a
+xdotool type --delay 30 'bar($2, $1)'
+xdotool key --clearmodifiers ctrl+alt+Return
+sleep 0.5
+shot 43j-replace-all
+xdotool key --clearmodifiers Escape
+sleep 0.3
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 grep -q 'bar(b, a)' "$WS/notes/regex.md" \
+  || fail "regex Replace All wrote '$(head -c 200 "$WS/notes/regex.md")'"
+[[ "$(cat "$WS/notes/regex.md")" == $'x = bar(b, a);\ny = bar(dd, cc);\nfoo()' ]] \
+  || fail "regex Replace All gave '$(cat "$WS/notes/regex.md")'"
+xdotool key --clearmodifiers ctrl+z
+sleep 0.3
+xdotool key --clearmodifiers ctrl+s
+wait_for 5 grep -q 'foo(a, b)' "$WS/notes/regex.md" \
+  || fail "one Ctrl+Z did not undo the regex Replace All: '$(cat "$WS/notes/regex.md")'"
+[[ "$(cat "$WS/notes/regex.md")" == "$REGEX_ORIG" ]] || fail "after Ctrl+Z: '$(cat "$WS/notes/regex.md")'"
+# An unfinished pattern: the field says why and the app lives on.
+xdotool key --clearmodifiers ctrl+f
+sleep 0.4
+xdotool key --clearmodifiers ctrl+a
+xdotool type --delay 30 '('
+sleep 0.6
+shot 43k-find-bad-regex
+kill -0 "$APP_PID" 2>/dev/null || fail "an invalid regex '(' brought the app down"
+# Turn the regex off again so later steps search literally.
+xdotool key --clearmodifiers alt+r
+xdotool key --clearmodifiers Escape
+sleep 0.3
+pass "Find: regex 2 matches, Replace All bar(\$2, \$1) is one undo step, '(' is an error not a crash"
+
 # 21a2. After scrolling (Ctrl+End in the 12k-line file) a line-number click
 #       still selects: click the last line's number and copy it.
 xdotool key --clearmodifiers ctrl+p

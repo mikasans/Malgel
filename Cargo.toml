@@ -182,7 +182,14 @@ strip = "debuginfo"
 # Find matches big documents (>1 MiB) on the background executor, debounced
 # and batched, on-screen rows first, and next/previous select the current
 # match with a strong fill even while the window is inactive.
+# Find has VS Code's Aa / ab / .* toggles (regex crate, $1 replace) and
+# Ctrl+D adds a selection on the next match; the search panel lives in
+# gpui-component, so it (and the two crates it shares types with) come
+# from the same fork commit, unchanged otherwise from 0.7.0.
 # Pinned to a commit on the fork's malgel-0.7.0 branch.
 # Remove when upstream ships the same.
 [patch.crates-io]
-gpui-base = { git = "https://github.com/mikasans/gpui-kit", rev = "f2c520c58feb58563cf6851fd8a197ee29d7f939" }
+gpui-base = { git = "https://github.com/mikasans/gpui-kit", rev = "3e1779c4c75861bc1dd180d40b193cc6d86060b2" }
+gpui-component = { git = "https://github.com/mikasans/gpui-kit", rev = "3e1779c4c75861bc1dd180d40b193cc6d86060b2" }
+gpui-component-macros = { git = "https://github.com/mikasans/gpui-kit", rev = "3e1779c4c75861bc1dd180d40b193cc6d86060b2" }
+gpui-kit-assets = { git = "https://github.com/mikasans/gpui-kit", rev = "3e1779c4c75861bc1dd180d40b193cc6d86060b2" }
