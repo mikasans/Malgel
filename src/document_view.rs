@@ -3329,15 +3329,16 @@ impl DocumentView {
                 gpui_kit::component::Icon::new(gpui_kit::component::IconName::Info)
                     .text_color(cx.theme().primary),
             )
-            // The message gives way (ellipsis, full text in the tooltip)
-            // so the button always shows whole.
+            // The message wraps onto a second line in a narrow pane rather
+            // than lose its end to an ellipsis (full text in the tooltip
+            // too); the buttons always show whole.
             .child({
                 let message = large_file_message(megabytes, state);
                 div()
                     .id("large-file-message")
                     .flex_1()
                     .min_w_0()
-                    .truncate()
+                    .whitespace_normal()
                     .tooltip({
                         let message = message.clone();
                         move |window, cx| {
@@ -4135,15 +4136,15 @@ fn large_file_megabytes(disk_len: Option<u64>, text_len: usize) -> f64 {
 fn large_file_message(megabytes: f64, state: LargeFileState) -> String {
     match state {
         LargeFileState::Reduced => format!(
-            "Large file ({megabytes:.1} MB): preview and outline are off to save memory; \
-             highlighting and spell checking stay off at this size."
+            "Large file ({megabytes:.1} MB): preview and outline off to save memory; \
+             highlighting and spell checking stay off."
         ),
         LargeFileState::Building => {
             format!("Large file ({megabytes:.1} MB): building the outline and preview…")
         }
         LargeFileState::Enabled => format!(
-            "Large file ({megabytes:.1} MB): preview (of the beginning) and outline are on; \
-             highlighting and spell checking stay off at this size."
+            "Large file ({megabytes:.1} MB): preview (start only) and outline are on; \
+             highlighting and spell checking stay off."
         ),
     }
 }
@@ -4653,6 +4654,11 @@ mod tests {
         assert!(enabled.contains("preview") && enabled.contains("outline are on"));
         assert!(enabled.contains("highlighting and spell checking stay off"));
         assert!(large_file_message(1., Building).contains("building"));
+        // Short enough to read whole on one line of a normal pane.
+        for state in [Reduced, Enabled, Building] {
+            let message = large_file_message(123.4, state);
+            assert!(message.chars().count() <= 106, "{message}");
+        }
     }
 
     /// The bar draws `foreground` on `background`: WCAG AA (4.5:1) in every
