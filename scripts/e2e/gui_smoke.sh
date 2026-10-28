@@ -1676,6 +1676,58 @@ pass "terminal: drag / double / triple click 5990 rows into the scrollback copy 
 xdotool key --clearmodifiers ctrl+grave
 sleep 0.5
 
+# 21g. Settings: every switch is drawn inside the card (the default dialog
+#      width clipped them all), and filtering does not move the card.
+xdotool key --clearmodifiers ctrl+comma
+sleep 1.0
+shot 49h-settings
+card_box() { # card_box <shot>: "x0 x1 top" of the dialog card (any theme)
+  python3 - "$ART_DIR/$1.png" <<'PY'
+from PIL import Image
+from collections import Counter
+import sys
+im = Image.open(sys.argv[1]).convert("RGB")
+w, h = im.size
+px = im.load()
+cx, cy = w // 2, h // 2
+bg = Counter(px[x, y] for x in range(cx - 100, cx + 100, 2) for y in range(cy - 20, cy + 20, 2)).most_common(1)[0][0]
+near = lambda p: sum(abs(a - b) for a, b in zip(p, bg)) < 12
+band = range(cy - 150, cy + 150, 3)
+cols = [x for x in range(w) if sum(near(px[x, y]) for y in band) > len(band) * 0.5]
+x0, x1 = min(cols), max(cols) + 1
+rows = [y for y in range(h) if sum(near(px[x, y]) for x in range(x0, x1, 3)) > (x1 - x0) / 3 * 0.5]
+print(x0, x1, min(rows))
+PY
+}
+read -r CX0 CX1 CTOP < <(card_box 49h-settings) || fail "could not find the Settings card"
+python3 - "$ART_DIR/49h-settings.png" "$CX0" "$CX1" "$CTOP" <<'PY' || fail "Settings switches are clipped or missing"
+from PIL import Image
+import sys
+im = Image.open(sys.argv[1]).convert("L")
+x0, x1, top = map(int, sys.argv[2:])
+px = im.load()
+bg = px[x1 - 3, top + 3]
+ink = lambda x, y: abs(px[x, y] - bg) > 60
+ys = range(top + 60, min(top + 520, im.size[1]))
+# Switches sit at the card's right: count their pixels in the right 90 px;
+# nothing may reach the card's last 5 px (a clipped switch runs into it).
+inside = sum(1 for y in ys for x in range(x1 - 90, x1 - 5) if ink(x, y))
+edge = sum(1 for y in ys for x in range(x1 - 5, x1 - 1) if ink(x, y))
+print(f"card {x0}..{x1} top {top}: switch pixels {inside}, at the edge {edge}")
+assert x1 - x0 >= 560, x1 - x0
+assert inside > 400 and edge == 0, (inside, edge)
+PY
+xdotool type --delay 40 'wrap'
+sleep 0.8
+shot 49i-settings-filtered
+read -r _ _ CTOP2 < <(card_box 49i-settings-filtered) || fail "no Settings card after filtering"
+[[ "$CTOP" == "$CTOP2" ]] || fail "filtering moved the Settings card ($CTOP -> $CTOP2)"
+xdotool key --clearmodifiers Escape
+sleep 0.3
+xdotool key --clearmodifiers Escape
+sleep 0.5
+pass "Settings: switches inside the card; the card stays put while filtering"
+
 # 22. Ctrl+Q → Don't save: dialog, disk unchanged, then the app exits.
 #     Last so later steps are not stranded without a process.
 printf 'quit-disk\n' >"$WS/notes/quit-final.md"

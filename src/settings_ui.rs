@@ -251,10 +251,13 @@ impl Render for SettingsView {
                 || q.contains("file")
         };
 
+        // A fixed height (not max_h): the dialog is centred, so a list that
+        // shrank while filtering moved the whole card up and down.
         let mut body = v_flex()
             .gap_0()
-            .w(px(520.))
-            .max_h(px(480.))
+            .w_full()
+            .pr_3()
+            .h(px(BODY_HEIGHT))
             .overflow_y_scrollbar();
         let mut last_section = "";
         for row in &matched {
@@ -274,11 +277,14 @@ impl Render for SettingsView {
             let id = row.id;
             body = body.child(
                 h_flex()
+                    .w_full()
                     .gap_4()
                     .py_2()
                     .justify_between()
                     .child(
                         v_flex()
+                            .flex_1()
+                            .min_w_0()
                             .gap_0p5()
                             .child(
                                 div()
@@ -293,14 +299,12 @@ impl Render for SettingsView {
                                     .child(row.description),
                             ),
                     )
-                    .child(
-                        Switch::new(id)
-                            .checked(checked)
-                            .on_click(move |checked, _, cx| {
-                                let checked = *checked;
-                                AppSettings::update(cx, |settings| set(settings, checked));
-                            }),
-                    ),
+                    .child(Switch::new(id).flex_none().checked(checked).on_click(
+                        move |checked, _, cx| {
+                            let checked = *checked;
+                            AppSettings::update(cx, |settings| set(settings, checked));
+                        },
+                    )),
             );
         }
 
@@ -317,11 +321,14 @@ impl Render for SettingsView {
             }
             body = body.child(
                 h_flex()
+                    .w_full()
                     .gap_4()
                     .py_2()
                     .justify_between()
                     .child(
                         v_flex()
+                            .flex_1()
+                            .min_w_0()
                             .gap_0p5()
                             .child(
                                 div()
@@ -387,7 +394,7 @@ impl Render for SettingsView {
         }
 
         v_flex()
-            .w(px(560.))
+            .w_full()
             .gap_2()
             .child(
                 h_flex()
@@ -443,11 +450,14 @@ fn default_app_row(status: default_app::Status, cx: &App) -> impl IntoElement {
             .into_any_element()
     };
     h_flex()
+        .w_full()
         .gap_4()
         .py_2()
         .justify_between()
         .child(
             v_flex()
+                .flex_1()
+                .min_w_0()
                 .gap_0p5()
                 .child(
                     div()
@@ -462,7 +472,7 @@ fn default_app_row(status: default_app::Status, cx: &App) -> impl IntoElement {
                         .child(description),
                 ),
         )
-        .child(action)
+        .child(div().flex_none().child(action))
 }
 
 /// Open the filterable Settings dialog.
@@ -478,9 +488,17 @@ pub fn open(window: &mut Window, cx: &mut App) {
     let focus = view.read(cx).filter_focus(cx);
     window.defer(cx, move |window, cx| focus.focus(window, cx));
     window.open_dialog(cx, move |dialog, _window, _cx| {
-        dialog.title("Settings").child(view.clone())
+        dialog
+            .title("Settings")
+            .width(px(DIALOG_WIDTH))
+            .child(view.clone())
     });
 }
+
+/// The Settings dialog's width: the default (448 px) clipped every switch.
+const DIALOG_WIDTH: f32 = 600.;
+/// The settings list's height, fixed so filtering does not move the card.
+const BODY_HEIGHT: f32 = 480.;
 
 #[cfg(test)]
 mod tests {
