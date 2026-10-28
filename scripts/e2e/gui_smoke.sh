@@ -819,12 +819,21 @@ PY
 LONG_DIFF="$(same_view 20d-longmath-scrolled 20e-longmath-converted $((bwx + 330)) $((bwy + 110)) 260 560)" \
   || fail "Convert scrolled the editor away from where it was (best match $LONG_DIFF px off)"
 pass "Convert keeps the editor scrolled where it was ($LONG_DIFF px changed)"
-# Put things back: undo (the tab is clean again), close it, and drop the
+# Put things back: undo, save, close it, and drop the
 # file so the Explorer rows the later steps click are where they were.
+# The undone tab still counts as modified, so Ctrl+W alone opens a "Save
+# changes?" prompt that ate the next step's keys (CI 40712758691: gbk.txt
+# never opened). Save the restored text first, then close and wait for it.
 xdotool key --clearmodifiers ctrl+z
-sleep 0.4
-xdotool key --clearmodifiers ctrl+w
 sleep 0.6
+xdotool key --clearmodifiers ctrl+s
+sleep 0.6
+app_title() { xdotool getwindowname "$(xdotool search --pid "$APP_PID" --onlyvisible --name . 2>/dev/null | head -1)" 2>/dev/null; }
+xdotool key --clearmodifiers ctrl+w
+longmath_closed() { [[ "$(app_title)" != longmath.md* ]]; }
+wait_for 10 longmath_closed \
+  || fail "Ctrl+W did not close longmath.md (title: $(app_title))"
+sleep 0.4
 rm -f "$WS/notes/longmath.md"
 sleep 1.0
 
