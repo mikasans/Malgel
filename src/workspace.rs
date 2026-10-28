@@ -4300,12 +4300,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (n, written) = search::replace_in_files(files, find, replace);
+        let search::Replaced {
+            occurrences: n,
+            written,
+            skipped,
+        } = search::replace_in_files(files, find, replace);
         crate::perf::release_free_memory();
         self.reload_replaced_files(&written, window, cx);
+        let skipped = match skipped {
+            0 => String::new(),
+            1 => " 1 file skipped (its encoding can’t hold the change or isn’t known).".into(),
+            n => {
+                format!(" {n} files skipped (their encoding can’t hold the change or isn’t known).")
+            }
+        };
         window.push_notification(
             Notification::info(format!(
-                "Replaced {n} occurrence{} in {} file{}.",
+                "Replaced {n} occurrence{} in {} file{}.{skipped}",
                 if n == 1 { "" } else { "s" },
                 written.len(),
                 if written.len() == 1 { "" } else { "s" },

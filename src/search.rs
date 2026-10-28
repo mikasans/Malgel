@@ -199,13 +199,38 @@ pub fn search_folder_files(
     out
 }
 
-/// A file's text, or `None` when it cannot be read or is not UTF-8 text.
+/// A file's text, or `None` when it cannot be read as text.
 fn read_text(path: &std::path::Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.contains(&0) {
-        return None;
+    read_loaded(path).ok().map(|loaded| loaded.text)
+}
+
+/// Why a file's text could not be searched.
+enum Unreadable {
+    /// Not there, or binary: not text at all, so not worth a mention.
+    NotText,
+    /// Text in no encoding Malgel recognises with confidence: a Replace
+    /// would write U+FFFD over its unknown bytes.
+    Lossy,
+}
+
+/// A file decoded the way the editor opens it (UTF-8, UTF-8 with BOM,
+/// UTF-16, GBK, Big5, Shift JIS, Latin-1), with its line ending and
+/// encoding so a Replace can write it back the same way.
+fn read_loaded(path: &std::path::Path) -> Result<crate::document::LoadedText, Unreadable> {
+    use crate::document::Encoding;
+    let bytes = std::fs::read(path).map_err(|_| Unreadable::NotText)?;
+    let utf16 = matches!(
+        Encoding::from_bom(&bytes),
+        Encoding::Utf16Le | Encoding::Utf16Be
+    );
+    if !utf16 && bytes.contains(&0) {
+        return Err(Unreadable::NotText);
     }
-    String::from_utf8(bytes).ok()
+    match crate::document::decode(bytes) {
+        Ok(loaded) if loaded.lossy => Err(Unreadable::Lossy),
+        Ok(loaded) => Ok(loaded),
+        Err(_) => Err(Unreadable::NotText),
+    }
 }
 
 /// How many occurrences of `find` the files hold, and in how many files,
@@ -278,28 +303,45 @@ pub fn replace_in_text(text: &str, find: &str, replace: &str) -> (String, usize)
     (out, count)
 }
 
-/// Apply [`replace_in_text`] to each path that can be read as UTF-8 text.
-/// Returns `(replacements, files written)`, and the files written.
-pub fn replace_in_files(files: &[PathBuf], find: &str, replace: &str) -> (usize, Vec<PathBuf>) {
-    let mut total = 0;
-    let mut written = Vec::new();
+/// What a Replace All did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Replaced {
+    pub occurrences: usize,
+    pub written: Vec<PathBuf>,
+    /// Files left alone: text in no encoding read with confidence, a
+    /// replacement their encoding cannot hold, or a failed write.
+    pub skipped: usize,
+}
+
+/// Apply [`replace_in_text`] to each file that reads as text, writing it
+/// back atomically in its own encoding and line ending.
+pub fn replace_in_files(files: &[PathBuf], find: &str, replace: &str) -> Replaced {
+    let mut out = Replaced::default();
     for path in files {
-        let Some(text) = read_text(path) else {
-            continue;
+        let loaded = match read_loaded(path) {
+            Ok(loaded) => loaded,
+            Err(Unreadable::Lossy) => {
+                out.skipped += 1;
+                continue;
+            }
+            Err(Unreadable::NotText) => continue,
         };
-        if count_in_text(&text, find) == 0 {
+        if count_in_text(&loaded.text, find) == 0 {
             continue;
         }
-        let (next, n) = replace_in_text(&text, find, replace);
+        let (next, n) = replace_in_text(&loaded.text, find, replace);
         if n == 0 {
             continue;
         }
-        if std::fs::write(path, next.as_bytes()).is_ok() {
-            total += n;
-            written.push(path.clone());
+        match crate::document::save_encoded(path, &next, loaded.line_ending, loaded.encoding) {
+            Ok(()) => {
+                out.occurrences += n;
+                out.written.push(path.clone());
+            }
+            Err(_) => out.skipped += 1,
         }
     }
-    (total, written)
+    out
 }
 
 #[cfg(test)]
@@ -468,8 +510,9 @@ mod tests {
             .collect();
         assert_eq!(count_in_files(&files, "alpha"), (8, 4));
         assert_eq!(count_in_files(&files, "Alpha"), (4, 4));
-        let (n, written) = replace_in_files(&files, "alpha", "gamma");
-        assert_eq!((n, written.len()), (8, 4));
+        let replaced = replace_in_files(&files, "alpha", "gamma");
+        assert_eq!((replaced.occurrences, replaced.written.len()), (8, 4));
+        assert_eq!(replaced.skipped, 0);
         assert_eq!(count_in_files(&files, "alpha"), (0, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -482,5 +525,66 @@ mod tests {
         let (out, n) = replace_in_text("Foo foo FOO", "Foo", "Bar");
         assert_eq!(n, 1);
         assert_eq!(out, "Bar foo FOO");
+    }
+
+    /// GBK, Latin-1 and UTF-16 files are found and replaced, and keep their
+    /// encoding and line endings; text in no known encoding is skipped and
+    /// counted, never written over with U+FFFD; a replacement the
+    /// encoding can't hold leaves the file alone.
+    #[test]
+    fn legacy_encoded_files_are_found_and_replaced_in_their_encoding() {
+        use crate::document::{Encoding, LineEnding, encode};
+        let dir = scratch("encodings");
+        let gbk = dir.join("gbk.txt");
+        let latin = dir.join("latin.txt");
+        let utf16 = dir.join("utf16.txt");
+        let unknown = dir.join("unknown.txt");
+        std::fs::write(
+            &gbk,
+            encode("第一行 needle\n第二行\n", LineEnding::CrLf, Encoding::Gbk).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &latin,
+            encode("café needle\n", LineEnding::Lf, Encoding::Latin1).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &utf16,
+            encode("needle ☃\n", LineEnding::Lf, Encoding::Utf16Le).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&unknown, b"needle \xff\xfe\x81 junk\n").unwrap();
+        let files = vec![gbk.clone(), latin.clone(), utf16.clone(), unknown.clone()];
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let found = search_folder_files(&files, "needle", 100, 10, &cancel);
+        assert!(found.files_matched >= 3, "{found:?}");
+        for path in [&gbk, &latin, &utf16] {
+            assert!(
+                found.hits.iter().any(|hit| &hit.path == path),
+                "{path:?} not found"
+            );
+        }
+        let original_unknown = std::fs::read(&unknown).unwrap();
+        let replaced = replace_in_files(&files, "needle", "針");
+        // Latin-1 can't hold 針: that file is skipped, as is the unknown one.
+        assert_eq!(replaced.written, vec![gbk.clone(), utf16.clone()]);
+        assert_eq!(replaced.skipped, 2);
+        assert_eq!(
+            std::fs::read(&gbk).unwrap(),
+            encode("第一行 針\n第二行\n", LineEnding::CrLf, Encoding::Gbk).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&utf16).unwrap(),
+            encode("針 ☃\n", LineEnding::Lf, Encoding::Utf16Le).unwrap()
+        );
+        assert_eq!(std::fs::read(&unknown).unwrap(), original_unknown);
+        let replaced = replace_in_files(std::slice::from_ref(&latin), "needle", "thé");
+        assert_eq!(replaced.written, vec![latin.clone()]);
+        assert_eq!(
+            std::fs::read(&latin).unwrap(),
+            encode("café thé\n", LineEnding::Lf, Encoding::Latin1).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
